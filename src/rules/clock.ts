@@ -1,10 +1,15 @@
 import { BLACK, WHITE, PlayerColor } from './types';
 
 export interface PlayerClockState {
-  mainTimeLeft: number;
+  mainTimeLeft: number; // seconds (float)
   byoyomiPeriodsLeft: number;
-  byoyomiTimeLeft: number;
+  byoyomiTimeLeft: number; // seconds (float)
   inByoyomi: boolean;
+}
+
+export interface ClockSnapshot {
+  black: PlayerClockState;
+  white: PlayerClockState;
 }
 
 export interface ClockCallbacks {
@@ -64,6 +69,7 @@ export class GameClock {
       return;
     }
 
+    // Reset current byoyomi period timer when turn switches or begins if in byoyomi
     const st = color === BLACK ? this.black : this.white;
     if (st.inByoyomi) {
       st.byoyomiTimeLeft = this.byoyomiDuration;
@@ -89,6 +95,27 @@ export class GameClock {
 
   public stop(): void {
     this.pause();
+  }
+
+  public getSnapshot(): ClockSnapshot {
+    return {
+      black: { ...this.black },
+      white: { ...this.white },
+    };
+  }
+
+  public applySnapshot(snapshot: ClockSnapshot, nextActiveColor?: PlayerColor | null): void {
+    this.black = { ...snapshot.black };
+    this.white = { ...snapshot.white };
+    if (nextActiveColor !== undefined) {
+      if (nextActiveColor === null) {
+        this.pause();
+      } else {
+        this.startTurn(nextActiveColor);
+      }
+    } else {
+      this.emitTick();
+    }
   }
 
   private step(): void {

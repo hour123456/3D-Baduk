@@ -2,7 +2,7 @@
 
 > **웹 브라우저 바로 플레이**: https://hour123456.github.io/3D-Baduk/
 
-Three.js 기반 고해상도 절차적 PBR 그래픽과 Web Audio API 물리 모델링 음향 합성, 엄격한 한국식·중국식 바둑 규칙, 그리고 5단계 Web Worker 인공지능(MCTS + RAVE + 전술 판독기)을 갖춘 **3D 정통 바둑 게임(웹 & Windows Electron 데스크톱 앱)** 입니다.
+Three.js 기반 고해상도 절차적 PBR 그래픽과 Web Audio API 물리 모델링 음향 합성, 엄격한 한국식·중국식 바둑 규칙, 5단계 Web Worker 인공지능(MCTS + RAVE + 전술 판독기), 그리고 실시간 온라인 2인 멀티플레이를 갖춘 **3D 정통 바둑 게임(웹 & Windows Electron 데스크톱 앱)** 입니다.
 
 ## 주요 특징
 
@@ -18,6 +18,11 @@ Three.js 기반 고해상도 절차적 PBR 그래픽과 Web Audio API 물리 모
 - **5단계 인공지능 & 2인 로컬 맞대국 (`src/ai/`)**
   - 전용 Web Worker에서 비동기 구동되는 5단계 AI (`입문` / `초급` / `중급` / `고급` / `마스터`)
   - PUCT + RAVE 탐색, 진눈 보호, 단수 및 축(Ladder)·축머리 전술 수읽기, 포석·행마 패턴 탑재
+- **플레이어 닉네임 & 실시간 온라인 2인 멀티플레이 (`src/profile/`, `src/online/`)**
+  - **닉네임 시스템**: 나만의 대국 닉네임 설정·랜덤 추천·자동 저장(`localStorage`), 대국 카드 및 SGF 기보(`PB`, `PW`) 반영
+  - **실시간 빠른 매칭**: 선호 판 크기(`전체` / `19줄` / `13줄` / `9줄`) 기준 자동 1:1 매칭 및 흑·백 돌가리기
+  - **방 만들기 & 대기실 목록/방 코드 참가**: 공개 대기방 실시간 조회, 6자리 방 코드 직접 입장, `?room=XXXXXX` 원클릭 초대 링크 지원
+  - **완전한 실전 동기화**: 실시간 착수·초읽기 시계 동기화, 양측 합의 방식의 온라인 사석 지정·계가, 무르기 요청/수락, 재대국 신청, 수담 인사·채팅 지원
 
 ## 실행 방법
 
@@ -31,7 +36,7 @@ npm run dev
 # Electron 데스크톱 앱 개발 모드 실행
 npm run electron:dev
 
-# 단위 테스트 실행 (규칙 및 AI 검증)
+# 단위 테스트 실행 (규칙, AI 및 온라인 멀티 검증)
 npm run test
 
 # 웹 프로덕션 빌드 (dist/ 생성)
@@ -40,9 +45,3 @@ npm run build
 # Windows 독립 실행형 데스크톱 앱 패키징 (release/win-unpacked 생성)
 npm run electron:pack
 ```
-
-## GitHub Pages로 웹사이트 열기
-
-이 저장소에는 `.github/workflows/deploy-pages.yml` 자동 배포 워크플로가 포함되어 있습니다.
-1. GitHub 저장소 상단의 **Settings** → 좌측 **Pages** 메뉴로 이동합니다.
-2. **Build and deployment** 항목의 **Source**를 **GitHub Actions**로 변경하면 자동으로 빌드되어 웹 브라우저에서 바로 플레이 가능한 사이트 주소가 생성됩니다.

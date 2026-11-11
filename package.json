@@ -2,7 +2,7 @@
   "name": "baduk-3d-master",
   "private": true,
   "version": "1.0.0",
-  "description": "고품격 3D 정통 바둑 게임 (한국식·중국식 엄격 규칙, 물리 음향 합성, 5단계 AI)",
+  "description": "고품격 3D 정통 바둑 게임 (한국식·중국식 엄격 규칙, 물리 음향 합성, 5단계 AI, 실시간 온라인 멀티)",
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite --port 5173",
@@ -32,6 +32,7 @@
     }
   },
   "dependencies": {
+    "mqtt": "^5.16.1",
     "three": "^0.170.0"
   },
   "devDependencies": {

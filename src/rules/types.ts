@@ -33,7 +33,7 @@ export interface GameConfig {
   handicap: number; // 0 or 2..9
   komi: number;
   superko: boolean; // Enforce positional superko
-  mode: 'ai' | 'local2p';
+  mode: 'ai' | 'local2p' | 'online';
   humanColor: PlayerColor;
   aiDifficulty: AIDifficulty;
   mainTimeSeconds: number; // 0 = unlimited
@@ -41,6 +41,7 @@ export interface GameConfig {
   byoyomiPeriods: number;
   blackName?: string;
   whiteName?: string;
+  roomCode?: string;
 }
 
 export interface MoveRecord {
