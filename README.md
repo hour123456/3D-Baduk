@@ -1,5 +1,7 @@
 # 수담(手談) — 3D 정통 바둑 게임
 
+> **웹 브라우저 바로 플레이**: https://hour123456.github.io/3D-Baduk/
+
 Three.js 기반 고해상도 절차적 PBR 그래픽과 Web Audio API 물리 모델링 음향 합성, 엄격한 한국식·중국식 바둑 규칙, 그리고 5단계 Web Worker 인공지능(MCTS + RAVE + 전술 판독기)을 갖춘 **3D 정통 바둑 게임(웹 & Windows Electron 데스크톱 앱)** 입니다.
 
 ## 주요 특징
