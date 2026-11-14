@@ -1,4 +1,4 @@
-import { BLACK, WHITE, BoardSize, GameConfig, PlayerColor } from '../rules/types';
+import { BLACK, WHITE, BoardSize, GameConfig, GameType, OmokRulesetType, PlayerColor } from '../rules/types';
 import { ClockSnapshot } from '../rules/clock';
 import { ProfileManager } from '../profile/ProfileManager';
 import {
@@ -67,6 +67,8 @@ interface QuickMatchSeekPayload {
   clientId: string;
   nickname: string;
   preferredSize: QuickMatchSizePref;
+  gameType?: GameType;
+  omokRuleset?: OmokRulesetType;
   joinedAt: number;
 }
 
@@ -76,6 +78,8 @@ interface QuickMatchOfferPayload {
   hostName: string;
   guestId: string;
   boardSize: BoardSize;
+  gameType?: GameType;
+  omokRuleset?: OmokRulesetType;
 }
 
 interface QuickMatchAcceptPayload {
@@ -84,6 +88,8 @@ interface QuickMatchAcceptPayload {
   guestId: string;
   guestName: string;
   boardSize: BoardSize;
+  gameType?: GameType;
+  omokRuleset?: OmokRulesetType;
 }
 
 interface RoomJoinReqPayload {
@@ -123,9 +129,17 @@ export class OnlineMatchManager {
 
   // Quick match state
   private qmPreferredSize: QuickMatchSizePref = 'any';
+  private qmGameType: GameType = 'baduk';
+  private qmOmokRuleset: OmokRulesetType = 'renju';
   private qmSeekTimer: ReturnType<typeof setInterval> | null = null;
-  private qmPendingOffer: { peerId: string; roomCode: string; boardSize: BoardSize; expiresAt: number } | null =
-    null;
+  private qmPendingOffer: {
+    peerId: string;
+    roomCode: string;
+    boardSize: BoardSize;
+    gameType?: GameType;
+    omokRuleset?: OmokRulesetType;
+    expiresAt: number;
+  } | null = null;
   private qmAcceptedRoomCode: string | null = null;
 
   // In-game ping & scoring state
@@ -320,6 +334,8 @@ export class OnlineMatchManager {
       hostName,
       boardSize: options.boardSize,
       ruleset: options.ruleset,
+      gameType: options.gameType ?? 'baduk',
+      omokRuleset: options.omokRuleset ?? 'renju',
       handicap: options.handicap,
       komi: options.komi,
       mainTimeSeconds: options.mainTimeSeconds,
@@ -412,7 +428,13 @@ export class OnlineMatchManager {
   // Quick Match (빠른 매칭)
   // =========================================================================
 
-  public async startQuickMatch(preferredSize: QuickMatchSizePref = 'any'): Promise<void> {
+  public async startQuickMatch(
+    preferredSize: QuickMatchSizePref = 'any',
+    gameType: GameType = 'baduk',
+    omokRuleset: OmokRulesetType = 'renju'
+  ): Promise<void> {
+    this.qmGameType = gameType;
+    this.qmOmokRuleset = omokRuleset;
     await this.cancelMatchmakingOrRoom();
     const seq = ++this.sessionSeq;
     this.qmPreferredSize = preferredSize;
@@ -436,6 +458,8 @@ export class OnlineMatchManager {
         clientId: this.profile.getClientId(),
         nickname: this.profile.getNickname(),
         preferredSize: this.qmPreferredSize,
+        gameType: this.qmGameType,
+        omokRuleset: this.qmOmokRuleset,
         joinedAt: Date.now(),
       };
       this.transport.publish(this.quickMatchTopic(), this.makeEnvelope('qm_seek', seek));
@@ -595,18 +619,26 @@ export class OnlineMatchManager {
     const myId = this.profile.getClientId();
     if (!peer.clientId || peer.clientId === myId) return;
 
+    const peerGameType: GameType = peer.gameType ?? 'baduk';
+    if (peerGameType !== this.qmGameType) return;
+    if (this.qmGameType === 'omok') {
+      const peerOmokRuleset: OmokRulesetType = peer.omokRuleset ?? 'renju';
+      if (peerOmokRuleset !== this.qmOmokRuleset) return;
+    }
+
     const sizeCompatible =
       this.qmPreferredSize === 'any' ||
       peer.preferredSize === 'any' ||
       this.qmPreferredSize === peer.preferredSize;
     if (!sizeCompatible) return;
 
+    const defaultSize: BoardSize = this.qmGameType === 'omok' ? 15 : 19;
     const resolvedSize: BoardSize =
       this.qmPreferredSize !== 'any'
         ? this.qmPreferredSize
         : peer.preferredSize !== 'any'
           ? peer.preferredSize
-          : 19;
+          : defaultSize;
 
     // Deterministic Host selection: smaller clientId initiates offer
     if (myId < peer.clientId) {
@@ -621,6 +653,8 @@ export class OnlineMatchManager {
         peerId: peer.clientId,
         roomCode,
         boardSize: resolvedSize,
+        gameType: this.qmGameType,
+        omokRuleset: this.qmOmokRuleset,
         expiresAt: now + 2600,
       };
 
@@ -632,6 +666,8 @@ export class OnlineMatchManager {
           hostName: this.profile.getNickname(),
           guestId: peer.clientId,
           boardSize: resolvedSize,
+          gameType: this.qmGameType,
+          omokRuleset: this.qmOmokRuleset,
         };
         this.transport.publish(this.directTopic(peer.clientId), this.makeEnvelope('qm_offer', offer));
       });
@@ -641,6 +677,8 @@ export class OnlineMatchManager {
         clientId: myId,
         nickname: this.profile.getNickname(),
         preferredSize: this.qmPreferredSize,
+        gameType: this.qmGameType,
+        omokRuleset: this.qmOmokRuleset,
         joinedAt: Date.now(),
       };
       this.transport.publish(this.quickMatchTopic(), this.makeEnvelope('qm_seek', seek));
@@ -662,6 +700,8 @@ export class OnlineMatchManager {
       guestId: this.profile.getClientId(),
       guestName: this.profile.getNickname(),
       boardSize: offer.boardSize,
+      gameType: offer.gameType ?? this.qmGameType,
+      omokRuleset: offer.omokRuleset ?? this.qmOmokRuleset,
     };
     this.transport.publish(this.directTopic(offer.hostId), this.makeEnvelope('qm_accept', accept));
 
@@ -699,6 +739,8 @@ export class OnlineMatchManager {
       whiteName: hostIsBlack ? accept.guestName : myName,
       boardSize: size,
       ruleset: 'korean',
+      gameType: accept.gameType ?? this.qmPendingOffer?.gameType ?? this.qmGameType,
+      omokRuleset: accept.omokRuleset ?? this.qmPendingOffer?.omokRuleset ?? this.qmOmokRuleset,
       handicap: 0,
       komi: 6.5,
       mainTimeSeconds: size === 9 ? 300 : 600,
@@ -753,6 +795,8 @@ export class OnlineMatchManager {
           whiteName: hostIsBlack ? req.guestName : myName,
           boardSize: room.boardSize,
           ruleset: room.ruleset,
+          gameType: room.gameType ?? 'baduk',
+          omokRuleset: room.omokRuleset ?? 'renju',
           handicap: room.handicap,
           komi: room.komi,
           mainTimeSeconds: room.mainTimeSeconds,
@@ -970,6 +1014,8 @@ export class OnlineMatchManager {
     const config: GameConfig = {
       boardSize: init.boardSize,
       ruleset: init.ruleset,
+      gameType: init.gameType ?? 'baduk',
+      omokRuleset: init.omokRuleset ?? 'renju',
       handicap: init.handicap,
       komi: init.komi,
       superko: true,

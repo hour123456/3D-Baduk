@@ -67,7 +67,11 @@ export function getBoardMetrics(size: BoardSize): BoardGridMetrics {
   let gridSpanZ = 4.02;
   let stoneRadius = 0.1015;
 
-  if (size === 13) {
+  if (size === 15) {
+    gridSpanX = 3.66;
+    gridSpanZ = 3.88;
+    stoneRadius = 0.123;
+  } else if (size === 13) {
     gridSpanX = 3.54;
     gridSpanZ = 3.76;
     stoneRadius = 0.138;

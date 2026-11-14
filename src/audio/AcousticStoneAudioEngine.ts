@@ -1,3 +1,15 @@
+/**
+ * AcousticStoneAudioEngine
+ *
+ * Sample-accurate physical modeling synthesis for authentic Baduk acoustics:
+ * - Slate (오석) & Clamshell (해남석) biconvex disk modal resonances + Hertzian contact pulses
+ * - Jujube wood bowl (대추나무 바둑통) cavity resonance + Poisson multi-stone rattle cascades
+ * - Kaya wood Goban (비자나무 각반 + 혈 울림통) dual-contact rim-to-belly placement snap ("딱! / 착!")
+ * - Adjacent stone micro-collision clinks on close-quarters tactical moves ("붙임 / 끼움")
+ * - Shallow wooden lid (바둑통 뚜껑) multi-bounce prisoner drop ("달그락 / 타닥톡")
+ * - Intimate traditional wooden room Impulse Response convolution reverb
+ */
+
 interface ModalPartial {
   freq: number;
   amp: number;
@@ -17,6 +29,7 @@ export class AcousticStoneAudioEngine {
   private muted = false;
   private initialized = false;
 
+  // Pre-synthesized sample-accurate acoustic variation banks
   private slateClackBuffers: AudioBuffer[] = [];
   private shellClackBuffers: AudioBuffer[] = [];
   private bowlWoodTapBuffers: AudioBuffer[] = [];
@@ -26,6 +39,7 @@ export class AcousticStoneAudioEngine {
   private lidWoodDropBuffers: AudioBuffer[] = [];
 
   private lastBowlRattleTime = 0;
+  private lastCollisionClinkTime = 0;
 
   public ensureReady(): void {
     if (!this.ctx) {
@@ -88,6 +102,10 @@ export class AcousticStoneAudioEngine {
     return this.muted;
   }
 
+  /**
+   * Builds a warm, short (0.34s) wooden & tatami room Impulse Response
+   * with realistic early tabletop/wall reflections and high-frequency air absorption.
+   */
   private buildTraditionalRoomIR(ctx: AudioContext): AudioBuffer {
     const sr = ctx.sampleRate;
     const duration = 0.34;
@@ -114,8 +132,10 @@ export class AcousticStoneAudioEngine {
 
       for (let i = 0; i < length; i++) {
         const t = i / sr;
+        // Exponential decay faster for highs, warm wood tail
         const env = Math.exp(-t / 0.068) * 0.55 + Math.exp(-t / 0.14) * 0.18;
         const white = rand() * env * (t < 0.003 ? t / 0.003 : 1);
+        // Warm lowpass damping over time
         const alpha = Math.max(0.08, 0.48 - t * 1.1);
         lpState += alpha * (white - lpState);
         data[i] = lpState * 0.45;
@@ -125,6 +145,7 @@ export class AcousticStoneAudioEngine {
         const idx = Math.floor((er.ms / 1000) * sr);
         if (idx < length - 8) {
           const g = ch === 0 ? er.gainL : er.gainR;
+          // Softened 5-sample warm reflection kernel
           data[idx] += g * 0.5;
           data[idx + 1] += g * 0.32;
           data[idx + 2] += g * 0.14;
@@ -135,6 +156,9 @@ export class AcousticStoneAudioEngine {
     return buffer;
   }
 
+  /**
+   * Renders a Hertzian elastic contact pulse + damped modal partials into a mono AudioBuffer.
+   */
   private renderModalImpactBuffer(
     ctx: AudioContext,
     durationSec: number,
@@ -151,6 +175,7 @@ export class AcousticStoneAudioEngine {
 
     const pulseSamples = Math.max(4, Math.floor(contactPulseSec * sr));
     for (let i = 0; i < pulseSamples && i < len; i++) {
+      // Hertzian contact force F(t) ~ sin(pi * t / tau)^1.5
       const s = Math.sin((Math.PI * i) / pulseSamples);
       out[i] += contactGain * Math.pow(s, 1.5);
     }
@@ -160,6 +185,7 @@ export class AcousticStoneAudioEngine {
       const phase0 = p.phase ?? 0;
       const decayPerSample = Math.exp(-1 / (p.decaySec * sr));
       let env = p.amp;
+      // 0.25ms smooth onset to avoid non-physical DC step click
       const attackSamples = Math.max(3, Math.floor(0.00025 * sr));
       for (let i = 0; i < len; i++) {
         const atk = i < attackSamples ? i / attackSamples : 1;
@@ -170,6 +196,7 @@ export class AcousticStoneAudioEngine {
     }
 
     if (noiseBurstGain > 0) {
+      // Resonant bandpass filtered micro-surface texture burst
       let bpY1 = 0;
       let bpY2 = 0;
       const f0 = noiseFreqHz / sr;
@@ -193,7 +220,11 @@ export class AcousticStoneAudioEngine {
     return buf;
   }
 
+  /**
+   * Pre-synthesizes multi-variant acoustic buffers at startup for instant, zero-jitter playback.
+   */
   private synthesizeBufferBanks(ctx: AudioContext): void {
+    // 1. Nachi Black Slate (오석) stone-on-stone clacks (dense, warm ceramic-mineral click)
     for (let v = 0; v < 8; v++) {
       const detune = 0.94 + v * 0.018;
       this.slateClackBuffers.push(
@@ -216,6 +247,7 @@ export class AcousticStoneAudioEngine {
       );
     }
 
+    // 2. Hyuga Clamshell (해남석/조개돌) stone-on-stone clacks (slightly crisper crystalline CaCO3 sheen)
     for (let v = 0; v < 8; v++) {
       const detune = 0.95 + v * 0.017;
       this.shellClackBuffers.push(
@@ -238,6 +270,7 @@ export class AcousticStoneAudioEngine {
       );
     }
 
+    // 3. Jujube Hardwood Bowl Wall / Cavity Taps (대추나무 바둑통 내부 울림)
     for (let v = 0; v < 5; v++) {
       const d = 0.95 + v * 0.025;
       this.bowlWoodTapBuffers.push(
@@ -259,15 +292,18 @@ export class AcousticStoneAudioEngine {
       );
     }
 
+    // 4. Smooth Mineral Sliding / Settling Grain ("사르륵" 돌 쓸림 마찰음)
     for (let v = 0; v < 4; v++) {
       this.slideGrainBuffers.push(this.buildMineralSlideBuffer(ctx, 0.09 + v * 0.025, 2200 + v * 320));
     }
 
+    // 5. Kaya Goban Center & Edge Dual-Contact Placement Snaps ("딱! / 착!")
     for (let v = 0; v < 6; v++) {
       this.boardCenterSnapBuffers.push(this.buildGobanSnapBuffer(ctx, true, v));
       this.boardEdgeSnapBuffers.push(this.buildGobanSnapBuffer(ctx, false, v));
     }
 
+    // 6. Upside-down Jujube Bowl Lid Impact (사석 바둑통 뚜껑 낙하 울림)
     for (let v = 0; v < 5; v++) {
       const d = 0.96 + v * 0.022;
       this.lidWoodDropBuffers.push(
@@ -290,6 +326,12 @@ export class AcousticStoneAudioEngine {
     }
   }
 
+  /**
+   * Synthesizes the iconic biconvex stone placement on a thick Kaya wood Goban:
+   * - Contact 1 (t = 0ms): Stone rim touches the wood surface
+   * - Contact 2 (t = 1.6~3.1ms): Biconvex belly snaps flat onto the Kaya slab,
+   *   exciting the hollow pyramid cavity (혈) underneath + crisp lacquer surface snap!
+   */
   private buildGobanSnapBuffer(ctx: AudioContext, isCenter: boolean, variant: number): AudioBuffer {
     const sr = ctx.sampleRate;
     const duration = 0.22;
@@ -298,9 +340,11 @@ export class AcousticStoneAudioEngine {
     const out = buf.getChannelData(0);
 
     const d = 0.965 + variant * 0.014;
+    // Rim-to-belly rock-down delay: 1.6ms to 3.0ms gives authentic Baduk snap comb texture!
     const snapDelaySec = 0.0016 + (variant % 4) * 0.00042;
     const snapOffset = Math.floor(snapDelaySec * sr);
 
+    // Pre-contact 1: subtle rim touch
     const rimPartials: ModalPartial[] = [
       { freq: (isCenter ? 310 : 390) * d, amp: 0.16, decaySec: 0.016 },
       { freq: 1680 * d, amp: 0.22, decaySec: 0.0055, phase: 0.4 },
@@ -312,8 +356,10 @@ export class AcousticStoneAudioEngine {
       out[i] += rimData[i];
     }
 
+    // Main Contact 2: Full stone belly slap + Kaya cavity resonance ("딱!")
     const bodyPartials: ModalPartial[] = isCenter
       ? [
+          // Deep Kaya wood block + pyramid cavity air mode
           { freq: 156 * d, amp: 0.46, decaySec: 0.046 },
           { freq: 258 * d, amp: 0.52, decaySec: 0.032, phase: 0.3 },
           { freq: 472 * d, amp: 0.38, decaySec: 0.021, phase: 0.8 },
@@ -323,6 +369,7 @@ export class AcousticStoneAudioEngine {
           { freq: 5280 * d, amp: 0.14, decaySec: 0.0023, phase: 0.2 },
         ]
       : [
+          // Corner/edge stiffer wood impedance near carved legs (brighter, tighter "딱!")
           { freq: 192 * d, amp: 0.32, decaySec: 0.035 },
           { freq: 328 * d, amp: 0.48, decaySec: 0.026, phase: 0.3 },
           { freq: 615 * d, amp: 0.42, decaySec: 0.018, phase: 0.9 },
@@ -367,6 +414,7 @@ export class AcousticStoneAudioEngine {
       seed = (seed * 1664525 + 1013904223) >>> 0;
       const n = (seed / 0xffffffff) * 2 - 1;
       const u = i / len;
+      // Smooth bell envelope with micro-grain modulation
       const grain = 0.65 + 0.35 * Math.sin(2 * Math.PI * u * 11);
       const env = Math.sin(Math.PI * u) * Math.exp(-u * 1.8) * grain;
       const y = n * (1 - r) - a1 * y1 - a2 * y2;
@@ -416,6 +464,10 @@ export class AcousticStoneAudioEngine {
     src.start(Math.max(this.ctx.currentTime, when));
   }
 
+  /**
+   * 1. Bowl Rattle ("바둑통 잘그락거림"):
+   * Clustered cascade of stone-on-stone clacks + jujube bowl wood resonance + mineral slide friction.
+   */
   public playBowlRattle(side: 'left' | 'right', intensity = 0.75, isBlackBowl = side === 'right'): void {
     this.ensureReady();
     if (!this.ctx || !this.initialized || this.muted) return;
@@ -429,13 +481,16 @@ export class AcousticStoneAudioEngine {
     const clampedIntensity = Math.max(0.25, Math.min(1.2, intensity));
     const stoneBank = isBlackBowl ? this.slateClackBuffers : this.shellClackBuffers;
 
+    // Number of colliding stones scales naturally with stir intensity (6 to 15 micro-collisions)
     const count = Math.floor(6 + clampedIntensity * 8);
     let cursor = 0;
 
+    // Underlying subtle mineral slide friction ("사르륵")
     const slideBuf = this.slideGrainBuffers[Math.floor(Math.random() * this.slideGrainBuffers.length)];
     this.scheduleBuffer(slideBuf, now + 0.008, 0.26 * clampedIntensity, 0.92 + Math.random() * 0.18, basePan);
 
     for (let i = 0; i < count; i++) {
+      // Clustered Poisson inter-arrival times: dense burst first, settling tail later
       const progress = i / count;
       const stepSec = (0.005 + Math.random() * 0.022) * (0.7 + progress * 1.45);
       cursor += stepSec;
@@ -445,10 +500,12 @@ export class AcousticStoneAudioEngine {
       const velocity = (0.16 + Math.random() * 0.28) * clampedIntensity * decayEnvelope;
       const rate = 0.91 + Math.random() * 0.2;
       const panJitter = basePan + (Math.random() - 0.5) * 0.14;
+      // Deeper buried stones have slightly warmer lowpass filtering
       const lp = 4800 + Math.random() * 6500;
 
       this.scheduleBuffer(buf, now + cursor, velocity, rate, panJitter, lp);
 
+      // Every ~3rd stone nudges the wooden jujube bowl wall for authentic hollow wooden warmth
       if (i % 3 === 1) {
         const woodBuf = this.bowlWoodTapBuffers[Math.floor(Math.random() * this.bowlWoodTapBuffers.length)];
         this.scheduleBuffer(
@@ -462,6 +519,10 @@ export class AcousticStoneAudioEngine {
     }
   }
 
+  /**
+   * 2. Stone Pickup ("돌 집어 올리기"):
+   * Subtle finger lift + 3~4 neighboring stones settling gently into the gap.
+   */
   public playStonePickup(side: 'left' | 'right', isBlack = side === 'right'): void {
     this.ensureReady();
     if (!this.ctx || !this.initialized || this.muted) return;
@@ -481,12 +542,17 @@ export class AcousticStoneAudioEngine {
     });
   }
 
+  /**
+   * 3. Board Stone Placement ("바둑판 착수음 '딱!' / '착!'"):
+   * Blends center vs edge Goban resonance based on board position, adds subtle slate/clamshell top transient,
+   * and triggers micro-jostle stone clinks when placed adjacent to existing stones on the board!
+   */
   public playStonePlace(params: {
-    normX: number;
-    normY: number;
-    force?: number;
+    normX: number; // -1 (left) to +1 (right)
+    normY: number; // -1 (top) to +1 (bottom)
+    force?: number; // 0.6 ~ 1.25
     isBlack: boolean;
-    adjacentStones?: number;
+    adjacentStones?: number; // 0..4
   }): void {
     this.ensureReady();
     if (!this.ctx || !this.initialized || this.muted) return;
@@ -495,6 +561,7 @@ export class AcousticStoneAudioEngine {
     const force = Math.max(0.55, Math.min(1.25, params.force ?? 0.92));
     const pan = params.normX * 0.36;
 
+    // Radial distance from Tangen (천원 center): 0 at center, ~1 at corners
     const radialDist = Math.min(1, Math.hypot(params.normX, params.normY) / 1.25);
     const centerWeight = 1 - radialDist * 0.8;
     const edgeWeight = radialDist * 0.85;
@@ -521,10 +588,12 @@ export class AcousticStoneAudioEngine {
       );
     }
 
+    // Subtle stone body mineral character on finger release
     const stoneBank = params.isBlack ? this.slateClackBuffers : this.shellClackBuffers;
     const bodyClick = stoneBank[Math.floor(Math.random() * stoneBank.length)];
     this.scheduleBuffer(bodyClick, now + 0.0018, 0.18 * force, rateJitter, pan, 5400);
 
+    // Adjacent stone micro-jostle ("붙임/끼움/단수" 시 옆 돌과 살짝 부딪히는 '톡/찰칵' 소리!)
     const adj = params.adjacentStones ?? 0;
     if (adj > 0) {
       const clinkCount = Math.min(3, adj);
@@ -544,6 +613,11 @@ export class AcousticStoneAudioEngine {
     }
   }
 
+  /**
+   * 4. Capture Scoop & Bowl Lid Drop ("사석 수거 및 바둑통 뚜껑 투하"):
+   * Models each captured stone landing in the shallow wooden lid with 2~3 micro-bounces
+   * and clattering against existing prisoners in the lid.
+   */
   public playCaptureToLid(
     capturedCount: number,
     existingPrisoners: number,
@@ -563,6 +637,7 @@ export class AcousticStoneAudioEngine {
       const lidBuf = this.lidWoodDropBuffers[Math.floor(Math.random() * this.lidWoodDropBuffers.length)];
       const prisonerDensity = Math.min(1, (existingPrisoners + k) / 6);
 
+      // Primary drop onto wooden lid (softer wood if many stones already cushion it, more stone clatter!)
       this.scheduleBuffer(
         lidBuf,
         now + baseDelay,
@@ -571,6 +646,7 @@ export class AcousticStoneAudioEngine {
         pan
       );
 
+      // Secondary biconvex stone rock-settle bounce on lid ("타-닥-톡")
       this.scheduleBuffer(
         lidBuf,
         now + baseDelay + 0.032 + Math.random() * 0.012,
@@ -580,6 +656,7 @@ export class AcousticStoneAudioEngine {
         4200
       );
 
+      // Stone-on-stone clink against existing captured prisoners in the lid
       if (existingPrisoners + k > 0) {
         const clink1 = stoneBank[Math.floor(Math.random() * stoneBank.length)];
         this.scheduleBuffer(
@@ -602,6 +679,9 @@ export class AcousticStoneAudioEngine {
     }
   }
 
+  /**
+   * 5. Byoyomi Clock Countdown Chime (초읽기 알림음)
+   */
   public playByoyomiTick(secondsLeft: number): void {
     this.ensureReady();
     if (!this.ctx || !this.dryBus || this.muted) return;
@@ -637,6 +717,57 @@ export class AcousticStoneAudioEngine {
     oscHarm.stop(now + 0.2);
   }
 
+  /**
+   * Physics-coupled adjacent stone collision clink sound scaled by impulse energy.
+   */
+  public playStoneCollisionClink(impulse: number, isBlack: boolean, pan = 0): void {
+    this.ensureReady();
+    if (!this.ctx || !this.initialized || this.muted) return;
+
+    const now = this.ctx.currentTime;
+    if (now - this.lastCollisionClinkTime < 0.032) return;
+    this.lastCollisionClinkTime = now;
+
+    const bank = isBlack ? this.slateClackBuffers : this.shellClackBuffers;
+    if (bank.length === 0) return;
+
+    const buf = bank[Math.floor(Math.random() * bank.length)];
+    const gain = Math.max(0.06, Math.min(0.45, 0.09 + impulse * 0.34));
+    const rate = 0.94 + Math.random() * 0.16;
+    const lp = 4400 + impulse * 5800;
+    this.scheduleBuffer(buf, now + 0.002, gain, rate, Math.max(-0.8, Math.min(0.8, pan)), lp);
+  }
+
+  /**
+   * Ascending ceremonial harmonic chime on Omok 5-in-a-row or game victory.
+   */
+  public playWinCelebrationChime(): void {
+    this.ensureReady();
+    if (!this.ctx || !this.dryBus || !this.wetBus || this.muted) return;
+
+    const now = this.ctx.currentTime + 0.015;
+    const chord = [523.25, 659.25, 783.99, 1046.5];
+    chord.forEach((freq, idx) => {
+      if (!this.ctx || !this.dryBus || !this.wetBus) return;
+      const t = now + idx * 0.085;
+      const osc = this.ctx.createOscillator();
+      const g = this.ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.value = freq;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.linearRampToValueAtTime(0.09, t + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.65);
+      osc.connect(g);
+      g.connect(this.dryBus);
+      g.connect(this.wetBus);
+      osc.start(t);
+      osc.stop(t + 0.68);
+    });
+  }
+
+  /**
+   * Subtle ceremonial wooden clapper/bell sound on game start or result
+   */
   public playCeremonialChime(type: 'start' | 'finish'): void {
     this.ensureReady();
     if (!this.ctx || !this.dryBus || !this.wetBus || this.muted) return;

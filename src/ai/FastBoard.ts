@@ -1,20 +1,62 @@
 import { BLACK, WHITE, EMPTY, BoardSize, PlayerColor, RulesetType, opponentColor } from '../rules/types';
 import { stoneZobristKey, computeBoardHash } from '../rules/zobrist';
 
+interface BoardTopology {
+  neighbors: Int16Array;
+  diagonals: Int16Array;
+}
+
+const TOPOLOGY_CACHE = new Map<number, BoardTopology>();
+
+function getBoardTopology(size: number): BoardTopology {
+  const cached = TOPOLOGY_CACHE.get(size);
+  if (cached) return cached;
+
+  const total = size * size;
+  const neighbors = new Int16Array(total * 4).fill(-1);
+  const diagonals = new Int16Array(total * 4).fill(-1);
+
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const idx = y * size + x;
+      let k = 0;
+      if (x > 0) neighbors[idx * 4 + k++] = idx - 1;
+      if (x < size - 1) neighbors[idx * 4 + k++] = idx + 1;
+      if (y > 0) neighbors[idx * 4 + k++] = idx - size;
+      if (y < size - 1) neighbors[idx * 4 + k++] = idx + size;
+
+      let d = 0;
+      if (x > 0 && y > 0) diagonals[idx * 4 + d++] = (y - 1) * size + (x - 1);
+      if (x < size - 1 && y > 0) diagonals[idx * 4 + d++] = (y - 1) * size + (x + 1);
+      if (x > 0 && y < size - 1) diagonals[idx * 4 + d++] = (y + 1) * size + (x - 1);
+      if (x < size - 1 && y < size - 1) diagonals[idx * 4 + d++] = (y + 1) * size + (x + 1);
+    }
+  }
+
+  const topo = { neighbors, diagonals };
+  TOPOLOGY_CACHE.set(size, topo);
+  return topo;
+}
+
+/**
+ * FastBoard: High-speed flat-array Go simulator tailored for MCTS playouts and tactical lookahead.
+ */
 export class FastBoard {
   public readonly size: BoardSize;
   public readonly total: number;
   public grid: Uint8Array;
-  public koIdx: number;
-  public capturesBlack: number;
-  public capturesWhite: number;
+  public koIdx: number; // -1 if none
+  public capturesBlack: number; // White stones captured by Black
+  public capturesWhite: number; // Black stones captured by White
   public hash: bigint;
 
+  // Reusable scratch buffers to eliminate per-move allocations during MCTS rollouts
   private readonly visited: Uint32Array;
   private visitToken = 1;
   private readonly stack: Int16Array;
-  private readonly neighborsTable: Int16Array;
-  private readonly diagonalsTable: Int16Array;
+  private readonly groupBuf: Int16Array;
+  private readonly neighborsTable: Int16Array; // [idx * 4 + 0..3], -1 padded
+  private readonly diagonalsTable: Int16Array; // [idx * 4 + 0..3], -1 padded
 
   constructor(size: BoardSize) {
     this.size = size;
@@ -27,25 +69,10 @@ export class FastBoard {
 
     this.visited = new Uint32Array(this.total);
     this.stack = new Int16Array(this.total);
-    this.neighborsTable = new Int16Array(this.total * 4).fill(-1);
-    this.diagonalsTable = new Int16Array(this.total * 4).fill(-1);
-
-    for (let y = 0; y < size; y++) {
-      for (let x = 0; x < size; x++) {
-        const idx = y * size + x;
-        let k = 0;
-        if (x > 0) this.neighborsTable[idx * 4 + k++] = idx - 1;
-        if (x < size - 1) this.neighborsTable[idx * 4 + k++] = idx + 1;
-        if (y > 0) this.neighborsTable[idx * 4 + k++] = idx - size;
-        if (y < size - 1) this.neighborsTable[idx * 4 + k++] = idx + size;
-
-        let d = 0;
-        if (x > 0 && y > 0) this.diagonalsTable[idx * 4 + d++] = (y - 1) * size + (x - 1);
-        if (x < size - 1 && y > 0) this.diagonalsTable[idx * 4 + d++] = (y - 1) * size + (x + 1);
-        if (x > 0 && y < size - 1) this.diagonalsTable[idx * 4 + d++] = (y + 1) * size + (x - 1);
-        if (x < size - 1 && y < size - 1) this.diagonalsTable[idx * 4 + d++] = (y + 1) * size + (x + 1);
-      }
-    }
+    this.groupBuf = new Int16Array(this.total);
+    const topo = getBoardTopology(size);
+    this.neighborsTable = topo.neighbors;
+    this.diagonalsTable = topo.diagonals;
   }
 
   public copyFromState(
@@ -93,6 +120,10 @@ export class FastBoard {
     return this.diagonalsTable.subarray(idx * 4, idx * 4 + 4);
   }
 
+  /**
+   * Counts liberties of the chain at startIdx (up to maxLimit for early exit)
+   * and also records chain stone count and up to 2 liberty indices.
+   */
   public analyzeChain(
     startIdx: number,
     maxLimit = 4
@@ -126,7 +157,7 @@ export class FastBoard {
             else if (libertyCount === 1) lib1 = n;
             libertyCount++;
             if (libertyCount >= maxLimit) {
-              // continue stone traversal
+              // Keep counting stones only if needed? Early exit is safe when caller only cares about >= maxLimit
             }
           }
         } else if (nc === color && this.visited[n] !== tok) {
@@ -189,6 +220,9 @@ export class FastBoard {
     return { removedCount: count, singleIdx };
   }
 
+  /**
+   * Attempts to play at idx for `color`. Returns number of captured stones (>= 0), or -1 if illegal!
+   */
   public play(idx: number, color: PlayerColor, forbiddenHashes?: Set<bigint>): number {
     if (idx < 0 || idx >= this.total) return -1;
     if (this.grid[idx] !== EMPTY || idx === this.koIdx) return -1;
@@ -215,6 +249,7 @@ export class FastBoard {
     }
 
     if (totalCaptured === 0 && !this.hasAnyLiberty(idx)) {
+      // Suicide: revert immediately
       this.grid[idx] = EMPTY;
       this.hash = prevHash;
       this.koIdx = prevKo;
@@ -222,12 +257,14 @@ export class FastBoard {
     }
 
     if (forbiddenHashes && forbiddenHashes.has(this.hash)) {
+      // Superko violation: full revert needed if stones were captured — caller uses clone when checking root superko
       return -1;
     }
 
     if (color === BLACK) this.capturesBlack += totalCaptured;
     else this.capturesWhite += totalCaptured;
 
+    // Simple Ko detection
     if (totalCaptured === 1) {
       const ownInfo = this.analyzeChain(idx, 2);
       if (ownInfo.stoneCount === 1 && ownInfo.libertyCount === 1) {
@@ -246,6 +283,7 @@ export class FastBoard {
     if (idx < 0 || idx >= this.total) return false;
     if (this.grid[idx] !== EMPTY || idx === this.koIdx) return false;
 
+    // Quick path: if any orthogonal neighbor is EMPTY, placing here definitely has >= 1 liberty (unless superko)
     const base = idx * 4;
     let hasEmptyNbr = false;
     for (let i = 0; i < 4; i++) {
@@ -265,6 +303,9 @@ export class FastBoard {
     return test.play(idx, color, forbiddenHashes) >= 0;
   }
 
+  /**
+   * Checks if empty point `idx` is a true eye for `color` (should never be filled by own stone).
+   */
   public isTrueEye(idx: number, color: PlayerColor): boolean {
     if (this.grid[idx] !== EMPTY) return false;
     const base = idx * 4;
@@ -274,6 +315,7 @@ export class FastBoard {
       if (this.grid[n] !== color) return false;
     }
 
+    // Check diagonals: allow at most 1 opponent/uncontrolled diagonal in interior, 0 on edges/corners
     const opp = opponentColor(color);
     let diagTotal = 0;
     let oppDiag = 0;
@@ -288,6 +330,9 @@ export class FastBoard {
     return oppDiag === 0;
   }
 
+  /**
+   * Fast end-of-rollout score evaluation for MCTS (returns Black - White score difference).
+   */
   public evaluateRolloutScore(ruleset: RulesetType, komi: number): number {
     let blackPoints = 0;
     let whitePoints = 0;
@@ -298,6 +343,7 @@ export class FastBoard {
         if (c === BLACK) blackPoints++;
         else if (c === WHITE) whitePoints++;
         else {
+          // Single-point or enclosed territory owner check
           const base = i * 4;
           let seenB = false;
           let seenW = false;
@@ -314,6 +360,7 @@ export class FastBoard {
       }
       return blackPoints - (whitePoints + komi);
     } else {
+      // Korean rules rollout evaluation: empty territory + prisoners captured!
       blackPoints = this.capturesBlack;
       whitePoints = this.capturesWhite;
       for (let i = 0; i < this.total; i++) {

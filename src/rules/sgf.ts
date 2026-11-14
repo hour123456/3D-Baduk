@@ -1,5 +1,16 @@
-import { BLACK, WHITE, BoardSize, Coord, PlayerColor, RulesetType } from './types';
+import {
+  BLACK,
+  WHITE,
+  BoardSize,
+  Coord,
+  GameConfig,
+  GameType,
+  OmokRulesetType,
+  PlayerColor,
+  RulesetType,
+} from './types';
 import { GoEngine } from './GoEngine';
+import { GomokuEngine } from './GomokuEngine';
 
 function coordToSgf(coord: Coord | null): string {
   if (!coord) return '';
@@ -11,7 +22,7 @@ function coordToSgf(coord: Coord | null): string {
 function sgfToCoord(token: string, size: BoardSize): Coord | null {
   const clean = token.trim();
   if (clean.length === 0 || (clean === 'tt' && size <= 19)) {
-    return null;
+    return null; // Pass
   }
   if (clean.length < 2) return null;
   const x = clean.charCodeAt(0) - 97;
@@ -24,12 +35,24 @@ function escapeSgfText(text: string): string {
   return text.replace(/\\/g, '\\\\').replace(/\]/g, '\\]');
 }
 
-export function exportToSgf(engine: GoEngine): string {
+export function exportToSgf(engine: GoEngine | GomokuEngine): string {
   const cfg = engine.config;
+  const isOmok = cfg.gameType === 'omok' || engine instanceof GomokuEngine;
   const dateStr = new Date().toISOString().slice(0, 10);
-  const ru = cfg.ruleset === 'korean' ? 'Korean' : 'Chinese';
-  const pb = escapeSgfText(cfg.blackName || (cfg.mode === 'ai' && cfg.humanColor === WHITE ? `AI (Lv.${cfg.aiDifficulty})` : '흑 대국자'));
-  const pw = escapeSgfText(cfg.whiteName || (cfg.mode === 'ai' && cfg.humanColor === BLACK ? `AI (Lv.${cfg.aiDifficulty})` : '백 대국자'));
+  const gm = isOmok ? 4 : 1;
+  const ru = isOmok
+    ? (cfg.omokRuleset ?? 'renju') === 'freestyle'
+      ? 'Freestyle'
+      : 'Renju'
+    : cfg.ruleset === 'korean'
+      ? 'Korean'
+      : 'Chinese';
+  const pb = escapeSgfText(
+    cfg.blackName || (cfg.mode === 'ai' && cfg.humanColor === WHITE ? `AI (Lv.${cfg.aiDifficulty})` : '흑 대국자')
+  );
+  const pw = escapeSgfText(
+    cfg.whiteName || (cfg.mode === 'ai' && cfg.humanColor === BLACK ? `AI (Lv.${cfg.aiDifficulty})` : '백 대국자')
+  );
 
   let re = '';
   if (engine.result) {
@@ -39,14 +62,15 @@ export function exportToSgf(engine: GoEngine): string {
       const w = engine.result.winner === BLACK ? 'B' : 'W';
       if (engine.result.reason === 'resign') re = `RE[${w}+R]`;
       else if (engine.result.reason === 'timeout') re = `RE[${w}+T]`;
+      else if (engine.result.reason === 'five_in_row') re = `RE[${w}+5]`;
       else re = `RE[${w}+${engine.result.margin ?? 0}]`;
     }
   }
 
-  let header = `(;FF[4]GM[1]CA[UTF-8]AP[Sudam3DBaduk:1.0]SZ[${engine.size}]KM[${cfg.komi}]RU[${ru}]DT[${dateStr}]PB[${pb}]PW[${pw}]`;
+  let header = `(;FF[4]GM[${gm}]CA[UTF-8]AP[Sudam3DBaduk:2.0]SZ[${engine.size}]KM[${isOmok ? 0 : cfg.komi}]RU[${ru}]DT[${dateStr}]PB[${pb}]PW[${pw}]`;
   if (re) header += re;
 
-  if (engine.handicapStones.length >= 2) {
+  if (!isOmok && engine instanceof GoEngine && engine.handicapStones.length >= 2) {
     header += `HA[${engine.handicapStones.length}]AB`;
     for (const pt of engine.handicapStones) {
       header += `[${coordToSgf(pt)}]`;
@@ -63,6 +87,8 @@ export function exportToSgf(engine: GoEngine): string {
 }
 
 export interface ParsedSgfGame {
+  gameType: GameType;
+  omokRuleset: OmokRulesetType;
   boardSize: BoardSize;
   komi: number;
   ruleset: RulesetType;
@@ -76,6 +102,9 @@ export interface ParsedSgfGame {
 }
 
 export function parseSgf(sgfContent: string): ParsedSgfGame {
+  // Tokenize SGF properties along the main variation (first branch if variations exist)
+  let gameType: GameType = 'baduk';
+  let omokRuleset: OmokRulesetType = 'renju';
   let boardSize: BoardSize = 19;
   let komi = 6.5;
   let ruleset: RulesetType = 'korean';
@@ -87,10 +116,13 @@ export function parseSgf(sgfContent: string): ParsedSgfGame {
   let whiteName: string | undefined;
   let resultText: string | undefined;
 
+  // Strip nested side-variations while keeping the main trunk
   let mainLine = '';
   let depth = 0;
   let inBracket = false;
   let escaped = false;
+  // Keep depth === 1 (primary game tree) and stop if a sibling variation starts after depth 1 closes,
+  // or skip nested sub-variations (depth > 1) after first child
   let closedAtDepth1 = false;
   const branchTakenAtDepth = new Map<number, boolean>();
 
@@ -119,6 +151,7 @@ export function parseSgf(sgfContent: string): ParsedSgfGame {
       } else {
         if (!branchTakenAtDepth.get(parentDepth)) {
           branchTakenAtDepth.set(parentDepth, true);
+          // Inline first branch into main trunk
           depth = 1;
         } else {
           depth = parentDepth + 1;
@@ -156,15 +189,30 @@ export function parseSgf(sgfContent: string): ParsedSgfGame {
       }
 
       if (nodeIdx === 0) {
-        if (key === 'SZ' && values[0]) {
+        if (key === 'GM' && values[0]) {
+          const gm = parseInt(values[0], 10);
+          if (gm === 4 || gm === 5) gameType = 'omok';
+        } else if (key === 'SZ' && values[0]) {
           const sz = parseInt(values[0], 10);
-          if (sz === 9 || sz === 13 || sz === 19) boardSize = sz;
+          if (sz === 9 || sz === 13 || sz === 15 || sz === 19) {
+            boardSize = sz;
+            if (sz === 15) gameType = 'omok';
+          }
         } else if (key === 'KM' && values[0]) {
           const km = parseFloat(values[0]);
           if (!Number.isNaN(km)) komi = km;
         } else if (key === 'RU' && values[0]) {
-          if (/chinese|area|aga/i.test(values[0])) ruleset = 'chinese';
-          else ruleset = 'korean';
+          if (/freestyle|gomoku/i.test(values[0])) {
+            omokRuleset = 'freestyle';
+            gameType = 'omok';
+          } else if (/renju/i.test(values[0])) {
+            omokRuleset = 'renju';
+            gameType = 'omok';
+          } else if (/chinese|area|aga/i.test(values[0])) {
+            ruleset = 'chinese';
+          } else {
+            ruleset = 'korean';
+          }
         } else if (key === 'HA' && values[0]) {
           const ha = parseInt(values[0], 10);
           if (!Number.isNaN(ha)) handicap = ha;
@@ -196,6 +244,8 @@ export function parseSgf(sgfContent: string): ParsedSgfGame {
   });
 
   return {
+    gameType,
+    omokRuleset,
     boardSize,
     komi,
     ruleset,

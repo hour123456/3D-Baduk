@@ -5,6 +5,8 @@ import {
   AIDifficulty,
   BoardSize,
   Coord,
+  GameType,
+  OmokRulesetType,
   PlayerColor,
   RulesetType,
   opponentColor,
@@ -14,6 +16,9 @@ import { FastBoard } from './FastBoard';
 import { computeCandidateMovesAndPriors } from './GoHeuristics';
 
 export interface AISearchRequest {
+  gameType?: GameType;
+  omokRuleset?: OmokRulesetType;
+  includeHints?: boolean;
   board: Uint8Array;
   size: BoardSize;
   color: PlayerColor;
@@ -24,22 +29,29 @@ export interface AISearchRequest {
   lastMove: Coord | null;
   opponentPassed: boolean;
   moveCount: number;
-  positionHashes: string[];
+  positionHashes: string[]; // serialized bigint strings
   difficulty: AIDifficulty;
 }
 
-export interface AISearchResult {
-  coord: Coord | null;
+export interface AISuggestion {
+  coord: Coord;
   winrate: number;
+  visits: number;
+}
+
+export interface AISearchResult {
+  coord: Coord | null; // null = PASS
+  winrate: number; // 0..1 for AI color
   simulations: number;
   elapsedMs: number;
+  topSuggestions?: AISuggestion[];
 }
 
 interface DifficultyProfile {
   maxSimulations: number;
   timeBudgetMs: number;
   cPuct: number;
-  raveEquiv: number;
+  raveEquiv: number; // 0 disables RAVE
   temperature: number;
   advancedTactics: boolean;
   maxChildren19: number;
@@ -47,58 +59,63 @@ interface DifficultyProfile {
 
 const DIFFICULTY_PROFILES: Record<AIDifficulty, DifficultyProfile> = {
   1: {
-    maxSimulations: 95,
+    // 입문: 빠르고 부드러운 수읽기, 입문자도 충분히 이길 수 있는 빈틈 허용
+    maxSimulations: 140,
     timeBudgetMs: 260,
-    cPuct: 1.8,
+    cPuct: 1.75,
     raveEquiv: 0,
-    temperature: 1.25,
+    temperature: 1.15,
     advancedTactics: false,
-    maxChildren19: 28,
+    maxChildren19: 30,
   },
   2: {
-    maxSimulations: 380,
+    // 초급: 기본 단수와 포석을 갖추지만 깊은 수읽기는 생략
+    maxSimulations: 520,
     timeBudgetMs: 480,
-    cPuct: 1.5,
-    raveEquiv: 250,
-    temperature: 0.58,
+    cPuct: 1.48,
+    raveEquiv: 300,
+    temperature: 0.52,
     advancedTactics: false,
-    maxChildren19: 36,
+    maxChildren19: 38,
   },
   3: {
-    maxSimulations: 1450,
-    timeBudgetMs: 900,
-    cPuct: 1.35,
-    raveEquiv: 700,
-    temperature: 0.18,
+    // 중급: RAVE + LGRF + 행마 패턴 활성화, 자연스러운 포석과 중반 전투
+    maxSimulations: 1850,
+    timeBudgetMs: 920,
+    cPuct: 1.32,
+    raveEquiv: 800,
+    temperature: 0.16,
     advancedTactics: false,
-    maxChildren19: 46,
+    maxChildren19: 48,
   },
   4: {
-    maxSimulations: 3800,
-    timeBudgetMs: 1450,
-    cPuct: 1.25,
-    raveEquiv: 1100,
-    temperature: 0.05,
+    // 고급: 축·환격·양단수 전술 판독기 + 정밀 수읽기
+    maxSimulations: 4800,
+    timeBudgetMs: 1650,
+    cPuct: 1.24,
+    raveEquiv: 1350,
+    temperature: 0.04,
     advancedTactics: true,
-    maxChildren19: 58,
+    maxChildren19: 64,
   },
   5: {
-    maxSimulations: 8500,
-    timeBudgetMs: 2150,
-    cPuct: 1.18,
-    raveEquiv: 1500,
+    // 마스터: 최대 시뮬레이션 예산 + LGRF-1 + 전술/끝내기 정밀도 극대화
+    maxSimulations: 10500,
+    timeBudgetMs: 2400,
+    cPuct: 1.16,
+    raveEquiv: 1800,
     temperature: 0.0,
     advancedTactics: true,
-    maxChildren19: 72,
+    maxChildren19: 84,
   },
 };
 
 class MctsNode {
-  public readonly moveIdx: number;
+  public readonly moveIdx: number; // -1 = PASS
   public readonly playerJustMoved: PlayerColor;
   public readonly prior: number;
   public visits = 0;
-  public valueSum = 0;
+  public valueSum = 0; // from perspective of playerJustMoved
   public amafVisits = 0;
   public amafValueSum = 0;
   public children: MctsNode[] | null = null;
@@ -111,6 +128,10 @@ class MctsNode {
 }
 
 export class MctsEngine {
+  /**
+   * Checks whether `idx` sits strictly inside `color`'s already completely enclosed alive territory
+   * with zero opponent stones nearby — playing there is pointless or loses a point in Korean rules.
+   */
   private isRedundantOwnTerritoryFill(
     board: Uint8Array,
     size: BoardSize,
@@ -124,6 +145,7 @@ export class MctsEngine {
     const x = idx % size;
     const y = (idx - x) / size;
 
+    // If any live opponent stone is within Manhattan distance 2, keep move available for defense/shortage-of-liberties
     for (let dy = -2; dy <= 2; dy++) {
       for (let dx = -2; dx <= 2; dx++) {
         if (Math.abs(dx) + Math.abs(dy) > 2) continue;
@@ -154,6 +176,7 @@ export class MctsEngine {
     const rootBoard = new FastBoard(size);
     rootBoard.copyFromState(req.board, koIdx, req.captures.black, req.captures.white);
 
+    // Precompute current territory / dead stone estimate to avoid filling settled own territory in late endgame
     const deadMask = estimateDeadStones(req.board, size);
     const currentScore = calculateScore({
       board: req.board,
@@ -173,6 +196,7 @@ export class MctsEngine {
       enableAdvancedTactics: profile.advancedTactics,
     });
 
+    // Filter out redundant moves inside completely settled own territory
     const filteredMoves: Array<{ idx: number; prior: number }> = [];
     for (let i = 0; i < rawCount; i++) {
       const mIdx = rawMoves[i];
@@ -185,6 +209,7 @@ export class MctsEngine {
       filteredMoves.push({ idx: mIdx, prior: rawPriors[i] });
     }
 
+    // If no worthwhile moves remain at all -> PASS immediately!
     if (filteredMoves.length === 0) {
       return {
         coord: null,
@@ -194,6 +219,7 @@ export class MctsEngine {
       };
     }
 
+    // If opponent just passed and dameCount === 0 (all boundaries closed), check if any tactical atari exists; if not, pass!
     if (req.opponentPassed && currentScore.dameCount === 0 && req.moveCount >= total * 0.3) {
       let hasUrgentTactic = false;
       for (const item of filteredMoves) {
@@ -215,6 +241,7 @@ export class MctsEngine {
       }
     }
 
+    // Sort root candidates by prior descending and cap width on large boards
     filteredMoves.sort((a, b) => b.prior - a.prior);
     const maxWidth = size === 19 ? profile.maxChildren19 : size === 13 ? 52 : 81;
     const pruned = filteredMoves.slice(0, maxWidth);
@@ -224,9 +251,21 @@ export class MctsEngine {
     const root = new MctsNode(-1, oppColor, 1.0);
     root.children = pruned.map((p) => new MctsNode(p.idx, aiColor, priorSum > 0 ? p.prior / priorSum : 1 / pruned.length));
 
+    // Dynamic Komi for high-handicap / large score disparity openings so rollouts stay sharp
+    let effectiveKomi = req.komi;
+    if (Math.abs(req.komi) >= 12) {
+      const openingPhase = Math.max(0, 1 - req.moveCount / (total * 0.45));
+      effectiveKomi = req.komi * (1 - 0.35 * openingPhase);
+    }
+
     const simBoard = new FastBoard(size);
+    const rolloutScratch = new FastBoard(size);
     const playedBlackMask = new Uint8Array(total);
     const playedWhiteMask = new Uint8Array(total);
+    const lgrBlack = new Int16Array(total).fill(-1);
+    const lgrWhite = new Int16Array(total).fill(-1);
+    const rolloutMoveLog = new Int16Array(Math.floor(total * 1.4) + 8);
+    const rolloutColorLog = new Uint8Array(Math.floor(total * 1.4) + 8);
     const pathNodes: MctsNode[] = [];
 
     let sims = 0;
@@ -248,6 +287,7 @@ export class MctsEngine {
       let lastIdx = lastMoveIdx;
       let passes = req.opponentPassed ? 1 : 0;
 
+      // 1. Selection
       while (node.children !== null && node.children.length > 0 && passes < 2) {
         const child = this.selectChild(node, profile);
         if (child.moveIdx === -1) {
@@ -279,17 +319,24 @@ export class MctsEngine {
         }
       }
 
+      // 2. Playout (Light-tactical simulation with LGRF-1 & zero-alloc scratch board)
       const blackUtility = this.runTacticalPlayout(
         simBoard,
+        rolloutScratch,
         turn,
         lastIdx,
         passes,
         req.ruleset,
-        req.komi,
+        effectiveKomi,
         playedBlackMask,
-        playedWhiteMask
+        playedWhiteMask,
+        lgrBlack,
+        lgrWhite,
+        rolloutMoveLog,
+        rolloutColorLog
       );
 
+      // 3. Backpropagation + RAVE (AMAF) update
       for (let i = 0; i < pathNodes.length; i++) {
         const pNode = pathNodes[i];
         pNode.visits += 1;
@@ -313,6 +360,7 @@ export class MctsEngine {
       sims++;
     }
 
+    // Select final move according to difficulty temperature
     const children = root.children!;
     let chosen: MctsNode = children[0];
 
@@ -360,12 +408,30 @@ export class MctsEngine {
 
     const winrate = chosen.visits > 0 ? chosen.valueSum / chosen.visits : 0.5;
 
+    // Collect top 3 root suggestions for Hints / Winrate tracking
+    const ranked = children
+      .filter((c) => c.moveIdx >= 0 && c.visits > 0)
+      .slice()
+      .sort((a, b) => {
+        const qa = a.valueSum / Math.max(1, a.visits);
+        const qb = b.valueSum / Math.max(1, b.visits);
+        return b.visits + qb * 4.0 - (a.visits + qa * 4.0);
+      })
+      .slice(0, 3)
+      .map((c) => ({
+        coord: { x: c.moveIdx % size, y: (c.moveIdx - (c.moveIdx % size)) / size },
+        winrate: c.valueSum / Math.max(1, c.visits),
+        visits: c.visits,
+      }));
+
+    // Late-game Pass check: if game is past midgame and even best move has terrible value while opponent passed
     if (req.opponentPassed && req.moveCount > total * 0.45 && winrate < 0.04) {
       return {
         coord: null,
         winrate,
         simulations: sims,
         elapsedMs: performance.now() - startTime,
+        topSuggestions: ranked,
       };
     }
 
@@ -377,6 +443,7 @@ export class MctsEngine {
       winrate,
       simulations: sims,
       elapsedMs: performance.now() - startTime,
+      topSuggestions: ranked,
     };
   }
 
@@ -393,7 +460,8 @@ export class MctsEngine {
       let blendedQ = q;
       if (profile.raveEquiv > 0 && ch.amafVisits > 0) {
         const amafQ = ch.amafValueSum / ch.amafVisits;
-        const beta = ch.amafVisits / (ch.amafVisits + ch.visits + (4 * ch.amafVisits * ch.visits) / profile.raveEquiv + 1e-5);
+        const beta =
+          ch.amafVisits / (ch.amafVisits + ch.visits + (4 * ch.amafVisits * ch.visits) / profile.raveEquiv + 1e-5);
         blendedQ = (1 - beta) * q + beta * amafQ;
       }
 
@@ -443,21 +511,30 @@ export class MctsEngine {
     node.children = sliced.map((s) => new MctsNode(s.idx, turn, sum > 0 ? s.prior / sum : 1 / sliced.length));
   }
 
+  /**
+   * Light-tactical Monte Carlo rollout returning utility in [0, 1] for BLACK.
+   */
   private runTacticalPlayout(
     board: FastBoard,
+    scratch: FastBoard,
     startTurn: PlayerColor,
     initialLastIdx: number | null,
     initialPasses: number,
     ruleset: RulesetType,
     komi: number,
     playedBlackMask: Uint8Array,
-    playedWhiteMask: Uint8Array
+    playedWhiteMask: Uint8Array,
+    lgrBlack: Int16Array,
+    lgrWhite: Int16Array,
+    rolloutMoveLog: Int16Array,
+    rolloutColorLog: Uint8Array
   ): number {
     const total = board.total;
     const maxSteps = Math.floor(total * 1.35);
     let turn = startTurn;
     let lastIdx = initialLastIdx;
     let passes = initialPasses;
+    let logLen = 0;
 
     const emptyCells = new Int16Array(total);
     let emptyCount = 0;
@@ -477,6 +554,7 @@ export class MctsEngine {
       let chosenMove = -1;
       const opp = opponentColor(turn);
 
+      // A) Local tactical check around opponent's last move
       if (lastIdx !== null && lastIdx >= 0 && board.grid[lastIdx] === opp) {
         const nbrs = board.getNeighborsOffset(lastIdx);
         for (let i = 0; i < 4; i++) {
@@ -485,8 +563,8 @@ export class MctsEngine {
           if (board.grid[n] === turn) {
             const ownCh = board.analyzeChain(n, 2);
             if (ownCh.libertyCount === 1 && ownCh.lib0 >= 0 && !board.isTrueEye(ownCh.lib0, turn)) {
-              const test = board.clone();
-              if (test.play(ownCh.lib0, turn) >= 0 && test.analyzeChain(ownCh.lib0, 2).libertyCount >= 2) {
+              scratch.copyFrom(board);
+              if (scratch.play(ownCh.lib0, turn) >= 0 && scratch.analyzeChain(ownCh.lib0, 2).libertyCount >= 2) {
                 chosenMove = ownCh.lib0;
                 break;
               }
@@ -500,8 +578,27 @@ export class MctsEngine {
             chosenMove = lastCh.lib0;
           }
         }
+
+        // B) LGRF-1 Last Good Reply lookup
+        if (chosenMove < 0) {
+          const lgrCandidate = turn === BLACK ? lgrBlack[lastIdx] : lgrWhite[lastIdx];
+          if (
+            lgrCandidate >= 0 &&
+            lgrCandidate < total &&
+            board.grid[lgrCandidate] === EMPTY &&
+            lgrCandidate !== board.koIdx &&
+            !board.isTrueEye(lgrCandidate, turn)
+          ) {
+            scratch.copyFrom(board);
+            const cap = scratch.play(lgrCandidate, turn);
+            if (cap >= 0 && (cap > 0 || scratch.analyzeChain(lgrCandidate, 2).libertyCount >= 2)) {
+              chosenMove = lgrCandidate;
+            }
+          }
+        }
       }
 
+      // C) Randomized scan of empty intersections avoiding eyes and blatant self-atari
       if (chosenMove < 0 && emptyCount > 0) {
         const startOffset = nextRand(emptyCount);
         for (let k = 0; k < emptyCount; k++) {
@@ -529,13 +626,11 @@ export class MctsEngine {
             chosenMove = cell;
             break;
           } else {
-            const test = board.clone();
-            const cap = test.play(cell, turn);
-            if (cap >= 0) {
-              if (cap > 0 || test.analyzeChain(cell, 2).libertyCount >= 2) {
-                chosenMove = cell;
-                break;
-              }
+            scratch.copyFrom(board);
+            const cap = scratch.play(cell, turn);
+            if (cap >= 0 && (cap > 0 || scratch.analyzeChain(cell, 2).libertyCount >= 2)) {
+              chosenMove = cell;
+              break;
             }
           }
         }
@@ -546,6 +641,12 @@ export class MctsEngine {
         if (cap >= 0) {
           if (turn === BLACK) playedBlackMask[chosenMove] = 1;
           else playedWhiteMask[chosenMove] = 1;
+
+          if (logLen < rolloutMoveLog.length) {
+            rolloutMoveLog[logLen] = chosenMove;
+            rolloutColorLog[logLen] = turn;
+            logLen++;
+          }
 
           if (cap > 0) {
             emptyCount = 0;
@@ -560,6 +661,7 @@ export class MctsEngine {
         }
       }
 
+      // Pass
       passes++;
       board.koIdx = -1;
       lastIdx = null;
@@ -567,8 +669,26 @@ export class MctsEngine {
     }
 
     const diff = board.evaluateRolloutScore(ruleset, komi);
+    const blackWon = diff > 0;
     const winFlag = diff > 0 ? 1.0 : diff < 0 ? 0.0 : 0.5;
     const marginBonus = 0.5 + 0.5 * Math.tanh(diff / 14.0);
+
+    // LGRF-1 table update
+    for (let i = 1; i < logLen; i++) {
+      const prevMove = rolloutMoveLog[i - 1];
+      const replyMove = rolloutMoveLog[i];
+      const replyColor = rolloutColorLog[i];
+      if (prevMove >= 0 && replyMove >= 0) {
+        if (replyColor === BLACK) {
+          if (blackWon) lgrBlack[prevMove] = replyMove;
+          else if (lgrBlack[prevMove] === replyMove) lgrBlack[prevMove] = -1;
+        } else {
+          if (!blackWon && diff < 0) lgrWhite[prevMove] = replyMove;
+          else if (lgrWhite[prevMove] === replyMove) lgrWhite[prevMove] = -1;
+        }
+      }
+    }
+
     return 0.86 * winFlag + 0.14 * marginBonus;
   }
 }

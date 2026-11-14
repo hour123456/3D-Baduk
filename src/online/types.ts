@@ -1,4 +1,4 @@
-import { BoardSize, Coord, PlayerColor, RulesetType } from '../rules/types';
+import { BoardSize, Coord, GameType, OmokRulesetType, PlayerColor, RulesetType } from '../rules/types';
 import { ClockSnapshot } from '../rules/clock';
 
 export type OnlineTransportStatus = 'disconnected' | 'connecting' | 'connected' | 'reconnecting' | 'error';
@@ -15,6 +15,8 @@ export type QuickMatchSizePref = BoardSize | 'any';
 export interface CreateRoomOptions {
   title?: string;
   isPublic: boolean;
+  gameType?: GameType;
+  omokRuleset?: OmokRulesetType;
   boardSize: BoardSize;
   ruleset: RulesetType;
   handicap: number;
@@ -30,6 +32,8 @@ export interface RoomSummary {
   title: string;
   hostId: string;
   hostName: string;
+  gameType?: GameType;
+  omokRuleset?: OmokRulesetType;
   boardSize: BoardSize;
   ruleset: RulesetType;
   handicap: number;
@@ -50,6 +54,8 @@ export interface OnlineMatchInitPayload {
   whiteId: string;
   blackName: string;
   whiteName: string;
+  gameType?: GameType;
+  omokRuleset?: OmokRulesetType;
   boardSize: BoardSize;
   ruleset: RulesetType;
   handicap: number;

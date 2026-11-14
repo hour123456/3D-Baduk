@@ -6,6 +6,8 @@ import {
   GameConfig,
   GamePhase,
   GameResult,
+  GameType,
+  OmokRulesetType,
   PlayerColor,
   RulesetType,
   ScoreBreakdown,
@@ -18,6 +20,13 @@ import {
   QuickMatchSizePref,
   RoomSummary,
 } from '../online/types';
+import {
+  LightingTheme,
+  PhysicsIntensity,
+  PlacementInputMode,
+  StoneMotionStyle,
+  UserSettings,
+} from '../settings/SettingsManager';
 import { CameraPreset } from '../scene/SceneManager';
 
 export interface UIActions {
@@ -28,6 +37,12 @@ export interface UIActions {
   onToggleMoveNumbers: () => boolean;
   onToggleTerritoryHint: () => boolean;
   onToggleCoordinates: () => boolean;
+  onRequestAIHint: () => void;
+  onConfirmPendingMove: () => void;
+  onCancelPendingMove: () => void;
+  onNudgePendingMove: (dx: number, dy: number) => void;
+  onUpdateSettings: (patch: Partial<UserSettings>) => UserSettings;
+  onResetSettings: () => UserSettings;
   onCameraPreset: (preset: CameraPreset) => void;
   onStirBowls: () => void;
   onVolumeChange: (vol: number) => void;
@@ -45,7 +60,11 @@ export interface UIActions {
   onGenerateRandomNickname: () => string;
   onEnterOnlineTab: () => void;
   onRefreshOpenRooms: () => void;
-  onStartQuickMatch: (preferredSize: QuickMatchSizePref) => void;
+  onStartQuickMatch: (
+    preferredSize: QuickMatchSizePref,
+    gameType: GameType,
+    omokRuleset: OmokRulesetType
+  ) => void;
   onCancelOnlineWait: () => void;
   onCreateOnlineRoom: (options: CreateRoomOptions) => void;
   onJoinOnlineRoom: (roomCode: string) => void;
@@ -58,9 +77,17 @@ export interface UIActions {
 const AI_LEVEL_DESCRIPTIONS: Record<AIDifficulty, string> = {
   1: 'Lv.1 입문 — 기본 따내기와 집 짓기 위주로 두며 입문자도 즐겁게 승리할 수 있습니다.',
   2: 'Lv.2 초급 — 단수 방어와 귀·변 포석의 기초를 갖추어 가벼운 연습 대국에 적합합니다.',
-  3: 'Lv.3 중급 — RAVE 탐색과 행마 패턴을 활용하여 자연스러운 포석과 중반 전투를 펼칩니다.',
-  4: 'Lv.4 고급 — 축(Ladder)·환격 전술 수읽기가 결합되어 날카로운 전투와 끝내기를 구사합니다.',
-  5: 'Lv.5 마스터 — 최대 탐색 예산과 정밀 형세 판단으로 빈틈없는 최상급 수읽기를 선보입니다.',
+  3: 'Lv.3 중급 — RAVE·LGRF 탐색과 맥점 휴리스틱으로 자연스러운 포석과 중반 전투를 펼칩니다.',
+  4: 'Lv.4 고급 — 축·장문·환격·급소 전술 수읽기가 결합되어 날카로운 전투와 끝내기를 구사합니다.',
+  5: 'Lv.5 마스터 — 동적 덤과 대용량 MCTS 탐색 예산으로 빈틈없는 최상급 수읽기를 선보입니다.',
+};
+
+const OMOK_AI_LEVEL_DESCRIPTIONS: Record<AIDifficulty, string> = {
+  1: 'Lv.1 입문 — 3·4 위협을 간혹 놓치며 오목 입문자도 편하게 승리할 수 있습니다.',
+  2: 'Lv.2 초급 — 기본 열린 3 방어와 간단한 연속 3수 패턴을 구사합니다.',
+  3: 'Lv.3 중급 — 4축 패턴 평가와 3수 깊이 알파-베타 탐색으로 균형 잡힌 수읽기를 합니다.',
+  4: 'Lv.4 고급 — VCF(연속 4수 필승) 탐색과 4수 깊이 정밀 수읽기로 방심을 허용하지 않습니다.',
+  5: 'Lv.5 마스터 — 6수 깊이 반복 심화 알파-베타 + 고속 VCF 수읽기로 최상급 승부를 펼칩니다.',
 };
 
 export const AI_LEVEL_NAMES: Record<AIDifficulty, string> = {
@@ -112,9 +139,12 @@ export class UIManager {
   private root: HTMLElement;
   private actions: UIActions;
   private currentNickname: string;
+  private settings: UserSettings;
 
   // Draft setup form state (Offline)
   private draftMode: 'ai' | 'local2p' | 'online' = 'ai';
+  private draftGameType: GameType = 'baduk';
+  private draftOmokRuleset: OmokRulesetType = 'renju';
   private draftDifficulty: AIDifficulty = 3;
   private draftColorChoice: 'black' | 'white' | 'random' = 'black';
   private draftSize: BoardSize = 19;
@@ -125,8 +155,12 @@ export class UIManager {
 
   // Draft setup form state (Online)
   private onlineSubTab: 'quick' | 'create' | 'join' = 'quick';
+  private qmGameType: GameType = 'baduk';
+  private qmOmokRuleset: OmokRulesetType = 'renju';
   private qmSizePref: QuickMatchSizePref = 'any';
   private roomVis: 'public' | 'private' = 'public';
+  private roomGameType: GameType = 'baduk';
+  private roomOmokRuleset: OmokRulesetType = 'renju';
   private roomSize: BoardSize = 19;
   private roomRuleset: RulesetType = 'korean';
   private roomHandicap = 0;
@@ -139,6 +173,7 @@ export class UIManager {
   private bubbleTimers: { [K in PlayerColor]?: number } = {};
 
   // DOM Elements
+  private brandTitleEl!: HTMLElement;
   private metaBadgeEl!: HTMLElement;
   private coordBadgeEl!: HTMLElement;
   private onlineHudPillEl!: HTMLElement;
@@ -174,6 +209,11 @@ export class UIManager {
   private reviewBarEl!: HTMLElement;
   private reviewSliderEl!: HTMLInputElement;
   private reviewLabelEl!: HTMLElement;
+  private reviewChartCanvasEl!: HTMLCanvasElement;
+  private reviewWinrateLabelEl!: HTMLElement;
+
+  private pendingMoveBarEl!: HTMLElement;
+  private pendingCoordEl!: HTMLElement;
 
   private chatPopoverEl!: HTMLElement;
   private chatToggleBtn!: HTMLButtonElement;
@@ -182,9 +222,12 @@ export class UIManager {
   private passBtn!: HTMLButtonElement;
   private undoBtn!: HTMLButtonElement;
   private resignBtn!: HTMLButtonElement;
+  private aiHintBtn!: HTMLButtonElement;
   private hintBtn!: HTMLButtonElement;
   private moveNumBtn!: HTMLButtonElement;
+  private coordsBtn!: HTMLButtonElement;
   private showResultBtn!: HTMLButtonElement;
+  private camPresetBtns: HTMLButtonElement[] = [];
 
   private setupModalEl!: HTMLElement;
   private setupNickInputEl!: HTMLInputElement;
@@ -207,12 +250,19 @@ export class UIManager {
   private resultModalEl!: HTMLElement;
   private resultBodyEl!: HTMLElement;
   private rematchResultBtn!: HTMLButtonElement;
+  private optionsModalEl!: HTMLElement;
   private toastContainerEl!: HTMLElement;
   private hasStartedOnce = false;
 
-  constructor(root: HTMLElement, initialNickname: string, actions: UIActions) {
+  constructor(
+    root: HTMLElement,
+    initialNickname: string,
+    initialSettings: UserSettings,
+    actions: UIActions
+  ) {
     this.root = root;
     this.currentNickname = initialNickname;
+    this.settings = { ...initialSettings };
     this.actions = actions;
     this.buildDOM();
   }
@@ -228,7 +278,7 @@ export class UIManager {
         <div class="top-bar">
           <div class="brand-cluster interactive">
             <div class="brand-seal">手談</div>
-            <span class="brand-title">수담 3D 바둑</span>
+            <span class="brand-title" id="ui-brand-title">수담 3D 바둑</span>
             <span class="game-meta-badge" id="ui-meta-badge">19줄 · 한국식 · 덤 6.5집</span>
             <span class="coord-badge" id="ui-coord-badge">대기 중</span>
             <span class="online-hud-pill hidden" id="ui-online-pill">
@@ -247,7 +297,8 @@ export class UIManager {
             <div class="divider-v"></div>
             <button class="btn btn-sm" data-cam="default" title="흑 정면 기본 시점">기본뷰</button>
             <button class="btn btn-sm" data-cam="white" title="백 정면 시점">백시점</button>
-            <button class="btn btn-sm" data-cam="top" title="수직 조감도 시점">조감도</button>
+            <button class="btn btn-sm" data-cam="top" title="원근 조감도 시점">조감도</button>
+            <button class="btn btn-sm" data-cam="true_top" title="원근 왜곡 없는 90° 정밀 수직뷰">수직뷰</button>
             <button class="btn btn-sm" data-cam="cinema" title="입체 사선 시점">입체뷰</button>
             <div class="divider-v"></div>
             <button class="btn btn-sm" id="btn-stir-bowls" title="바둑통 속 바둑돌 잘그락 소리 듣기">바둑통 잘그락</button>
@@ -257,6 +308,7 @@ export class UIManager {
             </div>
             <div class="divider-v"></div>
             <button class="btn btn-sm btn-gold" id="btn-open-setup">새 대국 · 온라인</button>
+            <button class="btn btn-sm" id="btn-open-options" title="모션 · 수직뷰 · 모바일 입력 · 물리 · 조명 설정">⚙ 옵션</button>
             <button class="btn btn-sm" id="btn-fullscreen" title="전체화면 (F11)">전체화면</button>
           </div>
         </div>
@@ -335,6 +387,20 @@ export class UIManager {
           </div>
         </div>
 
+        <div class="hidden" id="pending-move-bar">
+          <span class="pending-coord-pill" id="pending-move-coord">착수 예정: --</span>
+          <div class="pending-nudge-pad" aria-label="1칸 미세 이동">
+            <button class="nudge-btn" id="btn-nudge-left" type="button" title="왼쪽 1칸">◀</button>
+            <button class="nudge-btn" id="btn-nudge-up" type="button" title="위쪽 1칸">▲</button>
+            <button class="nudge-btn" id="btn-nudge-down" type="button" title="아래쪽 1칸">▼</button>
+            <button class="nudge-btn" id="btn-nudge-right" type="button" title="오른쪽 1칸">▶</button>
+          </div>
+          <div class="pending-actions">
+            <button class="btn-cancel-move" id="btn-pending-cancel" type="button">취소</button>
+            <button class="btn-confirm-move" id="btn-pending-confirm" type="button">착수 확정</button>
+          </div>
+        </div>
+
         <div class="review-bar interactive hidden" id="review-bar">
           <button class="btn btn-sm" id="rev-first" title="초수 전으로">|&lt;</button>
           <button class="btn btn-sm" id="rev-prev" title="이전 수">&lt;</button>
@@ -342,6 +408,13 @@ export class UIManager {
           <button class="btn btn-sm" id="rev-next" title="다음 수">&gt;</button>
           <button class="btn btn-sm" id="rev-last" title="마지막 수">&gt;|</button>
           <span class="review-label" id="rev-label">0 / 0수</span>
+          <div class="review-chart-wrap hidden" id="rev-chart-wrap">
+            <div class="review-chart-caption">
+              <span>흑 기준 AI 기대승률 추이 (Review)</span>
+              <span id="rev-winrate-label">--%</span>
+            </div>
+            <canvas id="rev-winrate-chart" width="380" height="46"></canvas>
+          </div>
         </div>
 
         <div class="bottom-dock interactive">
@@ -350,6 +423,7 @@ export class UIManager {
           <button class="btn btn-danger" id="btn-resign">기권</button>
           <div class="divider-v"></div>
           <button class="btn hidden" id="btn-chat-toggle">수담 인사·채팅</button>
+          <button class="btn btn-ai-hint" id="btn-ai-hint" title="AI가 분석한 최선 추천수 Top 3 보기">AI 추천수</button>
           <button class="btn" id="btn-territory-hint">형세·집 보기</button>
           <button class="btn" id="btn-move-nums">수순 번호</button>
           <button class="btn btn-active" id="btn-coords">좌표 눈금</button>
@@ -397,6 +471,14 @@ export class UIManager {
 
           <!-- OFFLINE (1P AI / 2P Local) OPTIONS -->
           <div id="offline-options-wrap">
+            <div class="form-section">
+              <span class="form-label">종목 선택</span>
+              <div class="seg-group" id="seg-game-type">
+                <button class="seg-btn selected" data-val="baduk">정통 바둑 (Baduk)</button>
+                <button class="seg-btn" data-val="omok">오목 (Omok · 5목)</button>
+              </div>
+            </div>
+
             <div id="ai-options-panel">
               <div class="form-section">
                 <span class="form-label">인공지능 난이도 (5단계)</span>
@@ -421,15 +503,16 @@ export class UIManager {
             </div>
 
             <div class="form-section">
-              <span class="form-label">바둑판 크기</span>
+              <span class="form-label" id="lbl-offline-size">판 크기</span>
               <div class="seg-group" id="seg-size">
                 <button class="seg-btn selected" data-val="19">19줄 (정식 대국)</button>
+                <button class="seg-btn hidden" data-val="15">15줄 (오목 표준)</button>
                 <button class="seg-btn" data-val="13">13줄 (중형 전략)</button>
                 <button class="seg-btn" data-val="9">9줄 (입문·속기)</button>
               </div>
             </div>
 
-            <div class="form-section">
+            <div class="form-section" id="offline-baduk-rules-sec">
               <span class="form-label">바둑 규칙 및 계가 방식</span>
               <div class="seg-group" id="seg-ruleset">
                 <button class="seg-btn selected" data-val="korean">한국식 규칙 (집 + 사석)</button>
@@ -437,7 +520,15 @@ export class UIManager {
               </div>
             </div>
 
-            <div class="form-row-2 form-section">
+            <div class="form-section hidden" id="offline-omok-rules-sec">
+              <span class="form-label">오목 규칙</span>
+              <div class="seg-group" id="seg-omok-ruleset">
+                <button class="seg-btn selected" data-val="renju">렌주룰 (흑 3·3 / 4·4 / 장목 금수)</button>
+                <button class="seg-btn" data-val="freestyle">자유룰 (흑·백 금수 없음)</button>
+              </div>
+            </div>
+
+            <div class="form-row-2 form-section" id="offline-baduk-handicap-sec">
               <div>
                 <label class="form-label" for="sel-handicap">접바둑 (치석)</label>
                 <select class="select-input" id="sel-handicap">
@@ -497,11 +588,28 @@ export class UIManager {
                   <h4>실시간 자동 빠른 매칭</h4>
                   <p>접속 중인 다른 대국자와 즉시 연결되어 흑·백 돌가리기 후 실시간 2인 대국을 시작합니다.</p>
                 </div>
+                <div class="form-row-2 form-section">
+                  <div>
+                    <span class="form-label">매칭 종목</span>
+                    <div class="seg-group" id="seg-qm-gametype">
+                      <button class="seg-btn selected" data-val="baduk">정통 바둑</button>
+                      <button class="seg-btn" data-val="omok">오목</button>
+                    </div>
+                  </div>
+                  <div class="hidden" id="qm-omok-ruleset-sec">
+                    <span class="form-label">오목 규칙</span>
+                    <div class="seg-group" id="seg-qm-omok-rule">
+                      <button class="seg-btn selected" data-val="renju">렌주룰</button>
+                      <button class="seg-btn" data-val="freestyle">자유룰</button>
+                    </div>
+                  </div>
+                </div>
                 <div class="form-section">
-                  <span class="form-label">선호 바둑판 크기</span>
+                  <span class="form-label">선호 판 크기</span>
                   <div class="seg-group" id="seg-qm-size">
                     <button class="seg-btn selected" data-val="any">전체 (가장 빠름)</button>
                     <button class="seg-btn" data-val="19">19줄</button>
+                    <button class="seg-btn hidden" data-val="15">15줄</button>
                     <button class="seg-btn" data-val="13">13줄</button>
                     <button class="seg-btn" data-val="9">9줄</button>
                   </div>
@@ -548,25 +656,41 @@ export class UIManager {
                   </div>
                 </div>
 
+                <div class="form-section">
+                  <span class="form-label">종목 선택</span>
+                  <div class="seg-group" id="seg-room-gametype">
+                    <button class="seg-btn selected" data-val="baduk">정통 바둑</button>
+                    <button class="seg-btn" data-val="omok">오목 (Omok)</button>
+                  </div>
+                </div>
+
                 <div class="form-row-2 form-section">
                   <div>
-                    <span class="form-label">바둑판 크기</span>
+                    <span class="form-label">판 크기</span>
                     <div class="seg-group" id="seg-room-size">
                       <button class="seg-btn selected" data-val="19">19줄</button>
+                      <button class="seg-btn hidden" data-val="15">15줄</button>
                       <button class="seg-btn" data-val="13">13줄</button>
                       <button class="seg-btn" data-val="9">9줄</button>
                     </div>
                   </div>
-                  <div>
+                  <div id="room-baduk-rules-sec">
                     <span class="form-label">계가 규칙</span>
                     <div class="seg-group" id="seg-room-rule">
                       <button class="seg-btn selected" data-val="korean">한국식</button>
                       <button class="seg-btn" data-val="chinese">중국식</button>
                     </div>
                   </div>
+                  <div class="hidden" id="room-omok-rules-sec">
+                    <span class="form-label">오목 규칙</span>
+                    <div class="seg-group" id="seg-room-omok-rule">
+                      <button class="seg-btn selected" data-val="renju">렌주룰</button>
+                      <button class="seg-btn" data-val="freestyle">자유룰</button>
+                    </div>
+                  </div>
                 </div>
 
-                <div class="form-row-2 form-section">
+                <div class="form-row-2 form-section" id="room-baduk-handicap-sec">
                   <div>
                     <label class="form-label" for="sel-room-handicap">접바둑 (치석)</label>
                     <select class="select-input" id="sel-room-handicap">
@@ -701,12 +825,126 @@ export class UIManager {
           </div>
         </div>
       </div>
+
+      <!-- Options & Preferences Modal -->
+      <div class="modal-backdrop hidden" id="modal-options">
+        <div class="modal-card modal-options-card">
+          <div class="modal-header">
+            <h2>대국 환경 · 모션 · 시점 옵션</h2>
+            <button class="btn btn-sm" id="btn-close-options">닫기</button>
+          </div>
+
+          <div class="options-section">
+            <div class="options-section-title">착수 모션 (Placement Motion)</div>
+            <div class="seg-group" id="seg-opt-motion">
+              <button class="seg-btn" data-val="realistic">실사 손가락 착수 (기본)</button>
+              <button class="seg-btn" data-val="classic_bowl">기존 바둑통 포물선</button>
+              <button class="seg-btn" data-val="instant">즉시 착수</button>
+            </div>
+            <div class="option-hint" style="margin-top: 6px;">
+              실사 손가락 착수는 바둑알이 판 위 근거리에서 테두리로 닿았다가 딱! 눕는 탄성 감쇠 모션을 적용합니다.
+            </div>
+          </div>
+
+          <div class="options-section">
+            <div class="options-section-title">진짜 90° 수직뷰 &amp; 모바일 시점</div>
+            <div class="toggle-list">
+              <label class="toggle-row">
+                <div class="toggle-row-text">
+                  <span class="toggle-row-title">원근 왜곡 없는 90° 정밀 수직뷰 기본 적용</span>
+                  <span class="toggle-row-desc">대국 시작 시 평면 직교(Orthographic) 90° 수직 시점을 기본으로 사용합니다.</span>
+                </div>
+                <input type="checkbox" id="opt-true-vertical" />
+              </label>
+              <label class="toggle-row">
+                <div class="toggle-row-text">
+                  <span class="toggle-row-title">모바일 세로 화면 자동 맞춤 수직뷰</span>
+                  <span class="toggle-row-desc">스마트폰 세로 화면에서 여백 없이 반상이 꽉 차는 수직뷰를 자동 적용합니다.</span>
+                </div>
+                <input type="checkbox" id="opt-auto-mobile-vertical" />
+              </label>
+              <label class="toggle-row">
+                <div class="toggle-row-text">
+                  <span class="toggle-row-title">수직뷰 회전 잠금 (실수 시점 틀어짐 방지)</span>
+                  <span class="toggle-row-desc">수직뷰 상태에서 손가락 드래그로 카메라가 회전하지 않도록 고정합니다.</span>
+                </div>
+                <input type="checkbox" id="opt-lock-vertical-rot" />
+              </label>
+            </div>
+          </div>
+
+          <div class="options-section">
+            <div class="options-section-title">모바일 &amp; 착수 실수 방지</div>
+            <div class="seg-group" id="seg-opt-input">
+              <button class="seg-btn" data-val="auto">자동 (PC 즉시/모바일 확인)</button>
+              <button class="seg-btn" data-val="confirm">2단계 확인 착수</button>
+              <button class="seg-btn" data-val="double_tap">두 번 탭</button>
+              <button class="seg-btn" data-val="instant">원터치 즉시</button>
+            </div>
+            <div class="toggle-list" style="margin-top: 8px;">
+              <label class="toggle-row">
+                <div class="toggle-row-text">
+                  <span class="toggle-row-title">터치 드래그 2.6× 정밀 확대경 사용</span>
+                  <span class="toggle-row-desc">모바일 터치 시 손가락 위 오프셋 원형 루페로 정확한 교차점을 미리 확인합니다.</span>
+                </div>
+                <input type="checkbox" id="opt-touch-loupe" />
+              </label>
+            </div>
+          </div>
+
+          <div class="options-section">
+            <div class="options-section-title">물리 엔진 · 반상 조명 테마</div>
+            <div class="form-section" style="margin-bottom: 10px;">
+              <span class="form-label">강체 물리 충돌 시뮬레이션</span>
+              <div class="seg-group" id="seg-opt-physics">
+                <button class="seg-btn" data-val="realistic">실감 물리 (미세 밀림·탄성·접지)</button>
+                <button class="seg-btn" data-val="subtle">표준 물리</button>
+                <button class="seg-btn" data-val="minimal">경량 (저전력)</button>
+              </div>
+            </div>
+            <div>
+              <span class="form-label">조명 분위기</span>
+              <div class="seg-group" id="seg-opt-lighting">
+                <button class="seg-btn" data-val="hanok_warm">전통 한옥</button>
+                <button class="seg-btn" data-val="studio_bright">밝은 대국실</button>
+                <button class="seg-btn" data-val="night_lantern">야간 호롱불</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="options-section">
+            <div class="options-section-title">기타 보조 및 음향</div>
+            <div class="toggle-list">
+              <label class="toggle-row">
+                <div class="toggle-row-text">
+                  <span class="toggle-row-title">오목 렌주룰 흑 금수 자리(✕) 표시</span>
+                  <span class="toggle-row-desc">흑 차례일 때 3·3 / 4·4 / 장목 금수 교차점을 보드에 표기합니다.</span>
+                </div>
+                <input type="checkbox" id="opt-show-forbidden" />
+              </label>
+              <label class="toggle-row">
+                <div class="toggle-row-text">
+                  <span class="toggle-row-title">반상 좌표 눈금 표시</span>
+                  <span class="toggle-row-desc">비자나무 반상 가장자리의 영문/숫자 좌표를 표시합니다.</span>
+                </div>
+                <input type="checkbox" id="opt-show-coords" />
+              </label>
+            </div>
+          </div>
+
+          <div class="options-footer">
+            <button class="btn" id="btn-options-reset">기본값 복원</button>
+            <button class="btn btn-gold" id="btn-options-close-footer">설정 저장 후 닫기</button>
+          </div>
+        </div>
+      </div>
     `;
 
     this.cacheRefsAndBind();
   }
 
   private cacheRefsAndBind(): void {
+    this.brandTitleEl = this.root.querySelector('#ui-brand-title')!;
     this.metaBadgeEl = this.root.querySelector('#ui-meta-badge')!;
     this.coordBadgeEl = this.root.querySelector('#ui-coord-badge')!;
     this.onlineHudPillEl = this.root.querySelector('#ui-online-pill')!;
@@ -740,6 +978,11 @@ export class UIManager {
     this.reviewBarEl = this.root.querySelector('#review-bar')!;
     this.reviewSliderEl = this.root.querySelector('#rev-slider') as HTMLInputElement;
     this.reviewLabelEl = this.root.querySelector('#rev-label')!;
+    this.reviewChartCanvasEl = this.root.querySelector('#rev-winrate-chart') as HTMLCanvasElement;
+    this.reviewWinrateLabelEl = this.root.querySelector('#rev-winrate-label')!;
+
+    this.pendingMoveBarEl = this.root.querySelector('#pending-move-bar')!;
+    this.pendingCoordEl = this.root.querySelector('#pending-move-coord')!;
 
     this.chatPopoverEl = this.root.querySelector('#chat-popover')!;
     this.chatToggleBtn = this.root.querySelector('#btn-chat-toggle') as HTMLButtonElement;
@@ -748,8 +991,10 @@ export class UIManager {
     this.passBtn = this.root.querySelector('#btn-pass') as HTMLButtonElement;
     this.undoBtn = this.root.querySelector('#btn-undo') as HTMLButtonElement;
     this.resignBtn = this.root.querySelector('#btn-resign') as HTMLButtonElement;
+    this.aiHintBtn = this.root.querySelector('#btn-ai-hint') as HTMLButtonElement;
     this.hintBtn = this.root.querySelector('#btn-territory-hint') as HTMLButtonElement;
     this.moveNumBtn = this.root.querySelector('#btn-move-nums') as HTMLButtonElement;
+    this.coordsBtn = this.root.querySelector('#btn-coords') as HTMLButtonElement;
     this.showResultBtn = this.root.querySelector('#btn-show-result') as HTMLButtonElement;
 
     this.setupModalEl = this.root.querySelector('#modal-setup')!;
@@ -773,12 +1018,15 @@ export class UIManager {
     this.resultModalEl = this.root.querySelector('#modal-result')!;
     this.resultBodyEl = this.root.querySelector('#result-modal-body')!;
     this.rematchResultBtn = this.root.querySelector('#btn-res-rematch') as HTMLButtonElement;
+    this.optionsModalEl = this.root.querySelector('#modal-options')!;
     this.toastContainerEl = this.root.querySelector('#toast-container')!;
 
     // Camera preset buttons
-    this.root.querySelectorAll<HTMLButtonElement>('[data-cam]').forEach((btn) => {
+    this.camPresetBtns = Array.from(this.root.querySelectorAll<HTMLButtonElement>('[data-cam]'));
+    this.camPresetBtns.forEach((btn) => {
       btn.addEventListener('click', () => {
-        this.actions.onCameraPreset(btn.dataset.cam as CameraPreset);
+        const preset = btn.dataset.cam as CameraPreset;
+        this.actions.onCameraPreset(preset);
       });
     });
 
@@ -798,6 +1046,7 @@ export class UIManager {
 
     this.root.querySelector('#btn-open-setup')!.addEventListener('click', () => this.openSetupModal());
     this.root.querySelector('#btn-close-setup')!.addEventListener('click', () => this.closeSetupModal());
+    this.root.querySelector('#btn-open-options')!.addEventListener('click', () => this.openOptionsModal());
     this.root.querySelector('#btn-fullscreen')!.addEventListener('click', () => this.actions.onToggleFullscreen());
     this.leaveOnlineBtn.addEventListener('click', () => this.actions.onLeaveOnlineMatch());
 
@@ -876,6 +1125,10 @@ export class UIManager {
       if (e.key === 'Enter') sendChatInput();
     });
 
+    this.aiHintBtn.addEventListener('click', () => {
+      this.actions.onRequestAIHint();
+    });
+
     this.hintBtn.addEventListener('click', () => {
       const on = this.actions.onToggleTerritoryHint();
       this.hintBtn.classList.toggle('btn-active', on);
@@ -886,11 +1139,18 @@ export class UIManager {
       this.moveNumBtn.classList.toggle('btn-active', on);
     });
 
-    const coordsBtn = this.root.querySelector('#btn-coords') as HTMLButtonElement;
-    coordsBtn.addEventListener('click', () => {
+    this.coordsBtn.addEventListener('click', () => {
       const on = this.actions.onToggleCoordinates();
-      coordsBtn.classList.toggle('btn-active', on);
+      this.coordsBtn.classList.toggle('btn-active', on);
     });
+
+    // Pending Move Confirmation Bar
+    this.root.querySelector('#btn-nudge-left')!.addEventListener('click', () => this.actions.onNudgePendingMove(-1, 0));
+    this.root.querySelector('#btn-nudge-right')!.addEventListener('click', () => this.actions.onNudgePendingMove(1, 0));
+    this.root.querySelector('#btn-nudge-up')!.addEventListener('click', () => this.actions.onNudgePendingMove(0, -1));
+    this.root.querySelector('#btn-nudge-down')!.addEventListener('click', () => this.actions.onNudgePendingMove(0, 1));
+    this.root.querySelector('#btn-pending-confirm')!.addEventListener('click', () => this.actions.onConfirmPendingMove());
+    this.root.querySelector('#btn-pending-cancel')!.addEventListener('click', () => this.actions.onCancelPendingMove());
 
     this.root.querySelector('#btn-save-sgf')!.addEventListener('click', () => this.actions.onSaveSgf());
     this.root.querySelector('#btn-open-sgf')!.addEventListener('click', () => this.actions.onOpenSgf());
@@ -947,10 +1207,45 @@ export class UIManager {
       }
     });
 
+    const syncOfflineGameTypeUI = () => {
+      const isOmok = this.draftGameType === 'omok';
+      this.root.querySelector('#offline-baduk-rules-sec')!.classList.toggle('hidden', isOmok);
+      this.root.querySelector('#offline-baduk-handicap-sec')!.classList.toggle('hidden', isOmok);
+      this.root.querySelector('#offline-omok-rules-sec')!.classList.toggle('hidden', !isOmok);
+
+      const sizeBtns = this.root.querySelectorAll<HTMLButtonElement>('#seg-size .seg-btn');
+      sizeBtns.forEach((b) => {
+        const val = Number(b.dataset.val);
+        const visible = isOmok ? val === 15 || val === 19 : val === 19 || val === 13 || val === 9;
+        b.classList.toggle('hidden', !visible);
+      });
+
+      if (isOmok && this.draftSize !== 15 && this.draftSize !== 19) {
+        this.draftSize = 15;
+      } else if (!isOmok && this.draftSize === 15) {
+        this.draftSize = 19;
+      }
+      sizeBtns.forEach((b) => b.classList.toggle('selected', Number(b.dataset.val) === this.draftSize));
+
+      const descMap = isOmok ? OMOK_AI_LEVEL_DESCRIPTIONS : AI_LEVEL_DESCRIPTIONS;
+      this.root.querySelector('#ai-desc-hint')!.textContent = descMap[this.draftDifficulty];
+    };
+
+    this.bindSegmented('#seg-game-type', (val) => {
+      this.draftGameType = val as GameType;
+      this.draftSize = this.draftGameType === 'omok' ? 15 : 19;
+      syncOfflineGameTypeUI();
+    });
+
+    this.bindSegmented('#seg-omok-ruleset', (val) => {
+      this.draftOmokRuleset = val as OmokRulesetType;
+    });
+
     // Offline segmented controls
     this.bindSegmented('#seg-difficulty', (val) => {
       this.draftDifficulty = Number(val) as AIDifficulty;
-      this.root.querySelector('#ai-desc-hint')!.textContent = AI_LEVEL_DESCRIPTIONS[this.draftDifficulty];
+      const descMap = this.draftGameType === 'omok' ? OMOK_AI_LEVEL_DESCRIPTIONS : AI_LEVEL_DESCRIPTIONS;
+      this.root.querySelector('#ai-desc-hint')!.textContent = descMap[this.draftDifficulty];
     });
     this.bindSegmented('#seg-color', (val) => {
       this.draftColorChoice = val as 'black' | 'white' | 'random';
@@ -993,13 +1288,38 @@ export class UIManager {
       this.switchOnlineSubTab(val as 'quick' | 'create' | 'join');
     });
 
+    const syncQmGameTypeUI = () => {
+      const isOmok = this.qmGameType === 'omok';
+      this.root.querySelector('#qm-omok-ruleset-sec')!.classList.toggle('hidden', !isOmok);
+      const btns = this.root.querySelectorAll<HTMLButtonElement>('#seg-qm-size .seg-btn');
+      btns.forEach((b) => {
+        const raw = b.dataset.val!;
+        const visible =
+          raw === 'any' || (isOmok ? raw === '15' || raw === '19' : raw === '19' || raw === '13' || raw === '9');
+        b.classList.toggle('hidden', !visible);
+      });
+      if (isOmok && this.qmSizePref !== 'any' && this.qmSizePref !== 15 && this.qmSizePref !== 19) {
+        this.qmSizePref = 'any';
+      } else if (!isOmok && this.qmSizePref === 15) {
+        this.qmSizePref = 'any';
+      }
+      btns.forEach((b) => b.classList.toggle('selected', b.dataset.val === String(this.qmSizePref)));
+    };
+
+    this.bindSegmented('#seg-qm-gametype', (val) => {
+      this.qmGameType = val as GameType;
+      syncQmGameTypeUI();
+    });
+    this.bindSegmented('#seg-qm-omok-rule', (val) => {
+      this.qmOmokRuleset = val as OmokRulesetType;
+    });
     this.bindSegmented('#seg-qm-size', (val) => {
       this.qmSizePref = val === 'any' ? 'any' : (Number(val) as BoardSize);
     });
 
     this.root.querySelector('#btn-qm-start')!.addEventListener('click', () => {
       this.syncSetupNicknameSilently();
-      this.actions.onStartQuickMatch(this.qmSizePref);
+      this.actions.onStartQuickMatch(this.qmSizePref, this.qmGameType, this.qmOmokRuleset);
     });
     this.root.querySelector('#btn-qm-cancel')!.addEventListener('click', () => {
       this.actions.onCancelOnlineWait();
@@ -1008,6 +1328,35 @@ export class UIManager {
     // Online Create Room controls
     this.bindSegmented('#seg-room-vis', (val) => {
       this.roomVis = val as 'public' | 'private';
+    });
+
+    const syncRoomGameTypeUI = () => {
+      const isOmok = this.roomGameType === 'omok';
+      this.root.querySelector('#room-baduk-rules-sec')!.classList.toggle('hidden', isOmok);
+      this.root.querySelector('#room-baduk-handicap-sec')!.classList.toggle('hidden', isOmok);
+      this.root.querySelector('#room-omok-rules-sec')!.classList.toggle('hidden', !isOmok);
+
+      const btns = this.root.querySelectorAll<HTMLButtonElement>('#seg-room-size .seg-btn');
+      btns.forEach((b) => {
+        const v = Number(b.dataset.val);
+        const visible = isOmok ? v === 15 || v === 19 : v === 19 || v === 13 || v === 9;
+        b.classList.toggle('hidden', !visible);
+      });
+      if (isOmok && this.roomSize !== 15 && this.roomSize !== 19) {
+        this.roomSize = 15;
+      } else if (!isOmok && this.roomSize === 15) {
+        this.roomSize = 19;
+      }
+      btns.forEach((b) => b.classList.toggle('selected', Number(b.dataset.val) === this.roomSize));
+    };
+
+    this.bindSegmented('#seg-room-gametype', (val) => {
+      this.roomGameType = val as GameType;
+      this.roomSize = this.roomGameType === 'omok' ? 15 : 19;
+      syncRoomGameTypeUI();
+    });
+    this.bindSegmented('#seg-room-omok-rule', (val) => {
+      this.roomOmokRuleset = val as OmokRulesetType;
     });
     this.bindSegmented('#seg-room-size', (val) => {
       this.roomSize = Number(val) as BoardSize;
@@ -1051,8 +1400,10 @@ export class UIManager {
         isPublic: this.roomVis === 'public',
         boardSize: this.roomSize,
         ruleset: this.roomRuleset,
-        handicap: this.roomHandicap,
-        komi: this.roomKomi,
+        gameType: this.roomGameType,
+        omokRuleset: this.roomOmokRuleset,
+        handicap: this.roomGameType === 'omok' ? 0 : this.roomHandicap,
+        komi: this.roomGameType === 'omok' ? 0 : this.roomKomi,
         mainTimeSeconds: t.mainTimeSeconds,
         byoyomiSeconds: t.byoyomiSeconds,
         byoyomiPeriods: t.byoyomiPeriods,
@@ -1109,6 +1460,43 @@ export class UIManager {
       this.resultModalEl.classList.add('hidden');
       this.openSetupModal();
     });
+
+    // Options Modal bindings
+    this.root.querySelector('#btn-close-options')!.addEventListener('click', () => this.closeOptionsModal());
+    this.root.querySelector('#btn-options-close-footer')!.addEventListener('click', () => this.closeOptionsModal());
+    this.root.querySelector('#btn-options-reset')!.addEventListener('click', () => {
+      const reset = this.actions.onResetSettings();
+      this.syncOptionsDOM(reset);
+      this.showToast('옵션이 기본값으로 복원되었습니다.');
+    });
+
+    this.bindSegmented('#seg-opt-motion', (val) => {
+      this.syncOptionsDOM(this.actions.onUpdateSettings({ stoneMotionStyle: val as StoneMotionStyle }));
+    });
+    this.bindSegmented('#seg-opt-input', (val) => {
+      this.syncOptionsDOM(this.actions.onUpdateSettings({ inputMode: val as PlacementInputMode }));
+    });
+    this.bindSegmented('#seg-opt-physics', (val) => {
+      this.syncOptionsDOM(this.actions.onUpdateSettings({ physicsIntensity: val as PhysicsIntensity }));
+    });
+    this.bindSegmented('#seg-opt-lighting', (val) => {
+      this.syncOptionsDOM(this.actions.onUpdateSettings({ lightingTheme: val as LightingTheme }));
+    });
+
+    const bindCheckbox = (selector: string, key: keyof UserSettings) => {
+      const el = this.root.querySelector(selector) as HTMLInputElement;
+      el.addEventListener('change', () => {
+        this.syncOptionsDOM(this.actions.onUpdateSettings({ [key]: el.checked } as Partial<UserSettings>));
+      });
+    };
+    bindCheckbox('#opt-true-vertical', 'trueVerticalView');
+    bindCheckbox('#opt-auto-mobile-vertical', 'autoMobileVerticalView');
+    bindCheckbox('#opt-lock-vertical-rot', 'lockVerticalRotation');
+    bindCheckbox('#opt-touch-loupe', 'touchLoupeEnabled');
+    bindCheckbox('#opt-show-forbidden', 'showForbiddenPoints');
+    bindCheckbox('#opt-show-coords', 'showCoordinates');
+
+    this.syncOptionsDOM(this.settings);
   }
 
   private syncSetupNicknameSilently(): void {
@@ -1164,11 +1552,14 @@ export class UIManager {
     const blackName = mode === 'ai' ? (humanColor === BLACK ? myNick : aiLabel) : `${myNick} (흑)`;
     const whiteName = mode === 'ai' ? (humanColor === WHITE ? myNick : aiLabel) : '백 대국자';
 
+    const isOmok = this.draftGameType === 'omok';
     const cfg: GameConfig = {
       boardSize: this.draftSize,
       ruleset: this.draftRuleset,
-      handicap: this.draftHandicap,
-      komi: this.draftKomi,
+      gameType: this.draftGameType,
+      omokRuleset: this.draftOmokRuleset,
+      handicap: isOmok ? 0 : this.draftHandicap,
+      komi: isOmok ? 0 : this.draftKomi,
       superko: true,
       mode,
       humanColor,
@@ -1271,10 +1662,17 @@ export class UIManager {
     this.createFormBoxEl.classList.add('hidden');
     this.waitingRoomBoxEl.classList.remove('hidden');
     this.waitingRoomCodeEl.textContent = room.roomCode;
-    const ruleLabel = room.ruleset === 'korean' ? '한국식' : '중국식';
+    const isOmok = room.gameType === 'omok';
+    const gameLabel = isOmok ? '오목' : '정통 바둑';
     const visLabel = isPublic ? '공개 대기방' : '비공개 코드방';
-    const hcLabel = room.handicap >= 2 ? `${room.handicap}점 접바둑` : `호선 (덤 ${room.komi}집)`;
-    this.waitingRoomMetaEl.textContent = `${visLabel} · ${room.boardSize}줄 · ${ruleLabel} · ${hcLabel}`;
+    if (isOmok) {
+      const omokRuleLabel = (room.omokRuleset ?? 'renju') === 'renju' ? '렌주룰' : '자유룰';
+      this.waitingRoomMetaEl.textContent = `${visLabel} · ${gameLabel} · ${room.boardSize}줄 · ${omokRuleLabel}`;
+    } else {
+      const ruleLabel = room.ruleset === 'korean' ? '한국식' : '중국식';
+      const hcLabel = room.handicap >= 2 ? `${room.handicap}점 접바둑` : `호선 (덤 ${room.komi}집)`;
+      this.waitingRoomMetaEl.textContent = `${visLabel} · ${gameLabel} · ${room.boardSize}줄 · ${ruleLabel} · ${hcLabel}`;
+    }
   }
 
   public renderOpenRooms(rooms: RoomSummary[]): void {
@@ -1289,8 +1687,18 @@ export class UIManager {
 
     this.openRoomsListEl.innerHTML = rooms
       .map((r) => {
-        const ruleTxt = r.ruleset === 'korean' ? '한국식' : '중국식';
-        const hcTxt = r.handicap >= 2 ? `${r.handicap}점` : `덤 ${r.komi}집`;
+        const isOmok = r.gameType === 'omok';
+        const gameBadge = isOmok
+          ? `<span class="room-badge omok">오목</span>`
+          : `<span class="room-badge">바둑</span>`;
+        const ruleTxt = isOmok
+          ? (r.omokRuleset ?? 'renju') === 'renju'
+            ? '렌주룰'
+            : '자유룰'
+          : r.ruleset === 'korean'
+            ? '한국식'
+            : '중국식';
+        const hcTxt = isOmok ? '' : r.handicap >= 2 ? ` · ${r.handicap}점` : ` · 덤 ${r.komi}집`;
         const timeTxt =
           r.mainTimeSeconds > 0
             ? `${Math.round(r.mainTimeSeconds / 60)}분+${r.byoyomiSeconds}초`
@@ -1300,9 +1708,9 @@ export class UIManager {
         return `
           <div class="room-item-card">
             <div>
-              <div class="room-item-title">${escapeHtml(r.title)}</div>
+              <div class="room-item-title">${gameBadge} ${escapeHtml(r.title)}</div>
               <div class="room-item-sub">
-                방장: <strong>${escapeHtml(r.hostName)}</strong> · ${r.boardSize}줄 · ${ruleTxt} · ${hcTxt} · ${timeTxt} · 코드 [${escapeHtml(r.roomCode)}]
+                방장: <strong>${escapeHtml(r.hostName)}</strong> · ${r.boardSize}줄 · ${ruleTxt}${hcTxt} · ${timeTxt} · 코드 [${escapeHtml(r.roomCode)}]
               </div>
             </div>
             <button class="btn btn-sm btn-gold" data-join-room="${escapeHtml(r.roomCode)}">입장하기</button>
@@ -1396,15 +1804,24 @@ export class UIManager {
   }
 
   public updateGameHeader(config: GameConfig): void {
-    const ruleText = config.ruleset === 'korean' ? '한국식' : '중국식';
-    const hcText = config.handicap >= 2 ? `${config.handicap}점 접바둑` : `덤 ${config.komi}집`;
+    const isOmok = config.gameType === 'omok';
+    this.brandTitleEl.textContent = isOmok ? '수담 3D 오목' : '수담 3D 바둑';
+
     const modeText =
       config.mode === 'ai'
         ? `AI ${AI_LEVEL_NAMES[config.aiDifficulty]}`
         : config.mode === 'online'
           ? `온라인 실시간`
           : '2인 맞대국';
-    this.metaBadgeEl.textContent = `${config.boardSize}줄 · ${ruleText} · ${hcText} · ${modeText}`;
+
+    if (isOmok) {
+      const omokRuleText = (config.omokRuleset ?? 'renju') === 'renju' ? '렌주룰(금수)' : '자유룰';
+      this.metaBadgeEl.textContent = `오목 ${config.boardSize}줄 · ${omokRuleText} · ${modeText}`;
+    } else {
+      const ruleText = config.ruleset === 'korean' ? '한국식' : '중국식';
+      const hcText = config.handicap >= 2 ? `${config.handicap}점 접바둑` : `덤 ${config.komi}집`;
+      this.metaBadgeEl.textContent = `${config.boardSize}줄 · ${ruleText} · ${hcText} · ${modeText}`;
+    }
 
     this.blackNameEl.textContent = config.blackName || '흑 대국자';
     this.whiteNameEl.textContent = config.whiteName || '백 대국자';
@@ -1414,10 +1831,18 @@ export class UIManager {
     const myTagWhite =
       config.mode === 'online' ? (config.humanColor === WHITE ? ' · 나' : ' · 상대') : '';
 
-    this.blackSubEl.textContent =
-      (config.handicap >= 2 ? `치석 ${config.handicap}점` : '흑 선번') + myTagBlack;
-    this.whiteSubEl.textContent = `덤 ${config.komi}집` + myTagWhite;
+    if (isOmok) {
+      const isRenju = (config.omokRuleset ?? 'renju') === 'renju';
+      this.blackSubEl.textContent = (isRenju ? '흑 선공 (3·3/4·4/6목 금수)' : '흑 선공') + myTagBlack;
+      this.whiteSubEl.textContent = '백 후공 (금수 없음)' + myTagWhite;
+    } else {
+      this.blackSubEl.textContent =
+        (config.handicap >= 2 ? `치석 ${config.handicap}점` : '흑 선번') + myTagBlack;
+      this.whiteSubEl.textContent = `덤 ${config.komi}집` + myTagWhite;
+    }
 
+    this.hintBtn.classList.toggle('hidden', isOmok);
+    this.passBtn.classList.toggle('hidden', isOmok);
     this.undoBtn.textContent = config.mode === 'online' ? '무르기 요청' : '무르기';
   }
 
@@ -1433,8 +1858,12 @@ export class UIManager {
     moveCount: number;
     mode?: 'ai' | 'local2p' | 'online';
     humanColor?: PlayerColor;
+    gameType?: GameType;
   }): void {
-    const { turn, phase, captures, aiThinking, moveCount, mode, humanColor } = params;
+    const { turn, phase, captures, aiThinking, moveCount, mode, humanColor, gameType } = params;
+    const isOmok = gameType === 'omok';
+    this.blackCapturesEl.parentElement!.classList.toggle('hidden', isOmok);
+    this.whiteCapturesEl.parentElement!.classList.toggle('hidden', isOmok);
     this.blackCapturesEl.textContent = String(captures.black);
     this.whiteCapturesEl.textContent = String(captures.white);
 
@@ -1451,6 +1880,7 @@ export class UIManager {
     this.passBtn.disabled = !isPlaying || aiThinking || !isMyTurn;
     this.undoBtn.disabled = !isPlaying || aiThinking || moveCount === 0;
     this.resignBtn.disabled = !isPlaying || aiThinking;
+    this.aiHintBtn.disabled = !isPlaying || aiThinking || !isMyTurn || isOnline;
 
     this.scoringBannerEl.classList.toggle('hidden', phase !== 'scoring');
     this.showResultBtn.classList.toggle('hidden', phase !== 'finished' && phase !== 'review');
@@ -1486,23 +1916,112 @@ export class UIManager {
     this.moveNumBtn.classList.toggle('btn-active', active);
   }
 
-  public configureReviewBar(visible: boolean, currentMove: number, totalMoves: number): void {
+  public configureReviewBar(
+    visible: boolean,
+    currentMove: number,
+    totalMoves: number,
+    blackWinrates?: Array<number | undefined>
+  ): void {
     this.reviewBarEl.classList.toggle('hidden', !visible);
     this.reviewSliderEl.max = String(totalMoves);
     this.reviewSliderEl.value = String(currentMove);
     this.reviewLabelEl.textContent = `${currentMove} / ${totalMoves}수`;
+
+    const chartWrap = this.root.querySelector('#rev-chart-wrap');
+    if (chartWrap) {
+      const hasAnyData = Boolean(
+        visible && blackWinrates && blackWinrates.some((v) => typeof v === 'number' && !Number.isNaN(v))
+      );
+      chartWrap.classList.toggle('hidden', !hasAnyData);
+      if (hasAnyData && blackWinrates) {
+        this.renderWinrateSparkline(blackWinrates, currentMove, totalMoves);
+      }
+    }
+  }
+
+  private renderWinrateSparkline(
+    blackWinrates: Array<number | undefined>,
+    currentMove: number,
+    totalMoves: number
+  ): void {
+    const canvas = this.reviewChartCanvasEl;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+
+    // 50% baseline
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.16)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, h / 2);
+    ctx.lineTo(w, h / 2);
+    ctx.stroke();
+
+    const pts: Array<{ x: number; y: number; wr: number; move: number }> = [];
+    for (let i = 0; i <= totalMoves; i++) {
+      const wr = blackWinrates[i];
+      if (typeof wr !== 'number' || Number.isNaN(wr)) continue;
+      const clamped = Math.max(0, Math.min(1, wr));
+      const x = totalMoves > 0 ? (i / totalMoves) * (w - 8) + 4 : 4;
+      const y = h - 4 - clamped * (h - 8);
+      pts.push({ x, y, wr: clamped, move: i });
+    }
+
+    if (pts.length >= 1) {
+      ctx.strokeStyle = '#6fe09a';
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      pts.forEach((p, idx) => {
+        if (idx === 0) ctx.moveTo(p.x, p.y);
+        else ctx.lineTo(p.x, p.y);
+      });
+      ctx.stroke();
+    }
+
+    // Current scrubber position marker
+    const curX = totalMoves > 0 ? (currentMove / totalMoves) * (w - 8) + 4 : 4;
+    ctx.strokeStyle = '#e6b85c';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(curX, 2);
+    ctx.lineTo(curX, h - 2);
+    ctx.stroke();
+
+    let latestWr: number | undefined = blackWinrates[currentMove];
+    if (latestWr === undefined) {
+      for (let i = Math.min(currentMove, totalMoves); i >= 0; i--) {
+        if (typeof blackWinrates[i] === 'number') {
+          latestWr = blackWinrates[i];
+          break;
+        }
+      }
+    }
+    if (this.reviewWinrateLabelEl) {
+      this.reviewWinrateLabelEl.textContent =
+        typeof latestWr === 'number' ? `흑 ${(latestWr * 100).toFixed(1)}%` : '--%';
+    }
   }
 
   public showResultModal(result: GameResult, config: GameConfig): void {
+    const isOmok = config.gameType === 'omok';
     const sb = result.scoreBreakdown;
-    const ruleName =
-      config.ruleset === 'korean' ? '한국식 계가 (집 + 사석)' : '중국식 계가 (생존돌 + 집 면적)';
+    const ruleName = isOmok
+      ? (config.omokRuleset ?? 'renju') === 'renju'
+        ? '오목 렌주룰'
+        : '오목 자유룰'
+      : config.ruleset === 'korean'
+        ? '한국식 계가 (집 + 사석)'
+        : '중국식 계가 (생존돌 + 집 면적)';
 
     const bName = escapeHtml(config.blackName || '흑');
     const wName = escapeHtml(config.whiteName || '백');
 
     let detailTable = '';
-    if (sb) {
+    if (!isOmok && sb) {
       if (sb.ruleset === 'korean') {
         detailTable = `
           <table class="score-table">
@@ -1581,7 +2100,7 @@ export class UIManager {
 
     this.resultBodyEl.innerHTML = `
       <div class="result-headline">
-        <span class="winner-badge">대국 종료</span>
+        <span class="winner-badge">대국 종료${isOmok ? ` · ${ruleName}` : ''}</span>
         <h3>${escapeHtml(result.summaryText)}</h3>
       </div>
       ${detailTable}
@@ -1592,6 +2111,62 @@ export class UIManager {
     this.rematchResultBtn.textContent = '온라인 재대국 신청';
 
     this.resultModalEl.classList.remove('hidden');
+  }
+
+  public setCameraPresetActive(preset: CameraPreset): void {
+    this.camPresetBtns.forEach((btn) => {
+      btn.classList.toggle('btn-active', btn.dataset.cam === preset);
+    });
+  }
+
+  public setPendingMoveState(coordLabel: string | null, hintPrefix = '착수 예정'): void {
+    const active = coordLabel !== null;
+    this.pendingMoveBarEl.classList.toggle('hidden', !active);
+    if (coordLabel !== null) {
+      this.pendingCoordEl.textContent = `${hintPrefix}: ${coordLabel}`;
+    }
+  }
+
+  public setAIHintLoading(loading: boolean): void {
+    this.aiHintBtn.textContent = loading ? '수읽기 중...' : 'AI 추천수';
+    this.aiHintBtn.classList.toggle('btn-active', loading);
+  }
+
+  public openOptionsModal(): void {
+    this.syncOptionsDOM(this.settings);
+    this.optionsModalEl.classList.remove('hidden');
+  }
+
+  public closeOptionsModal(): void {
+    this.optionsModalEl.classList.add('hidden');
+  }
+
+  public syncOptionsDOM(s: UserSettings): void {
+    this.settings = { ...s };
+    const markSeg = (selector: string, val: string) => {
+      this.root.querySelectorAll<HTMLButtonElement>(`${selector} .seg-btn`).forEach((b) => {
+        b.classList.toggle('selected', b.dataset.val === val);
+      });
+    };
+    markSeg('#seg-opt-motion', s.stoneMotionStyle);
+    markSeg('#seg-opt-input', s.inputMode);
+    markSeg('#seg-opt-physics', s.physicsIntensity);
+    markSeg('#seg-opt-lighting', s.lightingTheme);
+
+    (this.root.querySelector('#opt-true-vertical') as HTMLInputElement).checked = s.trueVerticalView;
+    (this.root.querySelector('#opt-auto-mobile-vertical') as HTMLInputElement).checked =
+      s.autoMobileVerticalView;
+    (this.root.querySelector('#opt-lock-vertical-rot') as HTMLInputElement).checked = s.lockVerticalRotation;
+    (this.root.querySelector('#opt-touch-loupe') as HTMLInputElement).checked = s.touchLoupeEnabled;
+    (this.root.querySelector('#opt-show-forbidden') as HTMLInputElement).checked = s.showForbiddenPoints;
+    (this.root.querySelector('#opt-show-coords') as HTMLInputElement).checked = s.showCoordinates;
+    this.coordsBtn.classList.toggle('btn-active', s.showCoordinates);
+
+    const volSlider = this.root.querySelector('#slider-volume') as HTMLInputElement;
+    volSlider.value = String(Math.round(s.soundVolume * 100));
+    const muteBtn = this.root.querySelector('#btn-mute') as HTMLButtonElement;
+    muteBtn.textContent = s.soundMuted ? '음소거됨' : '음향';
+    muteBtn.classList.toggle('btn-danger', s.soundMuted);
   }
 
   public setRematchButtonPending(): void {

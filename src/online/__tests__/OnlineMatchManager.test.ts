@@ -294,4 +294,62 @@ describe('Nickname & Online Multiplayer Engine', () => {
     await host.cancelMatchmakingOrRoom();
     await guest.cancelMatchmakingOrRoom();
   });
+
+  it('separates Baduk and Omok Quick Match queues and preserves Omok room metadata', async () => {
+    const hub = new InMemoryBrokerHub();
+    let badukMatched = false;
+    let omokStartA: { cfg: GameConfig; role: OnlineRoleInfo } | null = null;
+    let omokStartB: { cfg: GameConfig; role: OnlineRoleInfo } | null = null;
+
+    const badukSeeker = new OnlineMatchManager(
+      makeFakeProfile('sd_baduk_1', '바둑탐색'),
+      new MockTransport(hub),
+      makeBaseCallbacks({
+        onMatchStart: () => {
+          badukMatched = true;
+        },
+      })
+    );
+    const omokA = new OnlineMatchManager(
+      makeFakeProfile('sd_omok_a', '오목장인'),
+      new MockTransport(hub),
+      makeBaseCallbacks({
+        onMatchStart: (cfg, role) => {
+          omokStartA = { cfg, role };
+        },
+      })
+    );
+    const omokB = new OnlineMatchManager(
+      makeFakeProfile('sd_omok_b', '오목신수'),
+      new MockTransport(hub),
+      makeBaseCallbacks({
+        onMatchStart: (cfg, role) => {
+          omokStartB = { cfg, role };
+        },
+      })
+    );
+
+    await badukSeeker.startQuickMatch('any', 'baduk', 'renju');
+    await omokA.startQuickMatch('any', 'omok', 'renju');
+    await new Promise((r) => setTimeout(r, 40));
+
+    // A Baduk seeker must NOT pair with an Omok seeker
+    expect(badukMatched).toBe(false);
+    expect(omokStartA).toBeNull();
+
+    // Once another Omok Renju seeker joins, the two Omok players pair cleanly on 15x15
+    await omokB.startQuickMatch('any', 'omok', 'renju');
+    await new Promise((r) => setTimeout(r, 80));
+
+    expect(badukMatched).toBe(false);
+    expect(omokStartA).not.toBeNull();
+    expect(omokStartB).not.toBeNull();
+    expect(omokStartA!.cfg.gameType).toBe('omok');
+    expect(omokStartA!.cfg.omokRuleset).toBe('renju');
+    expect(omokStartA!.cfg.boardSize).toBe(15);
+
+    await badukSeeker.cancelMatchmakingOrRoom();
+    await omokA.cancelMatchmakingOrRoom();
+    await omokB.cancelMatchmakingOrRoom();
+  });
 });

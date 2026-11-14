@@ -3,11 +3,17 @@ import {
   BLACK,
   WHITE,
   EMPTY,
+  Coord,
+  AIDifficulty,
   GameConfig,
+  GameResult,
+  GameType,
+  OmokRulesetType,
   PlayerColor,
   opponentColor,
 } from './rules/types';
 import { GoEngine, coordToLabel } from './rules/GoEngine';
+import { GomokuEngine } from './rules/GomokuEngine';
 import {
   buildScoreGameResult,
   calculateScore,
@@ -17,9 +23,15 @@ import {
 import { exportToSgf, parseSgf } from './rules/sgf';
 import { ClockSnapshot, GameClock } from './rules/clock';
 import { AcousticStoneAudioEngine } from './audio/AcousticStoneAudioEngine';
-import { SceneManager } from './scene/SceneManager';
+import { CameraPreset, SceneManager } from './scene/SceneManager';
 import { AIController } from './ai/AIController';
 import { UIManager } from './ui/UIManager';
+import {
+  SettingsManager,
+  UserSettings,
+  isMobileOrTouchViewport,
+  resolveEffectiveInputMode,
+} from './settings/SettingsManager';
 import { ProfileManager, generateDefaultNickname } from './profile/ProfileManager';
 import { MultiBrokerTransport } from './online/MultiBrokerTransport';
 import { OnlineMatchManager, normalizeRoomCode } from './online/OnlineMatchManager';
@@ -27,27 +39,37 @@ import { SyncSnapshotPayload } from './online/types';
 
 class BadukApp {
   private profile: ProfileManager;
+  private settings: SettingsManager;
   private online: OnlineMatchManager;
   private audio: AcousticStoneAudioEngine;
-  private engine: GoEngine;
+  private engine: GoEngine | GomokuEngine;
   private scene: SceneManager;
   private ai: AIController;
   private ui: UIManager;
   private clock: GameClock;
 
   private aiThinking = false;
+  private hintThinking = false;
   private pendingOnlineUndo = false;
   private showMoveNumbers = false;
   private showTerritoryHint = false;
   private deadStoneMask: Uint8Array<ArrayBufferLike> = new Uint8Array(361);
   private reviewMoveIndex = 0;
+  private pendingCoord: Coord | null = null;
+  private doubleTapCoord: Coord | null = null;
+  private doubleTapAt = 0;
+  private moveBlackWinrates: Array<number | undefined> = [];
 
   constructor() {
     this.profile = new ProfileManager();
+    this.settings = new SettingsManager();
+    const initialSettings = this.settings.get();
 
     const defaultConfig: GameConfig = {
       boardSize: 19,
       ruleset: 'korean',
+      gameType: 'baduk',
+      omokRuleset: 'renju',
       handicap: 0,
       komi: 6.5,
       superko: true,
@@ -62,7 +84,9 @@ class BadukApp {
     };
 
     this.audio = new AcousticStoneAudioEngine();
-    this.engine = new GoEngine(defaultConfig);
+    this.audio.setVolume(initialSettings.soundVolume);
+    this.audio.setMuted(initialSettings.soundMuted);
+    this.engine = this.createEngine(defaultConfig);
     this.ai = new AIController();
 
     this.clock = new GameClock({
@@ -108,6 +132,7 @@ class BadukApp {
         this.ui?.setCoordStatus(this.engine.phase === 'scoring' ? '사석 클릭 지정' : '대기 중');
       },
     });
+    this.applySettingsToScene(initialSettings, false);
 
     const transport = new MultiBrokerTransport(this.profile.getClientId());
     this.online = new OnlineMatchManager(this.profile, transport, {
@@ -148,6 +173,7 @@ class BadukApp {
         if (!moveRes.valid || !moveRes.record) return;
 
         this.scene.clearHover();
+        this.clearAIHints();
         this.applyMoveToScene(
           payload.x,
           payload.y,
@@ -155,6 +181,12 @@ class BadukApp {
           moveRes.capturedCoords ?? [],
           moveRes.adjacentTotalCount ?? 0
         );
+
+        if (this.engine.result && (this.engine.phase as string) === 'finished') {
+          this.handleGameResultIfFinished(this.engine.result);
+          this.syncAllUI();
+          return;
+        }
 
         if (payload.clock) {
           this.clock.applySnapshot(payload.clock, this.engine.currentTurn);
@@ -291,23 +323,49 @@ class BadukApp {
       },
     });
 
-    this.ui = new UIManager(uiRoot, this.profile.getNickname(), {
+    this.ui = new UIManager(uiRoot, this.profile.getNickname(), initialSettings, {
       onStartNewGame: (cfg) => this.startNewGame(cfg, false),
       onPass: () => this.handleHumanPass(),
       onUndo: () => this.handleUndo(),
       onResign: () => this.handleResign(),
       onToggleMoveNumbers: () => this.toggleMoveNumbers(),
       onToggleTerritoryHint: () => this.toggleTerritoryHint(),
-      onToggleCoordinates: () => this.scene.toggleCoordinates(),
-      onCameraPreset: (preset) => this.scene.setCameraPreset(preset),
+      onToggleCoordinates: () => {
+        const next = !this.settings.get().showCoordinates;
+        const updated = this.settings.update({ showCoordinates: next });
+        this.scene.setCoordinatesVisible(updated.showCoordinates);
+        this.ui.syncOptionsDOM(updated);
+        return updated.showCoordinates;
+      },
+      onRequestAIHint: () => void this.handleRequestAIHint(),
+      onConfirmPendingMove: () => this.confirmPendingMove(),
+      onCancelPendingMove: () => this.clearPendingMove(),
+      onNudgePendingMove: (dx, dy) => this.nudgePendingMove(dx, dy),
+      onUpdateSettings: (patch) => this.handleSettingsUpdated(patch),
+      onResetSettings: () => {
+        const reset = this.settings.resetDefaults();
+        this.applySettingsToScene(reset, true);
+        this.refreshForbiddenOverlay();
+        return reset;
+      },
+      onCameraPreset: (preset) => {
+        this.scene.setCameraPreset(preset);
+        this.ui.setCameraPresetActive(preset);
+      },
       onStirBowls: () => {
         this.scene.stoneAnimator.stirBowl('black', 0.95, true);
         window.setTimeout(() => this.scene.stoneAnimator.stirBowl('white', 0.82, true), 190);
       },
-      onVolumeChange: (vol) => this.audio.setVolume(vol),
+      onVolumeChange: (vol) => {
+        this.audio.setVolume(vol);
+        const updated = this.settings.update({ soundVolume: vol });
+        this.ui.syncOptionsDOM(updated);
+      },
       onToggleMute: () => {
         const next = !this.audio.isMuted();
         this.audio.setMuted(next);
+        const updated = this.settings.update({ soundMuted: next });
+        this.ui.syncOptionsDOM(updated);
         return next;
       },
       onSaveSgf: () => void this.saveSgfFile(),
@@ -339,9 +397,9 @@ class BadukApp {
           this.online.refreshOpenRooms();
         });
       },
-      onStartQuickMatch: (prefSize) => {
+      onStartQuickMatch: (prefSize, gameType: GameType, omokRuleset: OmokRulesetType) => {
         this.audio.ensureReady();
-        void this.online.startQuickMatch(prefSize).catch((err: Error) => {
+        void this.online.startQuickMatch(prefSize, gameType, omokRuleset).catch((err: Error) => {
           this.ui.showToast(err.message, true);
         });
       },
@@ -381,9 +439,61 @@ class BadukApp {
       },
     });
 
+    const initialCam = this.pickPreferredCameraPreset(defaultConfig);
+    this.scene.setCameraPreset(initialCam);
+    this.ui.setCameraPresetActive(initialCam);
     this.ui.updateGameHeader(defaultConfig);
     this.syncAllUI();
     this.checkUrlRoomInvite();
+  }
+
+  private createEngine(cfg: GameConfig): GoEngine | GomokuEngine {
+    return cfg.gameType === 'omok' ? new GomokuEngine(cfg) : new GoEngine(cfg);
+  }
+
+  private pickPreferredCameraPreset(cfg: GameConfig): CameraPreset {
+    const s = this.settings.get();
+    const isPortraitMobile = isMobileOrTouchViewport() && window.innerHeight >= window.innerWidth;
+    if (s.trueVerticalView || (s.autoMobileVerticalView && isPortraitMobile)) {
+      return 'true_top';
+    }
+    if ((cfg.mode === 'ai' || cfg.mode === 'online') && cfg.humanColor === WHITE) {
+      return 'white';
+    }
+    return 'default';
+  }
+
+  private applySettingsToScene(s: UserSettings, updateCamera: boolean): void {
+    this.scene.stoneAnimator.setMotionStyle(s.stoneMotionStyle);
+    this.scene.stoneAnimator.setPhysicsIntensity(s.physicsIntensity);
+    this.scene.setLockVerticalRotation(s.lockVerticalRotation);
+    this.scene.setTouchLoupeEnabled(s.touchLoupeEnabled);
+    this.scene.setLightingTheme(s.lightingTheme);
+    this.scene.setCoordinatesVisible(s.showCoordinates);
+    this.audio.setVolume(s.soundVolume);
+    this.audio.setMuted(s.soundMuted);
+
+    if (updateCamera) {
+      const preset = this.pickPreferredCameraPreset(this.engine.config);
+      this.scene.setCameraPreset(preset);
+      this.ui?.setCameraPresetActive(preset);
+    }
+  }
+
+  private handleSettingsUpdated(patch: Partial<UserSettings>): UserSettings {
+    const prev = this.settings.get();
+    const next = this.settings.update(patch);
+    const camChanged =
+      prev.trueVerticalView !== next.trueVerticalView ||
+      prev.autoMobileVerticalView !== next.autoMobileVerticalView;
+    this.applySettingsToScene(next, camChanged);
+    if (prev.showForbiddenPoints !== next.showForbiddenPoints) {
+      this.refreshForbiddenOverlay();
+    }
+    if (prev.inputMode !== next.inputMode) {
+      this.clearPendingMove();
+    }
+    return next;
   }
 
   private checkUrlRoomInvite(): void {
@@ -422,11 +532,16 @@ class BadukApp {
     this.audio.ensureReady();
     this.ai.cancelPending();
     this.aiThinking = false;
+    this.hintThinking = false;
     this.pendingOnlineUndo = false;
     this.showTerritoryHint = false;
+    this.moveBlackWinrates = [];
+    this.clearPendingMove();
+    this.clearAIHints();
+    this.ui.setAIHintLoading(false);
     this.ui.setHintButtonActive(false);
 
-    this.engine.reset(cfg);
+    this.engine = this.createEngine(cfg);
     this.deadStoneMask = new Uint8Array(cfg.boardSize * cfg.boardSize);
 
     this.scene.setBoardSize(cfg.boardSize);
@@ -434,13 +549,12 @@ class BadukApp {
     this.scene.updateMarkers(null, null, null);
     this.scene.clearTerritoryMarkers();
     this.scene.clearMoveNumbers();
+    this.scene.renderOmokWinningLine(null);
+    this.refreshForbiddenOverlay();
 
-    // Orient camera naturally if human is White in 1P AI or Online mode
-    if ((cfg.mode === 'ai' || cfg.mode === 'online') && cfg.humanColor === WHITE) {
-      this.scene.setCameraPreset('white');
-    } else {
-      this.scene.setCameraPreset('default');
-    }
+    const preferredCam = this.pickPreferredCameraPreset(cfg);
+    this.scene.setCameraPreset(preferredCam);
+    this.ui.setCameraPresetActive(preferredCam);
 
     this.ui.updateGameHeader(cfg);
     this.ui.configureReviewBar(false, 0, 0);
@@ -496,7 +610,13 @@ class BadukApp {
             ? '자살수 금지'
             : check.reason === 'SUPERKO'
               ? '초패 금지'
-              : label;
+              : check.reason === 'DOUBLE_THREE'
+                ? '삼삼(3·3) 금수'
+                : check.reason === 'DOUBLE_FOUR'
+                  ? '사사(4·4) 금수'
+                  : check.reason === 'OVERLINE'
+                    ? '장목(6목+) 금수'
+                    : label;
       this.ui.setCoordStatus(reasonShort);
       return {
         valid: false,
@@ -530,6 +650,122 @@ class BadukApp {
 
     if (!this.isHumanTurn()) return;
 
+    this.clearAIHints();
+
+    const effMode = resolveEffectiveInputMode(this.settings.get().inputMode);
+    if (effMode === 'instant') {
+      this.clearPendingMove();
+      this.commitHumanMove(x, y);
+      return;
+    }
+
+    const check = this.engine.validateMove(x, y, this.engine.currentTurn);
+    if (!check.valid) {
+      if (check.reason && check.reason !== 'OCCUPIED') {
+        this.ui.showToast(this.engine.getIllegalReasonKorean(check.reason), true);
+      }
+      return;
+    }
+
+    const label = coordToLabel(x, y, this.engine.size);
+    if (effMode === 'double_tap') {
+      const now = Date.now();
+      const sameTarget =
+        this.doubleTapCoord !== null && this.doubleTapCoord.x === x && this.doubleTapCoord.y === y;
+      if (sameTarget && now - this.doubleTapAt < 2200) {
+        this.clearPendingMove();
+        this.commitHumanMove(x, y);
+        return;
+      }
+      this.doubleTapCoord = { x, y };
+      this.doubleTapAt = now;
+      this.pendingCoord = { x, y };
+      this.scene.setPendingMove(this.pendingCoord, this.engine.currentTurn);
+      this.ui.setPendingMoveState(label, '한 번 더 탭 또는 확정');
+      return;
+    }
+
+    // 'confirm' 2-step mode
+    this.pendingCoord = { x, y };
+    this.scene.setPendingMove(this.pendingCoord, this.engine.currentTurn);
+    this.ui.setPendingMoveState(label, '착수 예정');
+  }
+
+  private nudgePendingMove(dx: number, dy: number): void {
+    if (!this.pendingCoord || !this.isHumanTurn()) return;
+    const maxIdx = this.engine.size - 1;
+    const nx = Math.max(0, Math.min(maxIdx, this.pendingCoord.x + dx));
+    const ny = Math.max(0, Math.min(maxIdx, this.pendingCoord.y + dy));
+    this.pendingCoord = { x: nx, y: ny };
+    this.doubleTapCoord = { x: nx, y: ny };
+    this.doubleTapAt = Date.now();
+    this.scene.setPendingMove(this.pendingCoord, this.engine.currentTurn);
+
+    const check = this.engine.validateMove(nx, ny, this.engine.currentTurn);
+    const label = coordToLabel(nx, ny, this.engine.size);
+    const suffix = check.valid ? label : `${label} (착수 불가)`;
+    this.ui.setPendingMoveState(suffix, '착수 예정');
+  }
+
+  private confirmPendingMove(): void {
+    if (!this.pendingCoord || !this.isHumanTurn()) return;
+    const { x, y } = this.pendingCoord;
+    const check = this.engine.validateMove(x, y, this.engine.currentTurn);
+    if (!check.valid) {
+      this.ui.showToast(this.engine.getIllegalReasonKorean(check.reason), true);
+      return;
+    }
+    this.clearPendingMove();
+    this.commitHumanMove(x, y);
+  }
+
+  private clearPendingMove(): void {
+    this.pendingCoord = null;
+    this.doubleTapCoord = null;
+    this.scene?.setPendingMove(null);
+    this.ui?.setPendingMoveState(null);
+  }
+
+  private clearAIHints(): void {
+    this.hintThinking = false;
+    this.scene?.renderHintSuggestions([]);
+    this.ui?.setAIHintLoading(false);
+  }
+
+  private refreshForbiddenOverlay(): void {
+    if (
+      this.engine instanceof GomokuEngine &&
+      this.engine.phase === 'playing' &&
+      this.engine.currentTurn === BLACK &&
+      this.settings.get().showForbiddenPoints
+    ) {
+      this.scene.renderPersistentForbiddenPoints(this.engine.getForbiddenPoints());
+    } else {
+      this.scene.renderPersistentForbiddenPoints([]);
+    }
+  }
+
+  private handleGameResultIfFinished(result: GameResult): void {
+    this.clock.stop();
+    this.clearPendingMove();
+    this.refreshForbiddenOverlay();
+
+    if (result.winningLine && result.winningLine.length >= 5) {
+      this.scene.renderOmokWinningLine(result.winningLine);
+      this.audio.playWinCelebrationChime();
+    } else {
+      this.audio.playCeremonialChime('finish');
+    }
+
+    this.ui.showToast(result.summaryText);
+    window.setTimeout(() => {
+      if (this.engine.phase === 'finished') {
+        this.ui.showResultModal(result, this.engine.config);
+      }
+    }, 520);
+  }
+
+  private commitHumanMove(x: number, y: number): void {
     const moveRes = this.engine.playMove(x, y);
     if (!moveRes.valid || !moveRes.record) {
       if (moveRes.reason && moveRes.reason !== 'OCCUPIED') {
@@ -546,6 +782,22 @@ class BadukApp {
       moveRes.capturedCoords ?? [],
       moveRes.adjacentTotalCount ?? 0
     );
+
+    if (this.engine.phase === 'finished' && this.engine.result) {
+      this.clock.stop();
+      if (this.engine.config.mode === 'online') {
+        this.online.sendMove(
+          x,
+          y,
+          moveRes.record.color,
+          moveRes.record.moveNumber,
+          this.clock.getSnapshot()
+        );
+      }
+      this.handleGameResultIfFinished(this.engine.result);
+      this.syncAllUI();
+      return;
+    }
 
     this.clock.startTurn(this.engine.currentTurn);
     if (this.engine.config.mode === 'online') {
@@ -580,7 +832,10 @@ class BadukApp {
     });
 
     window.setTimeout(() => {
-      if (this.engine.history.length === expectedMoveCount && this.engine.phase === 'playing') {
+      if (
+        this.engine.history.length === expectedMoveCount &&
+        (this.engine.phase === 'playing' || this.engine.phase === 'finished')
+      ) {
         this.scene.updateMarkers({ x, y }, color, this.engine.koPoint);
         if (this.showMoveNumbers) {
           this.scene.renderMoveNumbers(
@@ -592,7 +847,9 @@ class BadukApp {
       }
     }, 205);
 
-    if (this.showTerritoryHint) {
+    this.refreshForbiddenOverlay();
+
+    if (this.showTerritoryHint && !(this.engine instanceof GomokuEngine)) {
       this.refreshTerritoryHintOverlay();
     }
   }
@@ -624,8 +881,13 @@ class BadukApp {
         lastMove: lastRecord?.coord ?? null,
         opponentPassed,
         moveCount: this.engine.history.length,
-        positionHashes: Array.from(this.engine.positionHashes).map((h) => h.toString()),
+        positionHashes:
+          this.engine instanceof GoEngine
+            ? Array.from(this.engine.positionHashes).map((h) => h.toString())
+            : [],
         difficulty: this.engine.config.aiDifficulty,
+        gameType: this.engine.config.gameType ?? 'baduk',
+        omokRuleset: this.engine.config.omokRuleset ?? 'renju',
       }),
       minVisualDelay,
     ]);
@@ -646,6 +908,10 @@ class BadukApp {
     const { x, y } = searchRes.coord;
     const res = this.engine.playMove(x, y);
     if (res.valid && res.record) {
+      const blackWr = aiColor === BLACK ? searchRes.winrate : 1 - searchRes.winrate;
+      res.record.winrateAfter = blackWr;
+      this.moveBlackWinrates[res.record.moveNumber] = blackWr;
+
       this.applyMoveToScene(
         x,
         y,
@@ -653,11 +919,78 @@ class BadukApp {
         res.capturedCoords ?? [],
         res.adjacentTotalCount ?? 0
       );
-      this.clock.startTurn(this.engine.currentTurn);
-      this.syncAllUI();
+      if (this.engine.result && (this.engine.phase as string) === 'finished') {
+        this.handleGameResultIfFinished(this.engine.result);
+        this.syncAllUI();
+      } else {
+        this.clock.startTurn(this.engine.currentTurn);
+        this.syncAllUI();
+      }
     } else {
       this.executePass(aiColor, true, false);
     }
+  }
+
+  private async handleRequestAIHint(): Promise<void> {
+    if (!this.isHumanTurn() || this.hintThinking) return;
+    if (this.engine.config.mode === 'online') {
+      this.ui.showToast('온라인 대국에서는 공정성을 위해 AI 추천수를 사용할 수 없습니다.', true);
+      return;
+    }
+
+    this.hintThinking = true;
+    this.ui.setAIHintLoading(true);
+    const turnColor = this.engine.currentTurn;
+    const lastRecord =
+      this.engine.history.length > 0 ? this.engine.history[this.engine.history.length - 1] : null;
+    const hintDifficulty = Math.max(3, this.engine.config.aiDifficulty) as AIDifficulty;
+
+    const searchRes = await this.ai.requestMove({
+      board: new Uint8Array(this.engine.board),
+      size: this.engine.size,
+      color: turnColor,
+      ruleset: this.engine.config.ruleset,
+      komi: this.engine.config.komi,
+      koPoint: this.engine.koPoint ? { ...this.engine.koPoint } : null,
+      captures: { ...this.engine.captures },
+      lastMove: lastRecord?.coord ?? null,
+      opponentPassed: lastRecord !== null && lastRecord.coord === null,
+      moveCount: this.engine.history.length,
+      positionHashes:
+        this.engine instanceof GoEngine
+          ? Array.from(this.engine.positionHashes).map((h) => h.toString())
+          : [],
+      difficulty: hintDifficulty,
+      gameType: this.engine.config.gameType ?? 'baduk',
+      omokRuleset: this.engine.config.omokRuleset ?? 'renju',
+      includeHints: true,
+    });
+
+    this.hintThinking = false;
+    this.ui.setAIHintLoading(false);
+
+    if (!searchRes || this.engine.phase !== 'playing' || !this.isHumanTurn()) {
+      return;
+    }
+
+    const suggestions =
+      searchRes.topSuggestions && searchRes.topSuggestions.length > 0
+        ? searchRes.topSuggestions
+        : searchRes.coord
+          ? [{ coord: searchRes.coord, winrate: searchRes.winrate, visits: searchRes.simulations }]
+          : [];
+
+    if (suggestions.length === 0) {
+      this.ui.showToast('AI가 한수쉼(Pass)을 권장합니다.');
+      return;
+    }
+
+    this.scene.renderHintSuggestions(suggestions);
+    const best = suggestions[0];
+    const bestLabel = coordToLabel(best.coord.x, best.coord.y, this.engine.size);
+    this.ui.showToast(
+      `AI 추천수 Top ${suggestions.length}: 1순위 ${bestLabel} (승률 ${(best.winrate * 100).toFixed(1)}%)`
+    );
   }
 
   private handleHumanPass(): void {
@@ -750,7 +1083,7 @@ class BadukApp {
   }
 
   private finalizeScoringNow(): void {
-    if (this.engine.phase !== 'scoring') return;
+    if (this.engine.phase !== 'scoring' || !(this.engine instanceof GoEngine)) return;
     const breakdown = calculateScore({
       board: this.engine.board,
       size: this.engine.size,
@@ -768,7 +1101,7 @@ class BadukApp {
   }
 
   private resumeFromScoring(fromRemote = false): void {
-    if (this.engine.phase !== 'scoring') return;
+    if (this.engine.phase !== 'scoring' || !(this.engine instanceof GoEngine)) return;
     if (this.engine.config.mode === 'online' && !fromRemote) {
       this.online.sendScoreResume();
     }
@@ -816,6 +1149,9 @@ class BadukApp {
   private performUndoSteps(steps: number, syncedClock?: ClockSnapshot): boolean {
     if (!this.engine.undo(steps)) return false;
 
+    this.clearPendingMove();
+    this.clearAIHints();
+    this.scene.renderOmokWinningLine(null);
     this.audio.playStonePickup('left', false);
     this.scene.stoneAnimator.syncBoardSnapshot(
       this.engine.board,
@@ -825,11 +1161,12 @@ class BadukApp {
     const last =
       this.engine.history.length > 0 ? this.engine.history[this.engine.history.length - 1] : null;
     this.scene.updateMarkers(last?.coord ?? null, last?.color ?? null, this.engine.koPoint);
+    this.refreshForbiddenOverlay();
 
     if (this.showMoveNumbers) {
       this.scene.renderMoveNumbers(this.engine.history, this.engine.history.length, this.engine.board);
     }
-    if (this.showTerritoryHint) {
+    if (this.showTerritoryHint && !(this.engine instanceof GomokuEngine)) {
       this.refreshTerritoryHintOverlay();
     }
 
@@ -894,7 +1231,10 @@ class BadukApp {
     if (snap.moves.length <= this.engine.history.length) return;
 
     const cfg = { ...this.engine.config };
-    this.engine.reset(cfg);
+    this.engine = this.createEngine(cfg);
+    this.clearPendingMove();
+    this.clearAIHints();
+    this.scene.renderOmokWinningLine(null);
     for (const m of snap.moves) {
       if (m.coord === null) {
         this.engine.pass();
@@ -911,6 +1251,7 @@ class BadukApp {
     const last =
       this.engine.history.length > 0 ? this.engine.history[this.engine.history.length - 1] : null;
     this.scene.updateMarkers(last?.coord ?? null, last?.color ?? null, this.engine.koPoint);
+    this.refreshForbiddenOverlay();
 
     if (snap.phase === 'scoring') {
       this.engine.phase = 'scoring';
@@ -971,8 +1312,11 @@ class BadukApp {
 
   private enterReviewMode(): void {
     this.clock.stop();
+    this.clearPendingMove();
+    this.clearAIHints();
     this.engine.phase = 'review';
     this.scene.clearTerritoryMarkers();
+    this.scene.renderPersistentForbiddenPoints([]);
     this.scene.stoneAnimator.updateDeadMaskVisuals(null);
     this.showMoveNumbers = true;
     this.ui.setMoveNumbersButtonActive(true);
@@ -995,7 +1339,12 @@ class BadukApp {
       this.scene.renderMoveNumbers(this.engine.history, this.reviewMoveIndex, snap.board);
     }
 
-    this.ui.configureReviewBar(true, this.reviewMoveIndex, this.engine.history.length);
+    this.ui.configureReviewBar(
+      true,
+      this.reviewMoveIndex,
+      this.engine.history.length,
+      this.moveBlackWinrates
+    );
     this.ui.updatePlayersStatus({
       turn: snap.nextTurn,
       phase: this.engine.phase,
@@ -1004,6 +1353,7 @@ class BadukApp {
       moveCount: this.engine.history.length,
       mode: this.engine.config.mode,
       humanColor: this.engine.config.humanColor,
+      gameType: this.engine.config.gameType,
     });
   }
 
@@ -1064,6 +1414,8 @@ class BadukApp {
         boardSize: parsed.boardSize,
         komi: parsed.komi,
         ruleset: parsed.ruleset,
+        gameType: parsed.gameType,
+        omokRuleset: parsed.omokRuleset,
         handicap: 0,
         mode: 'local2p',
         mainTimeSeconds: 0,
@@ -1073,9 +1425,16 @@ class BadukApp {
         whiteName: parsed.whiteName || '백 (기보)',
       };
 
-      this.engine.reset(cfg);
-      for (const pt of parsed.setupBlack) this.engine.setCustomSetupStone(pt.x, pt.y, BLACK);
-      for (const pt of parsed.setupWhite) this.engine.setCustomSetupStone(pt.x, pt.y, WHITE);
+      this.moveBlackWinrates = [];
+      this.scene.renderOmokWinningLine(null);
+      this.engine = this.createEngine(cfg);
+      if (this.engine instanceof GoEngine) {
+        for (const pt of parsed.setupBlack) this.engine.setCustomSetupStone(pt.x, pt.y, BLACK);
+        for (const pt of parsed.setupWhite) this.engine.setCustomSetupStone(pt.x, pt.y, WHITE);
+      } else {
+        for (const pt of parsed.setupBlack) this.engine.board[pt.y * cfg.boardSize + pt.x] = BLACK;
+        for (const pt of parsed.setupWhite) this.engine.board[pt.y * cfg.boardSize + pt.x] = WHITE;
+      }
 
       for (const m of parsed.moves) {
         this.engine.currentTurn = m.color;
@@ -1119,6 +1478,7 @@ class BadukApp {
       moveCount: this.engine.history.length,
       mode: this.engine.config.mode,
       humanColor: this.engine.config.humanColor,
+      gameType: this.engine.config.gameType,
     });
   }
 }

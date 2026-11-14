@@ -1,4 +1,5 @@
 import { AISearchRequest, AISearchResult, MctsEngine } from './MctsEngine';
+import { GomokuAI } from './GomokuAI';
 
 interface WorkerRequestMessage {
   id: number;
@@ -10,11 +11,13 @@ interface WorkerResponseMessage {
   result: AISearchResult;
 }
 
-const engine = new MctsEngine();
+const goEngine = new MctsEngine();
+const gomokuAI = new GomokuAI();
 
 self.onmessage = (event: MessageEvent<WorkerRequestMessage>) => {
   const { id, payload } = event.data;
-  const result = engine.chooseMove(payload);
+  const result =
+    payload.gameType === 'omok' ? gomokuAI.chooseMove(payload) : goEngine.chooseMove(payload);
   const response: WorkerResponseMessage = { id, result };
   self.postMessage(response);
 };

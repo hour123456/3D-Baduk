@@ -9,7 +9,9 @@ export function opponentColor(color: PlayerColor): PlayerColor {
   return color === BLACK ? WHITE : BLACK;
 }
 
-export type BoardSize = 9 | 13 | 19;
+export type GameType = 'baduk' | 'omok';
+export type OmokRulesetType = 'renju' | 'freestyle';
+export type BoardSize = 9 | 13 | 15 | 19;
 export type RulesetType = 'korean' | 'chinese';
 export type AIDifficulty = 1 | 2 | 3 | 4 | 5;
 export type GamePhase = 'setup' | 'playing' | 'scoring' | 'finished' | 'review';
@@ -20,7 +22,10 @@ export type IllegalMoveReason =
   | 'OCCUPIED'
   | 'SUICIDE'
   | 'KO'
-  | 'SUPERKO';
+  | 'SUPERKO'
+  | 'DOUBLE_THREE'
+  | 'DOUBLE_FOUR'
+  | 'OVERLINE';
 
 export interface Coord {
   x: number;
@@ -28,6 +33,8 @@ export interface Coord {
 }
 
 export interface GameConfig {
+  gameType?: GameType;
+  omokRuleset?: OmokRulesetType;
   boardSize: BoardSize;
   ruleset: RulesetType;
   handicap: number; // 0 or 2..9
@@ -56,6 +63,7 @@ export interface MoveRecord {
   hashAfter: bigint;
   consecutivePasses: number;
   timestamp: number;
+  winrateAfter?: number;
 }
 
 export interface MoveValidation {
@@ -69,26 +77,32 @@ export interface MoveValidation {
   adjacentTotalCount?: number;
 }
 
-export type WinReason = 'score' | 'resign' | 'timeout';
+export type WinReason = 'score' | 'resign' | 'timeout' | 'five_in_row' | 'draw';
 
 export interface ScoreBreakdown {
   ruleset: RulesetType;
   komi: number;
+  // Territory intersections (empty points surrounded exclusively by live stones of one color + dead opponent stone intersections)
   blackTerritory: number;
   whiteTerritory: number;
+  // Alive stones currently on board
   blackAliveStones: number;
   whiteAliveStones: number;
-  blackCapturesDuringPlay: number;
-  whiteCapturesDuringPlay: number;
+  // Prisoners captured during play
+  blackCapturesDuringPlay: number; // White stones captured by Black
+  whiteCapturesDuringPlay: number; // Black stones captured by White
+  // Dead stones marked at scoring
   deadBlackStones: number;
   deadWhiteStones: number;
+  // Neutral dame intersections
   dameCount: number;
+  // Final totals
   blackTotal: number;
   whiteTotal: number;
   winner: PlayerColor | 'draw';
-  margin: number;
-  territoryMap: Int8Array;
-  deadStoneMask: Uint8Array;
+  margin: number; // |blackTotal - whiteTotal|
+  territoryMap: Int8Array; // 0: neutral/occupied-alive, 1: black territory, 2: white territory
+  deadStoneMask: Uint8Array; // 1 where stone on board is marked dead
 }
 
 export interface GameResult {
@@ -96,6 +110,7 @@ export interface GameResult {
   reason: WinReason;
   margin?: number;
   scoreBreakdown?: ScoreBreakdown;
+  winningLine?: Coord[];
   summaryText: string;
 }
 

@@ -1,23 +1,27 @@
 import * as THREE from 'three';
-import { BLACK, WHITE, EMPTY, BoardSize, Coord, PlayerColor, StoneColor } from '../rules/types';
+import { BLACK, WHITE, EMPTY, Coord, PlayerColor, StoneColor } from '../rules/types';
 import { AcousticStoneAudioEngine } from '../audio/AcousticStoneAudioEngine';
+import type { PhysicsIntensity, StoneMotionStyle } from '../settings/SettingsManager';
 import { BoardGridMetrics, createClamshellStoneTexture, createSlateStoneTexture } from './ProceduralTextures';
 import { BowlAnchor } from './GobanBuilder';
+import {
+  BowlPhysicsParticle,
+  StonePhysicsBody,
+  StonePhysicsWorld,
+} from './StonePhysicsWorld';
 
 /**
  * Builds an authentic 36-go Biconvex Lens Go Stone Geometry (unit radius = 1.0, height = 0.92)
- * so scaling by `stoneRadius` yields exact proportional stones for 9x9, 13x13, and 19x19.
+ * so scaling by `stoneRadius` yields exact proportional stones for 9x9, 13x13, 15x15, and 19x19.
  */
 export function createBiconvexStoneGeometry(): THREE.BufferGeometry {
   const profile: THREE.Vector2[] = [];
-  const halfH = 0.46; // total height = 0.92 when radius = 1.0
+  const halfH = 0.46;
   const steps = 24;
 
   for (let i = 0; i <= steps; i++) {
-    // theta from -PI/2 (bottom pole) to +PI/2 (top pole)
     const u = i / steps;
     const angle = (u - 0.5) * Math.PI;
-    // Biconvex lens profile: flattened spherical dome with soft rounded equatorial shoulder
     const r = Math.cos(angle);
     const y = Math.sin(angle) * halfH * (0.88 + 0.12 * Math.cos(angle * 0.6));
     profile.push(new THREE.Vector2(Math.max(0, r), y));
@@ -28,36 +32,45 @@ export function createBiconvexStoneGeometry(): THREE.BufferGeometry {
   return geo;
 }
 
-interface BowlStoneItem {
+function createContactAoTexture(): THREE.CanvasTexture {
+  const size = 128;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d')!;
+  const half = size / 2;
+  const grad = ctx.createRadialGradient(half, half, half * 0.22, half, half, half);
+  grad.addColorStop(0.0, 'rgba(14, 9, 4, 0.52)');
+  grad.addColorStop(0.55, 'rgba(18, 11, 5, 0.28)');
+  grad.addColorStop(0.85, 'rgba(20, 12, 6, 0.08)');
+  grad.addColorStop(1.0, 'rgba(20, 12, 6, 0.0)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, size, size);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.needsUpdate = true;
+  return tex;
+}
+
+interface BowlStoneVisual {
   mesh: THREE.Mesh;
-  basePos: THREE.Vector3;
-  baseRot: THREE.Euler;
-  offset: THREE.Vector3;
-  vel: THREE.Vector3;
-  rotOffset: THREE.Vector2;
-  rotVel: THREE.Vector2;
+  particle: BowlPhysicsParticle;
+  baseRotY: number;
 }
 
 interface ActiveBoardStone {
+  idx: number;
   mesh: THREE.Mesh;
+  aoMesh: THREE.Mesh;
+  aoMat: THREE.MeshBasicMaterial;
+  rippleMesh: THREE.Mesh;
+  rippleMat: THREE.MeshBasicMaterial;
+  body: StonePhysicsBody;
   color: PlayerColor;
   gridX: number;
   gridY: number;
-  restPos: THREE.Vector3;
-  baseYaw: number;
-  // Spring micro-jostle state (when adjacent stones are placed!)
-  jostleOffset: THREE.Vector2;
-  jostleVel: THREE.Vector2;
-  jostleTilt: THREE.Vector2;
-  // Placement flight animation state
-  placing?: {
-    elapsed: number;
-    duration: number;
-    startPos: THREE.Vector3;
-    soundPlayed: boolean;
-    force: number;
-    adjacentCount: number;
-  };
+  boardSurfaceY: number;
+  capturedCount: number;
+  adjacentCount: number;
 }
 
 interface FlyingPrisoner {
@@ -69,8 +82,7 @@ interface FlyingPrisoner {
   delay: number;
   elapsed: number;
   duration: number;
-  landed: boolean;
-  lidTarget: 'black' | 'white'; // 'black' = Black's lid (holds captured White stones)
+  lidTarget: 'black' | 'white';
 }
 
 export class StonePhysicsAnimator {
@@ -81,21 +93,27 @@ export class StonePhysicsAnimator {
   private whiteBowl: BowlAnchor;
 
   private stoneGeo: THREE.BufferGeometry;
+  private aoGeo: THREE.PlaneGeometry;
+  private aoTex: THREE.CanvasTexture;
+  private rippleGeo: THREE.RingGeometry;
   public readonly blackMat: THREE.MeshPhysicalMaterial;
   public readonly whiteMat: THREE.MeshPhysicalMaterial;
   private deadBlackMat: THREE.MeshPhysicalMaterial;
   private deadWhiteMat: THREE.MeshPhysicalMaterial;
 
-  private bowlStonesBlack: BowlStoneItem[] = [];
-  private bowlStonesWhite: BowlStoneItem[] = [];
+  private physicsWorld: StonePhysicsWorld;
+
+  private bowlStonesBlack: BowlStoneVisual[] = [];
+  private bowlStonesWhite: BowlStoneVisual[] = [];
 
   private boardStones = new Map<number, ActiveBoardStone>();
   private flyingPrisoners: FlyingPrisoner[] = [];
-  private settledPrisonersBlackLid: THREE.Mesh[] = []; // White stones captured by Black
-  private settledPrisonersWhiteLid: THREE.Mesh[] = []; // Black stones captured by White
+  private settledPrisonersBlackLid: THREE.Mesh[] = [];
+  private settledPrisonersWhiteLid: THREE.Mesh[] = [];
 
   private lidShakeBlack = 0;
   private lidShakeWhite = 0;
+  private bodiesScratch: StonePhysicsBody[] = [];
 
   constructor(params: {
     parent: THREE.Group;
@@ -111,10 +129,43 @@ export class StonePhysicsAnimator {
     this.whiteBowl = params.whiteBowl;
 
     this.stoneGeo = createBiconvexStoneGeometry();
+    this.aoTex = createContactAoTexture();
+    this.aoGeo = new THREE.PlaneGeometry(2.38, 2.38);
+    this.aoGeo.rotateX(-Math.PI / 2);
+
+    this.rippleGeo = new THREE.RingGeometry(0.92, 1.14, 32);
+    this.rippleGeo.rotateX(-Math.PI / 2);
+
+    this.physicsWorld = new StonePhysicsWorld({
+      onBoardImpact: (body, impactEnergy) => {
+        const entry = this.boardStones.get(Number(body.key));
+        if (!entry) return;
+        const half = Math.max(1, (this.metrics.size - 1) / 2);
+        const normX = (entry.gridX - half) / half;
+        const normY = (entry.gridY - half) / half;
+        const force =
+          entry.capturedCount > 0
+            ? 1.18
+            : entry.adjacentCount >= 2
+              ? 1.06
+              : 0.88 * impactEnergy;
+        this.audio.playStonePlace({
+          normX,
+          normY,
+          force,
+          isBlack: entry.color === BLACK,
+          adjacentStones: entry.adjacentCount,
+        });
+      },
+      onStoneClink: (relSpeed, color, worldX) => {
+        const pan = Math.max(-0.75, Math.min(0.75, worldX / 2.2));
+        this.audio.playStoneCollisionClink(relSpeed, color === BLACK, pan);
+      },
+    });
+
     const slateTex = createSlateStoneTexture();
     const shellTex = createClamshellStoneTexture();
 
-    // Nachi Black Slate (오석: 깊은 차콜 무광 사틴 광택)
     this.blackMat = new THREE.MeshPhysicalMaterial({
       map: slateTex,
       color: 0x1a1c20,
@@ -124,7 +175,6 @@ export class StonePhysicsAnimator {
       clearcoatRoughness: 0.26,
     });
 
-    // Hyuga Clamshell (해남석/일향백석: 은은한 조개결과 매끄러운 유백색 광택)
     this.whiteMat = new THREE.MeshPhysicalMaterial({
       map: shellTex,
       color: 0xfbf9f3,
@@ -145,6 +195,14 @@ export class StonePhysicsAnimator {
     this.populateBowlStones();
   }
 
+  public setMotionStyle(style: StoneMotionStyle): void {
+    this.physicsWorld.setMotionStyle(style);
+  }
+
+  public setPhysicsIntensity(intensity: PhysicsIntensity): void {
+    this.physicsWorld.setPhysicsIntensity(intensity);
+  }
+
   public setMetrics(metrics: BoardGridMetrics): void {
     this.metrics = metrics;
   }
@@ -156,49 +214,58 @@ export class StonePhysicsAnimator {
     return new THREE.Vector3(wx, wy, wz);
   }
 
-  /**
-   * Populates 36 visible biconvex stones inside both Go bowls so hovering/picking up stones
-   * produces tangible 3D stone jostling synchronized with the rattle audio!
-   */
   private populateBowlStones(): void {
     const bowlStoneRadius = 0.104;
 
-    const buildPile = (anchor: BowlAnchor, color: PlayerColor): BowlStoneItem[] => {
-      const items: BowlStoneItem[] = [];
+    const buildPile = (anchor: BowlAnchor, color: PlayerColor): BowlStoneVisual[] => {
+      const items: BowlStoneVisual[] = [];
       const mat = color === BLACK ? this.blackMat : this.whiteMat;
       const count = 36;
 
       for (let i = 0; i < count; i++) {
-        const layer = Math.floor(i / 12); // 0, 1, 2
+        const layer = Math.floor(i / 12);
         const idxInLayer = i % 12;
         const ringR = idxInLayer === 0 ? 0.0 : idxInLayer < 5 ? 0.15 : 0.285;
         const angle = idxInLayer * 1.65 + layer * 0.9;
 
-        const px = anchor.stonePileOrigin.x + Math.cos(angle) * ringR + (Math.random() - 0.5) * 0.03;
-        const pz = anchor.stonePileOrigin.z + Math.sin(angle) * ringR + (Math.random() - 0.5) * 0.03;
-        const py = anchor.stonePileOrigin.y - 0.12 + layer * 0.068 + (1 - ringR) * 0.03;
+        const rx = Math.cos(angle) * ringR + (Math.random() - 0.5) * 0.03;
+        const rz = Math.sin(angle) * ringR + (Math.random() - 0.5) * 0.03;
+        const ry = anchor.stonePileOrigin.y - 0.12 + layer * 0.068 + (1 - ringR) * 0.03;
 
         const mesh = new THREE.Mesh(this.stoneGeo, mat);
         mesh.scale.setScalar(bowlStoneRadius);
-        mesh.position.set(px, py, pz);
-        const baseRot = new THREE.Euler(
-          (Math.random() - 0.5) * 0.48,
-          Math.random() * Math.PI * 2,
-          (Math.random() - 0.5) * 0.48
+        mesh.position.set(
+          anchor.stonePileOrigin.x + rx,
+          ry,
+          anchor.stonePileOrigin.z + rz
         );
-        mesh.rotation.copy(baseRot);
+        const baseRotY = Math.random() * Math.PI * 2;
+        const rotX = (Math.random() - 0.5) * 0.48;
+        const rotZ = (Math.random() - 0.5) * 0.48;
+        mesh.rotation.set(rotX, baseRotY, rotZ);
         mesh.castShadow = true;
         mesh.receiveShadow = true;
         this.parent.add(mesh);
 
         items.push({
           mesh,
-          basePos: new THREE.Vector3(px, py, pz),
-          baseRot,
-          offset: new THREE.Vector3(),
-          vel: new THREE.Vector3(),
-          rotOffset: new THREE.Vector2(),
-          rotVel: new THREE.Vector2(),
+          baseRotY,
+          particle: {
+            x: rx,
+            y: ry,
+            z: rz,
+            restX: rx,
+            restY: ry,
+            restZ: rz,
+            vx: 0,
+            vy: 0,
+            vz: 0,
+            rotX,
+            rotY: baseRotY,
+            rotZ,
+            angVx: 0,
+            angVz: 0,
+          },
         });
       }
       return items;
@@ -208,23 +275,19 @@ export class StonePhysicsAnimator {
     this.bowlStonesWhite = buildPile(this.whiteBowl, WHITE);
   }
 
-  /**
-   * Impulses the 3D stones inside a Go bowl to jostle & rattle naturally.
-   */
   public stirBowl(which: 'black' | 'white', intensity = 0.8, playSound = true): void {
     const items = which === 'black' ? this.bowlStonesBlack : this.bowlStonesWhite;
     const clamped = Math.max(0.25, Math.min(1.25, intensity));
 
     for (let i = 0; i < items.length; i++) {
-      // Top-layer stones move more vividly than deeper stones
       const layerFactor = 0.4 + (i / items.length) * 0.85;
-      const amp = 0.09 * clamped * layerFactor;
-      const it = items[i];
-      it.vel.x += (Math.random() - 0.5) * amp * 12;
-      it.vel.y += Math.random() * amp * 8;
-      it.vel.z += (Math.random() - 0.5) * amp * 12;
-      it.rotVel.x += (Math.random() - 0.5) * clamped * 9;
-      it.rotVel.y += (Math.random() - 0.5) * clamped * 9;
+      const amp = 0.095 * clamped * layerFactor;
+      const p = items[i].particle;
+      p.vx += (Math.random() - 0.5) * amp * 13;
+      p.vy += Math.random() * amp * 9;
+      p.vz += (Math.random() - 0.5) * amp * 13;
+      p.angVx += (Math.random() - 0.5) * clamped * 10;
+      p.angVz += (Math.random() - 0.5) * clamped * 10;
     }
 
     if (playSound) {
@@ -234,7 +297,6 @@ export class StonePhysicsAnimator {
   }
 
   private humanJitter(x: number, y: number): THREE.Vector2 {
-    // Deterministic subtle organic offset (±3.5% of stone radius) so stones feel placed by a master's hand
     const h1 = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453;
     const h2 = Math.sin(x * 39.3468 + y * 11.135) * 24634.6345;
     const jx = ((h1 - Math.floor(h1)) - 0.5) * this.metrics.stoneRadius * 0.065;
@@ -242,10 +304,6 @@ export class StonePhysicsAnimator {
     return new THREE.Vector2(jx, jz);
   }
 
-  /**
-   * Animates a newly played stone lifting from the player's bowl and snapping onto `(x, y)`,
-   * nudging adjacent stones on impact and capturing any opponent stones into the bowl lid!
-   */
   public animateMovePlacement(params: {
     x: number;
     y: number;
@@ -256,54 +314,96 @@ export class StonePhysicsAnimator {
     const { x, y, color, captured, adjacentCount } = params;
     const idx = y * this.metrics.size + x;
 
-    // Remove if somehow already occupied
     this.removeBoardStoneImmediate(idx);
 
     const whichBowl = color === BLACK ? 'black' : 'white';
     const bowlAnchor = color === BLACK ? this.blackBowl : this.whiteBowl;
     const side = color === BLACK ? 'right' : 'left';
 
-    // Subtle stone pickup sound + gentle stir in the active bowl!
     this.stirBowl(whichBowl, 0.42, false);
     this.audio.playStonePickup(side, color === BLACK);
 
-    const restPos = this.gridToWorld(x, y);
+    const restWorld = this.gridToWorld(x, y);
     const jitter = this.humanJitter(x, y);
-    restPos.x += jitter.x;
-    restPos.z += jitter.y;
+    const radius = this.metrics.stoneRadius;
+    const halfHeight = radius * 0.44;
+
+    const body = this.physicsWorld.spawnPlacementBody({
+      key: String(idx),
+      color,
+      targetX: restWorld.x,
+      targetZ: restWorld.z,
+      bowlX: bowlAnchor.stonePileOrigin.x,
+      bowlY: bowlAnchor.stonePileOrigin.y + 0.25,
+      bowlZ: bowlAnchor.stonePileOrigin.z,
+      radius,
+      halfHeight,
+      jitterX: jitter.x,
+      jitterZ: jitter.y,
+      boardSurfaceY: restWorld.y,
+    });
 
     const mesh = new THREE.Mesh(this.stoneGeo, color === BLACK ? this.blackMat : this.whiteMat);
-    mesh.scale.setScalar(this.metrics.stoneRadius);
-    mesh.position.copy(bowlAnchor.stonePileOrigin).add(new THREE.Vector3(0, 0.25, 0));
-    const baseYaw = Math.random() * Math.PI * 2;
-    mesh.rotation.set(0.22, baseYaw, 0);
+    mesh.scale.setScalar(radius);
+    mesh.position.set(body.x, restWorld.y + body.y, body.z);
+    mesh.rotation.set(body.rotX, body.rotY, body.rotZ);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     this.parent.add(mesh);
 
-    const force = captured.length > 0 ? 1.15 : adjacentCount >= 2 ? 1.04 : 0.88 + Math.random() * 0.14;
+    const aoMat = new THREE.MeshBasicMaterial({
+      map: this.aoTex,
+      transparent: true,
+      opacity: 0.36 * body.aoAlpha,
+      depthWrite: false,
+    });
+    const aoMesh = new THREE.Mesh(this.aoGeo, aoMat);
+    aoMesh.scale.setScalar(radius);
+    aoMesh.position.set(body.x, 0.0025, body.z);
+    this.parent.add(aoMesh);
 
-    this.boardStones.set(idx, {
+    const rippleMat = new THREE.MeshBasicMaterial({
+      color: color === BLACK ? 0xffe4b8 : 0xfff5de,
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+    });
+    const rippleMesh = new THREE.Mesh(this.rippleGeo, rippleMat);
+    rippleMesh.scale.setScalar(radius);
+    rippleMesh.position.set(body.restX, 0.0035, body.restZ);
+    rippleMesh.visible = false;
+    this.parent.add(rippleMesh);
+
+    const entry: ActiveBoardStone = {
+      idx,
       mesh,
+      aoMesh,
+      aoMat,
+      rippleMesh,
+      rippleMat,
+      body,
       color,
       gridX: x,
       gridY: y,
-      restPos,
-      baseYaw,
-      jostleOffset: new THREE.Vector2(),
-      jostleVel: new THREE.Vector2(),
-      jostleTilt: new THREE.Vector2(),
-      placing: {
-        elapsed: 0,
-        duration: 0.22,
-        startPos: mesh.position.clone(),
-        soundPlayed: false,
-        force,
-        adjacentCount,
-      },
-    });
+      boardSurfaceY: restWorld.y,
+      capturedCount: captured.length,
+      adjacentCount,
+    };
 
-    // Schedule captured opponent stones to lift and arc into the capturing player's lid right as stone lands!
+    this.boardStones.set(idx, entry);
+
+    if (body.impactFired) {
+      // Instant mode fires placement audio immediately
+      const half = Math.max(1, (this.metrics.size - 1) / 2);
+      this.audio.playStonePlace({
+        normX: (x - half) / half,
+        normY: (y - half) / half,
+        force: captured.length > 0 ? 1.15 : 0.9,
+        isBlack: color === BLACK,
+        adjacentStones: adjacentCount,
+      });
+    }
+
     if (captured.length > 0) {
       this.launchCapturedStonesToLid(captured, color);
     }
@@ -327,6 +427,10 @@ export class StonePhysicsAnimator {
       if (existing) {
         mesh = existing.mesh;
         startPos = mesh.position.clone();
+        this.parent.remove(existing.aoMesh);
+        this.parent.remove(existing.rippleMesh);
+        existing.aoMat.dispose();
+        existing.rippleMat.dispose();
         this.boardStones.delete(cIdx);
       } else {
         mesh = new THREE.Mesh(this.stoneGeo, capturedColor === BLACK ? this.blackMat : this.whiteMat);
@@ -337,7 +441,6 @@ export class StonePhysicsAnimator {
         this.parent.add(mesh);
       }
 
-      // Compute natural spiral pile slot inside the upside-down bowl lid
       const slotIndex = existingCount + i;
       const layer = Math.floor(slotIndex / 9);
       const inLayer = slotIndex % 9;
@@ -363,49 +466,48 @@ export class StonePhysicsAnimator {
         startPos,
         endPos,
         endRot,
-        delay: 0.21 + i * 0.038, // Starts right after the capturing stone snaps onto the board!
+        delay: 0.12 + i * 0.055,
         elapsed: 0,
-        duration: 0.36,
-        landed: false,
+        duration: 0.34,
         lidTarget: targetLidKey,
       });
     });
 
-    // Schedule synchronized lid drop audio right when the first prisoner hits the lid (~0.21 + 0.36 = 0.57s)
-    const impactDelayMs = Math.round((0.21 + 0.33) * 1000);
-    window.setTimeout(() => {
-      const side = capturingColor === BLACK ? 'right' : 'left';
-      this.audio.playCaptureToLid(captured.length, existingCount, side, capturedColor === BLACK);
-      if (targetLidKey === 'black') this.lidShakeBlack = Math.min(1.0, 0.35 + captured.length * 0.12);
-      else this.lidShakeWhite = Math.min(1.0, 0.35 + captured.length * 0.12);
-    }, impactDelayMs);
+    const lidSide = capturingColor === BLACK ? 'right' : 'left';
+    this.audio.playCaptureToLid(
+      captured.length,
+      existingCount,
+      lidSide,
+      capturingColor !== BLACK
+    );
+
+    if (capturingColor === BLACK) {
+      this.lidShakeBlack = Math.min(1.4, this.lidShakeBlack + 0.65 + captured.length * 0.15);
+    } else {
+      this.lidShakeWhite = Math.min(1.4, this.lidShakeWhite + 0.65 + captured.length * 0.15);
+    }
   }
 
-  /**
-   * Synchronizes the entire 3D board & prisoner lids instantaneously with a given board snapshot
-   * (used for New Game, Handicap initialization, Undo, SGF load, and Review scrubbing).
-   */
   public syncBoardSnapshot(
     board: Uint8Array,
-    size: BoardSize,
+    size: number,
     captures: { black: number; white: number },
-    deadStoneMask?: Uint8Array
+    deadStoneMask?: Uint8Array | null
   ): void {
-    // Clear any in-flight prisoner animations
     for (const fp of this.flyingPrisoners) {
       this.parent.remove(fp.mesh);
     }
     this.flyingPrisoners = [];
 
-    // Remove stones that no longer exist or changed color
     for (const [idx, st] of Array.from(this.boardStones.entries())) {
       if (idx >= size * size || board[idx] !== st.color) {
-        this.parent.remove(st.mesh);
-        this.boardStones.delete(idx);
+        this.removeBoardStoneImmediate(idx);
       }
     }
 
-    // Add or update all stones on board
+    const radius = this.metrics.stoneRadius;
+    const halfHeight = radius * 0.44;
+
     for (let y = 0; y < size; y++) {
       for (let x = 0; x < size; x++) {
         const idx = y * size + x;
@@ -418,66 +520,152 @@ export class StonePhysicsAnimator {
         if (!entry) {
           const restPos = this.gridToWorld(x, y);
           const jitter = this.humanJitter(x, y);
-          restPos.x += jitter.x;
-          restPos.z += jitter.y;
+          const rx = restPos.x + jitter.x;
+          const rz = restPos.z + jitter.y;
+          const baseYaw = ((x * 73 + y * 137) % 360) * (Math.PI / 180);
 
           const mesh = new THREE.Mesh(this.stoneGeo, c === BLACK ? this.blackMat : this.whiteMat);
-          mesh.scale.setScalar(this.metrics.stoneRadius);
-          mesh.position.copy(restPos);
-          const baseYaw = ((x * 73 + y * 137) % 360) * (Math.PI / 180);
+          mesh.scale.setScalar(radius);
+          mesh.position.set(rx, restPos.y, rz);
           mesh.rotation.set(0, baseYaw, 0);
           mesh.castShadow = !isDead;
           mesh.receiveShadow = true;
           this.parent.add(mesh);
 
+          const aoMat = new THREE.MeshBasicMaterial({
+            map: this.aoTex,
+            transparent: true,
+            opacity: isDead ? 0.12 : 0.36,
+            depthWrite: false,
+          });
+          const aoMesh = new THREE.Mesh(this.aoGeo, aoMat);
+          aoMesh.scale.setScalar(radius);
+          aoMesh.position.set(rx, 0.0025, rz);
+          this.parent.add(aoMesh);
+
+          const rippleMat = new THREE.MeshBasicMaterial({
+            color: 0xffe4b8,
+            transparent: true,
+            opacity: 0,
+            depthWrite: false,
+          });
+          const rippleMesh = new THREE.Mesh(this.rippleGeo, rippleMat);
+          rippleMesh.visible = false;
+          this.parent.add(rippleMesh);
+
           entry = {
+            idx,
             mesh,
+            aoMesh,
+            aoMat,
+            rippleMesh,
+            rippleMat,
             color: c,
             gridX: x,
             gridY: y,
-            restPos,
-            baseYaw,
-            jostleOffset: new THREE.Vector2(),
-            jostleVel: new THREE.Vector2(),
-            jostleTilt: new THREE.Vector2(),
+            boardSurfaceY: restPos.y,
+            capturedCount: 0,
+            adjacentCount: 0,
+            body: {
+              key: String(idx),
+              color: c,
+              x: rx,
+              y: 0,
+              z: rz,
+              restX: rx,
+              restZ: rz,
+              vx: 0,
+              vy: 0,
+              vz: 0,
+              rotX: 0,
+              rotY: baseYaw,
+              rotZ: 0,
+              angVx: 0,
+              angVz: 0,
+              radius,
+              halfHeight,
+              motionStyle: 'instant',
+              phaseElapsed: 0,
+              flightDuration: 0,
+              flightActive: false,
+              startPosX: rx,
+              startPosY: 0,
+              startPosZ: rz,
+              ctrlPosX: rx,
+              ctrlPosY: 0,
+              ctrlPosZ: rz,
+              impactFired: true,
+              aoAlpha: 1,
+              rippleAge: -1,
+              hasMoved: false,
+            },
           };
           this.boardStones.set(idx, entry);
         } else {
-          // Ensure snapped to rest if syncing
-          entry.placing = undefined;
-          entry.mesh.scale.setScalar(this.metrics.stoneRadius);
-          entry.restPos = this.gridToWorld(x, y).add(
-            new THREE.Vector3(this.humanJitter(x, y).x, 0, this.humanJitter(x, y).y)
-          );
-          entry.mesh.position.copy(entry.restPos);
+          const restPos = this.gridToWorld(x, y);
+          const jitter = this.humanJitter(x, y);
+          const rx = restPos.x + jitter.x;
+          const rz = restPos.z + jitter.y;
+          entry.boardSurfaceY = restPos.y;
+          entry.body.restX = rx;
+          entry.body.restZ = rz;
+          entry.body.x = rx;
+          entry.body.y = 0;
+          entry.body.z = rz;
+          entry.body.vx = 0;
+          entry.body.vy = 0;
+          entry.body.vz = 0;
+          entry.body.rotX = 0;
+          entry.body.rotZ = 0;
+          entry.body.flightActive = false;
+          entry.body.impactFired = true;
+          entry.body.aoAlpha = 1;
+          entry.body.rippleAge = -1;
+          entry.body.hasMoved = false;
+          entry.mesh.scale.setScalar(radius);
+          entry.mesh.position.set(rx, restPos.y, rz);
+          entry.mesh.rotation.set(0, entry.body.rotY, 0);
+          entry.aoMesh.scale.setScalar(radius);
+          entry.aoMesh.position.set(rx, 0.0025, rz);
+          entry.rippleMesh.visible = false;
         }
 
-        // Apply dead stone ghost material if in scoring phase
         if (isDead) {
           entry.mesh.material = c === BLACK ? this.deadBlackMat : this.deadWhiteMat;
           entry.mesh.castShadow = false;
+          entry.aoMat.opacity = 0.12;
         } else {
           entry.mesh.material = c === BLACK ? this.blackMat : this.whiteMat;
           entry.mesh.castShadow = true;
+          entry.aoMat.opacity = 0.36;
         }
       }
     }
 
-    // Sync visible prisoner counts in lids (cap visual meshes at 40 per lid)
     this.syncPrisonerPile(this.settledPrisonersBlackLid, Math.min(40, captures.black), WHITE, this.blackBowl);
     this.syncPrisonerPile(this.settledPrisonersWhiteLid, Math.min(40, captures.white), BLACK, this.whiteBowl);
   }
 
   public snapAllToRest(): void {
     for (const st of this.boardStones.values()) {
-      if (st.placing) {
-        st.placing = undefined;
-      }
-      st.jostleOffset.set(0, 0);
-      st.jostleVel.set(0, 0);
-      st.jostleTilt.set(0, 0);
-      st.mesh.position.copy(st.restPos);
-      st.mesh.rotation.set(0, st.baseYaw, 0);
+      const b = st.body;
+      b.flightActive = false;
+      b.x = b.restX;
+      b.y = 0;
+      b.z = b.restZ;
+      b.vx = 0;
+      b.vy = 0;
+      b.vz = 0;
+      b.rotX = 0;
+      b.rotZ = 0;
+      b.aoAlpha = 1;
+      b.rippleAge = -1;
+      b.hasMoved = false;
+      st.mesh.position.set(b.restX, st.boardSurfaceY, b.restZ);
+      st.mesh.rotation.set(0, b.rotY, 0);
+      st.aoMesh.position.set(b.restX, 0.0025, b.restZ);
+      st.aoMat.opacity = 0.36;
+      st.rippleMesh.visible = false;
     }
   }
 
@@ -487,9 +675,11 @@ export class StonePhysicsAnimator {
       if (isDead) {
         st.mesh.material = st.color === BLACK ? this.deadBlackMat : this.deadWhiteMat;
         st.mesh.castShadow = false;
+        st.aoMat.opacity = 0.12;
       } else {
         st.mesh.material = st.color === BLACK ? this.blackMat : this.whiteMat;
         st.mesh.castShadow = true;
+        st.aoMat.opacity = 0.36 * st.body.aoAlpha;
       }
     }
   }
@@ -530,130 +720,64 @@ export class StonePhysicsAnimator {
     const existing = this.boardStones.get(idx);
     if (existing) {
       this.parent.remove(existing.mesh);
+      this.parent.remove(existing.aoMesh);
+      this.parent.remove(existing.rippleMesh);
+      existing.aoMat.dispose();
+      existing.rippleMat.dispose();
       this.boardStones.delete(idx);
-    }
-  }
-
-  private triggerAdjacentMicroJostle(cx: number, cy: number, force: number): void {
-    const dirs = [
-      [-1, 0],
-      [1, 0],
-      [0, -1],
-      [0, 1],
-    ];
-    for (const [dx, dy] of dirs) {
-      const nx = cx + dx;
-      const ny = cy + dy;
-      if (nx < 0 || nx >= this.metrics.size || ny < 0 || ny >= this.metrics.size) continue;
-      const nStone = this.boardStones.get(ny * this.metrics.size + nx);
-      if (nStone && !nStone.placing) {
-        const impulse = 0.22 * force * this.metrics.stoneRadius;
-        nStone.jostleVel.x += dx * impulse * 18 + (Math.random() - 0.5) * impulse * 5;
-        nStone.jostleVel.y += dy * impulse * 18 + (Math.random() - 0.5) * impulse * 5;
-        nStone.jostleTilt.set(-dy * 0.11 * force, dx * 0.11 * force);
-      }
     }
   }
 
   public update(dt: number): void {
     const clampedDt = Math.min(0.05, dt);
 
-    // 1. Update bowl stone spring-damper micro-collisions
-    const stepBowlList = (items: BowlStoneItem[]) => {
-      const stiffness = 135;
-      const damping = 12.5;
-      for (const it of items) {
-        it.vel.x += (-stiffness * it.offset.x - damping * it.vel.x) * clampedDt;
-        it.vel.y += (-stiffness * it.offset.y - damping * it.vel.y) * clampedDt;
-        it.vel.z += (-stiffness * it.offset.z - damping * it.vel.z) * clampedDt;
-        it.offset.addScaledVector(it.vel, clampedDt);
-        // Prevent sinking below base floor
-        if (it.offset.y < -0.015) {
-          it.offset.y = -0.015;
-          it.vel.y *= -0.35;
-        }
-
-        it.rotVel.x += (-120 * it.rotOffset.x - 11 * it.rotVel.x) * clampedDt;
-        it.rotVel.y += (-120 * it.rotOffset.y - 11 * it.rotVel.y) * clampedDt;
-        it.rotOffset.x += it.rotVel.x * clampedDt;
-        it.rotOffset.y += it.rotVel.y * clampedDt;
-
-        it.mesh.position.copy(it.basePos).add(it.offset);
-        it.mesh.rotation.set(
-          it.baseRot.x + it.rotOffset.x,
-          it.baseRot.y,
-          it.baseRot.z + it.rotOffset.y
+    // 1. N-body bowl stone dynamics inside jujube bowls
+    const stepBowl = (items: BowlStoneVisual[], anchor: BowlAnchor) => {
+      const particles = items.map((v) => v.particle);
+      this.physicsWorld.stepContainerStones(particles, clampedDt, 0.36, 0.104, 0.045);
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        it.mesh.position.set(
+          anchor.stonePileOrigin.x + it.particle.x,
+          it.particle.y,
+          anchor.stonePileOrigin.z + it.particle.z
         );
+        it.mesh.rotation.set(it.particle.rotX, it.baseRotY, it.particle.rotZ);
       }
     };
-    stepBowlList(this.bowlStonesBlack);
-    stepBowlList(this.bowlStonesWhite);
+    stepBowl(this.bowlStonesBlack, this.blackBowl);
+    stepBowl(this.bowlStonesWhite, this.whiteBowl);
 
-    // 2. Update board stone placement trajectories & neighbor micro-jostle springs
+    // 2. Sub-stepped 2.5D rigid-body board stones (motion arc, impact bounce, neighbor clinks)
+    this.bodiesScratch.length = 0;
     for (const st of this.boardStones.values()) {
-      if (st.placing) {
-        st.placing.elapsed += clampedDt;
-        const t = Math.min(1, st.placing.elapsed / st.placing.duration);
+      this.bodiesScratch.push(st.body);
+    }
+    this.physicsWorld.stepBoardStones(this.bodiesScratch, clampedDt);
 
-        // Smooth ease-out cubic horizontal glide + parabolic arc + final crisp rim-to-belly snap!
-        const ease = 1 - Math.pow(1 - t, 3);
-        st.mesh.position.lerpVectors(st.placing.startPos, st.restPos, ease);
+    for (const st of this.boardStones.values()) {
+      const b = st.body;
+      st.mesh.position.set(b.x, st.boardSurfaceY + b.y, b.z);
+      st.mesh.rotation.set(b.rotX, b.rotY, b.rotZ);
 
-        // Arc height peaks around t = 0.42
-        const arcLift = Math.sin(Math.PI * Math.pow(t, 0.82)) * 0.48;
-        st.mesh.position.y += arcLift;
+      st.aoMesh.position.set(b.x, 0.0025, b.z);
+      const heightFade = Math.max(0.25, 1 - b.y * 1.4);
+      if (st.mesh.castShadow) {
+        st.aoMat.opacity = 0.36 * b.aoAlpha * heightFade;
+      }
 
-        // Biconvex rock-down angle: tilted slightly forward until t = 0.84, then snaps flat onto wood!
-        let rockPitch = 0;
-        if (t < 0.84) {
-          rockPitch = 0.24 * (1 - t * 0.5);
-        } else {
-          const snapPhase = (t - 0.84) / 0.16;
-          rockPitch = 0.14 * (1 - snapPhase);
-        }
-        st.mesh.rotation.set(rockPitch, st.baseYaw, 0);
-
-        if (!st.placing.soundPlayed && t >= 0.92) {
-          st.placing.soundPlayed = true;
-          const half = Math.max(1, (this.metrics.size - 1) / 2);
-          const normX = (st.gridX - half) / half;
-          const normY = (st.gridY - half) / half;
-
-          this.audio.playStonePlace({
-            normX,
-            normY,
-            force: st.placing.force,
-            isBlack: st.color === BLACK,
-            adjacentStones: st.placing.adjacentCount,
-          });
-          this.triggerAdjacentMicroJostle(st.gridX, st.gridY, st.placing.force);
-        }
-
-        if (t >= 1) {
-          st.mesh.position.copy(st.restPos);
-          st.mesh.rotation.set(0, st.baseYaw, 0);
-          st.placing = undefined;
-        }
+      if (b.rippleAge >= 0) {
+        const u = Math.min(1, b.rippleAge / 0.42);
+        st.rippleMesh.visible = true;
+        st.rippleMesh.position.set(b.restX, 0.0035, b.restZ);
+        st.rippleMesh.scale.setScalar(b.radius * (1.05 + u * 1.15));
+        st.rippleMat.opacity = (1 - u) * 0.48;
       } else {
-        // Settle neighbor micro-jostle spring
-        const k = 220;
-        const d = 16;
-        st.jostleVel.x += (-k * st.jostleOffset.x - d * st.jostleVel.x) * clampedDt;
-        st.jostleVel.y += (-k * st.jostleOffset.y - d * st.jostleVel.y) * clampedDt;
-        st.jostleOffset.x += st.jostleVel.x * clampedDt;
-        st.jostleOffset.y += st.jostleVel.y * clampedDt;
-        st.jostleTilt.multiplyScalar(Math.exp(-18 * clampedDt));
-
-        st.mesh.position.set(
-          st.restPos.x + st.jostleOffset.x,
-          st.restPos.y,
-          st.restPos.z + st.jostleOffset.y
-        );
-        st.mesh.rotation.set(st.jostleTilt.x, st.baseYaw, st.jostleTilt.y);
+        st.rippleMesh.visible = false;
       }
     }
 
-    // 3. Update flying captured prisoners arcing into the wooden lid
+    // 3. Flying captured prisoners into lid
     for (let i = this.flyingPrisoners.length - 1; i >= 0; i--) {
       const fp = this.flyingPrisoners[i];
       fp.elapsed += clampedDt;
@@ -680,7 +804,7 @@ export class StonePhysicsAnimator {
       }
     }
 
-    // 4. Subtle wooden lid vibration when captured stones drop inside
+    // 4. Wooden lid vibration
     if (this.lidShakeBlack > 0.001) {
       this.lidShakeBlack *= Math.exp(-14 * clampedDt);
       this.blackBowl.lidMesh.rotation.z = Math.sin(performance.now() * 0.065) * 0.035 * this.lidShakeBlack;

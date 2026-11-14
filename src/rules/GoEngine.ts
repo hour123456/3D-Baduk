@@ -30,12 +30,22 @@ export function getStarPoints(size: BoardSize): Coord[] {
     for (const y of pts) for (const x of pts) res.push({ x, y });
     return res;
   }
+  if (size === 15) {
+    return [
+      { x: 3, y: 3 },
+      { x: 11, y: 3 },
+      { x: 7, y: 7 },
+      { x: 3, y: 11 },
+      { x: 11, y: 11 },
+    ];
+  }
   if (size === 13) {
     const pts = [3, 6, 9];
     const res: Coord[] = [];
     for (const y of pts) for (const x of pts) res.push({ x, y });
     return res;
   }
+  // 9x9
   return [
     { x: 2, y: 2 },
     { x: 6, y: 2 },
@@ -95,8 +105,8 @@ export function getHandicapCoordinates(size: BoardSize, handicap: number): Coord
 }
 
 export interface ChainInfo {
-  stones: number[];
-  liberties: Set<number>;
+  stones: number[]; // flat indices
+  liberties: Set<number>; // flat indices of empty neighbors
 }
 
 export function inspectChain(board: Uint8Array, size: BoardSize, startIdx: number): ChainInfo {
@@ -117,6 +127,7 @@ export function inspectChain(board: Uint8Array, size: BoardSize, startIdx: numbe
     const x = idx % size;
     const y = (idx - x) / size;
 
+    // 4 orthogonal neighbors
     if (x > 0) {
       const n = idx - 1;
       const c = board[n];
@@ -165,7 +176,7 @@ export class GoEngine {
   public currentTurn: PlayerColor;
   public phase: GamePhase;
   public koPoint: Coord | null = null;
-  public captures = { black: 0, white: 0 };
+  public captures = { black: 0, white: 0 }; // stones captured BY black / BY white
   public consecutivePasses = 0;
   public history: MoveRecord[] = [];
   public initialBoard: Uint8Array;
@@ -202,6 +213,7 @@ export class GoEngine {
     this.result = null;
     this.phase = 'playing';
 
+    // Place handicap stones if >= 2
     this.handicapStones = [];
     if (this.config.handicap >= 2) {
       const coords = getHandicapCoordinates(this.size, this.config.handicap);
@@ -209,7 +221,7 @@ export class GoEngine {
         this.board[pt.y * this.size + pt.x] = BLACK;
         this.handicapStones.push(pt);
       }
-      this.currentTurn = WHITE;
+      this.currentTurn = WHITE; // White plays first in handicap Baduk
     } else {
       this.currentTurn = BLACK;
     }
@@ -247,6 +259,7 @@ export class GoEngine {
       return { valid: false, reason: 'OCCUPIED' };
     }
 
+    // Immediate Simple Ko check
     if (this.koPoint && this.koPoint.x === x && this.koPoint.y === y) {
       return { valid: false, reason: 'KO' };
     }
@@ -256,6 +269,7 @@ export class GoEngine {
     nextBoard[idx] = color;
     let nextHash = this.currentHash ^ stoneZobristKey(idx, color);
 
+    // Count adjacent stones for acoustic feedback & collect zero-liberty opponent chains
     const neighbors: number[] = [];
     if (x > 0) neighbors.push(idx - 1);
     if (x < this.size - 1) neighbors.push(idx + 1);
@@ -285,11 +299,13 @@ export class GoEngine {
       }
     }
 
+    // Step 2: Check suicide AFTER removing captured opponent stones
     const ownChain = inspectChain(nextBoard, this.size, idx);
     if (ownChain.liberties.size === 0) {
       return { valid: false, reason: 'SUICIDE' };
     }
 
+    // Step 3: Check Simple Ko via previous position hash (1-move recapture)
     const prevHash =
       this.history.length >= 1
         ? this.history.length >= 2
@@ -301,11 +317,15 @@ export class GoEngine {
       return { valid: false, reason: 'KO' };
     }
 
+    // Step 4: Check Positional Superko (mandatory in Chinese rules, optional/enabled in Korean rules to prevent infinite cycles)
     const enforceSuperko = this.config.ruleset === 'chinese' || this.config.superko;
     if (enforceSuperko && this.positionHashes.has(nextHash)) {
       return { valid: false, reason: 'SUPERKO' };
     }
 
+    // Determine next Simple Ko point:
+    // Occurs strictly when a single stone was placed (ownChain.stones.length === 1),
+    // ownChain now has exactly 1 liberty, and exactly 1 opponent stone was captured.
     let nextKoPoint: Coord | null = null;
     if (capturedIndices.size === 1 && ownChain.stones.length === 1 && ownChain.liberties.size === 1) {
       const [capIdx] = Array.from(capturedIndices);
@@ -377,7 +397,7 @@ export class GoEngine {
 
     const color = this.currentTurn;
     const boardBefore = new Uint8Array(this.board);
-    this.koPoint = null;
+    this.koPoint = null; // Passing clears immediate Ko threat restriction
     this.consecutivePasses += 1;
 
     const record: MoveRecord = {
@@ -509,6 +529,12 @@ export class GoEngine {
         return '활로가 없는 자살수 자리에는 착수할 수 없습니다.';
       case 'OCCUPIED':
         return '이미 돌이 놓여 있는 자리입니다.';
+      case 'DOUBLE_THREE':
+        return '렌주룰 흑 금수(삼삼 · 3·3) 자리에는 착수할 수 없습니다.';
+      case 'DOUBLE_FOUR':
+        return '렌주룰 흑 금수(사사 · 4·4) 자리에는 착수할 수 없습니다.';
+      case 'OVERLINE':
+        return '렌주룰 흑 금수(장목 · 6목 이상) 자리에는 착수할 수 없습니다.';
       default:
         return '착수할 수 없는 자리입니다.';
     }
