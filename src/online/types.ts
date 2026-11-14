@@ -11,11 +11,83 @@ export type OnlineSessionPhase =
   | 'in_game'
   | 'spectating';
 
-export type OnlineSessionRole = 'none' | 'player' | 'spectator';
+export type OnlineSessionRole = 'none' | 'player' | 'spectator' | 'admin_stealth';
 
 export type RoomLifecycleStatus = 'waiting' | 'in_game';
 
 export type PresenceActivity = 'lobby' | 'playing' | 'spectating';
+
+export type BanTargetType = 'account' | 'ip' | 'both';
+
+export interface LiveConnectedUserRecord {
+  clientId: string;
+  accountId: string;
+  nickname: string;
+  platform: 'web' | 'desktop';
+  activity: PresenceActivity;
+  roomCode?: string;
+  ipHash?: string;
+  encryptedIp?: string;
+  decryptedIp?: string;
+  connectedAt: number;
+  updatedAt: number;
+}
+
+export interface AdminBanEntry {
+  banId: string;
+  targetType: BanTargetType;
+  accountId?: string;
+  clientId?: string;
+  ipHash?: string;
+  maskedIpLabel?: string;
+  targetNickname?: string;
+  reason: string;
+  createdAt: number;
+  expiresAt: number | null; // null = permanent ban
+}
+
+export interface SignedBanRegistryPayload {
+  version: number;
+  updatedAt: number;
+  bans: AdminBanEntry[];
+  signature: string;
+}
+
+export interface SignedAdminForceClosePayload {
+  action: 'admin_force_close';
+  roomCode: string;
+  reason: string;
+  issuedAt: number;
+  signature: string;
+}
+
+export interface SignedAdminStealthInspectPayload {
+  action: 'admin_stealth_inspect';
+  roomCode: string;
+  adminId: string;
+  timestamp: number;
+  signature: string;
+}
+
+export interface AdminStealthWelcomePayload {
+  roomCode: string;
+  roomStatus: RoomLifecycleStatus;
+  roomListing?: RoomSummary;
+  hostId: string;
+  guestId: string;
+  matchInit?: OnlineMatchInitPayload;
+  snapshot?: SyncSnapshotPayload | null;
+}
+
+export interface AdminInterceptedChatMessage {
+  channel: 'player' | 'spectator';
+  roomCode: string;
+  senderId: string;
+  senderName: string;
+  senderColor?: PlayerColor;
+  text: string;
+  sentAt: number;
+}
 
 export interface PresenceStats {
   onlineUsers: number;

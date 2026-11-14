@@ -1,6 +1,12 @@
 import * as THREE from 'three';
 import { BoardSize } from '../rules/types';
 import { getStarPoints } from '../rules/GoEngine';
+import type { BoardGrainIntensity, GridLineContrast } from '../settings/SettingsManager';
+
+export interface GobanVisualOptions {
+  grainIntensity?: BoardGrainIntensity;
+  lineContrast?: GridLineContrast;
+}
 
 const GO_COL_LABELS = 'ABCDEFGHJKLMNOPQRST';
 
@@ -106,8 +112,14 @@ export function getBoardMetrics(size: BoardSize): BoardGridMetrics {
  */
 export function createGobanTopTextures(
   metrics: BoardGridMetrics,
-  showCoordinates = true
+  showCoordinates = true,
+  visualOpts: GobanVisualOptions = {}
 ): GobanSurfaceTextures {
+  const grainIntensity: BoardGrainIntensity = visualOpts.grainIntensity ?? 'classic';
+  const lineContrast: GridLineContrast = visualOpts.lineContrast ?? 'normal';
+  const grainScale =
+    grainIntensity === 'plain' ? 0.05 : grainIntensity === 'soft' ? 0.30 : 0.82;
+
   const res = 2048;
 
   const colorCanvas = document.createElement('canvas');
@@ -133,7 +145,7 @@ export function createGobanTopTextures(
   const bData = bumpImg.data;
   const rData = roughImg.data;
 
-  // Golden Honey Kaya Wood (비자나무 특유의 따뜻하고 기품 있는 황금 호박빛 결)
+  // Golden Honey Kaya Wood (차분하고 눈부심이 적은 황금 비자나무 반상 결)
   for (let py = 0; py < res; py++) {
     const ny = py / res;
     for (let px = 0; px < res; px++) {
@@ -150,24 +162,55 @@ export function createGobanTopTextures(
       const fineFiber = smoothNoise2D(nx * 240, ny * 28, 777);
       const microTone = fbm2D(nx * 12, ny * 12, 303, 3);
 
-      // Rich Kaya palette: base #d9a055 -> ring #b77932 -> highlight #e5b46c
-      const r = Math.min(255, Math.max(0, 224 - sharpRing * 36 + (fineFiber - 0.5) * 12 + (microTone - 0.5) * 14));
-      const g = Math.min(255, Math.max(0, 166 - sharpRing * 34 + (fineFiber - 0.5) * 10 + (microTone - 0.5) * 11));
-      const b = Math.min(255, Math.max(0, 88 - sharpRing * 25 + (fineFiber - 0.5) * 8 + (microTone - 0.5) * 8));
+      // Calibrated Kaya palette scaled by grainScale so wood rings never drown grid lines on mobile
+      const r = Math.min(
+        255,
+        Math.max(
+          0,
+          210 -
+            sharpRing * (32 * grainScale) +
+            (fineFiber - 0.5) * (11 * grainScale) +
+            (microTone - 0.5) * (13 * grainScale)
+        )
+      );
+      const g = Math.min(
+        255,
+        Math.max(
+          0,
+          156 -
+            sharpRing * (30 * grainScale) +
+            (fineFiber - 0.5) * (9 * grainScale) +
+            (microTone - 0.5) * (10 * grainScale)
+        )
+      );
+      const b = Math.min(
+        255,
+        Math.max(
+          0,
+          82 -
+            sharpRing * (22 * grainScale) +
+            (fineFiber - 0.5) * (7 * grainScale) +
+            (microTone - 0.5) * (7 * grainScale)
+        )
+      );
 
       cData[idx] = r;
       cData[idx + 1] = g;
       cData[idx + 2] = b;
       cData[idx + 3] = 255;
 
-      const bumpVal = Math.floor(124 + (fineFiber - 0.5) * 18 - sharpRing * 10);
+      const bumpVal = Math.floor(
+        124 + ((fineFiber - 0.5) * 16 - sharpRing * 9) * grainScale
+      );
       bData[idx] = bumpVal;
       bData[idx + 1] = bumpVal;
       bData[idx + 2] = bumpVal;
       bData[idx + 3] = 255;
 
-      // Satin hand-waxed Kaya wood roughness (~0.34..0.46)
-      const roughVal = Math.floor(92 + sharpRing * 22 + (1 - fineFiber) * 14);
+      // Satin matte Kaya wood roughness (~0.40..0.52) to prevent harsh overhead hotspot glare
+      const roughVal = Math.floor(
+        108 + sharpRing * (18 * grainScale) + (1 - fineFiber) * (12 * grainScale)
+      );
       rData[idx] = roughVal;
       rData[idx + 1] = roughVal;
       rData[idx + 2] = roughVal;
@@ -182,7 +225,7 @@ export function createGobanTopTextures(
   // Subtle warm edge vignette on wood top
   const vig = cCtx.createRadialGradient(res / 2, res / 2, res * 0.34, res / 2, res / 2, res * 0.74);
   vig.addColorStop(0, 'rgba(0,0,0,0)');
-  vig.addColorStop(1, 'rgba(52,26,6,0.13)');
+  vig.addColorStop(1, 'rgba(52,26,6,0.11)');
   cCtx.fillStyle = vig;
   cCtx.fillRect(0, 0, res, res);
 
@@ -219,14 +262,28 @@ export function createGobanTopTextures(
     ctx.restore();
   };
 
-  // Lacquer ink lines (검은 옻칠 눈금: 살짝 도톰하게 올라오고 매끄러운 광택을 띔)
-  drawGridLines(cCtx, '#16120f', 3.4, 5.0);
-  drawGridLines(bCtx, '#dcdcdc', 4.0, 5.6); // Raised lacquer ridge in bump map!
-  drawGridLines(rCtx, '#343434', 4.0, 5.6); // Glossy lacquer ink in roughness map!
+  const innerLineWidth =
+    lineContrast === 'high' ? 6.4 : lineContrast === 'bold' ? 5.0 : 3.6;
+  const outerBorderWidth =
+    lineContrast === 'high' ? 10.0 : lineContrast === 'bold' ? 8.2 : 6.2;
+  const lineHex =
+    lineContrast === 'high' ? '#050403' : lineContrast === 'bold' ? '#0b0806' : '#15110d';
+
+  if (lineContrast === 'high') {
+    // Subtle warm separation halo under black lines for effortless row/col tracking on mobile screens
+    drawGridLines(cCtx, 'rgba(246, 224, 178, 0.44)', innerLineWidth + 2.8, outerBorderWidth + 2.8);
+  }
+
+  // Lacquer ink lines (검은 옻칠 눈금)
+  drawGridLines(cCtx, lineHex, innerLineWidth, outerBorderWidth);
+  drawGridLines(bCtx, '#dcdcdc', innerLineWidth + 0.6, outerBorderWidth + 0.6);
+  drawGridLines(rCtx, '#484848', innerLineWidth + 0.6, outerBorderWidth + 0.6);
 
   // Star points (화점 Hoshi)
   const stars = getStarPoints(metrics.size);
-  const starRadius = metrics.size === 19 ? 8.2 : 9.6;
+  const baseStarR = metrics.size === 19 ? 8.4 : 9.8;
+  const starRadius =
+    lineContrast === 'high' ? baseStarR * 1.24 : lineContrast === 'bold' ? baseStarR * 1.12 : baseStarR;
 
   for (const st of stars) {
     const sx = marginX + st.x * stepPxX;
@@ -234,7 +291,7 @@ export function createGobanTopTextures(
 
     cCtx.beginPath();
     cCtx.arc(sx, sy, starRadius, 0, Math.PI * 2);
-    cCtx.fillStyle = '#14100d';
+    cCtx.fillStyle = lineHex;
     cCtx.fill();
 
     bCtx.beginPath();
@@ -244,15 +301,17 @@ export function createGobanTopTextures(
 
     rCtx.beginPath();
     rCtx.arc(sx, sy, starRadius + 0.8, 0, Math.PI * 2);
-    rCtx.fillStyle = '#2b2b2b';
+    rCtx.fillStyle = '#383838';
     rCtx.fill();
   }
 
   // Optional subtle laser-engraved / calligraphed coordinate indices along margins
   if (showCoordinates) {
     cCtx.save();
-    cCtx.fillStyle = 'rgba(42, 24, 10, 0.58)';
-    cCtx.font = '600 24px "Pretendard", "Malgun Gothic", sans-serif';
+    cCtx.fillStyle =
+      lineContrast === 'high' ? 'rgba(16, 10, 4, 0.84)' : 'rgba(38, 22, 10, 0.64)';
+    const coordPx = lineContrast === 'high' ? 27 : 24;
+    cCtx.font = `700 ${coordPx}px "Pretendard", "Malgun Gothic", sans-serif`;
     cCtx.textAlign = 'center';
     cCtx.textBaseline = 'middle';
 

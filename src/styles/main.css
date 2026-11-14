@@ -1765,4 +1765,605 @@ body[data-visual-quality='ultra'] .player-card.active-turn {
   }
 }
 
+/* ============================================================================
+ * v4.0 UI Polish, Brightness Slider, Byoyomi 10s Alert, Tutorial & Mobile UI
+ * ============================================================================ */
+
+.btn-tutorial-nav {
+  background: linear-gradient(135deg, rgba(64, 128, 102, 0.34), rgba(38, 86, 68, 0.42));
+  border: 1px solid rgba(124, 214, 174, 0.42);
+  color: #daf8ea;
+}
+
+.btn-tutorial-nav:hover {
+  background: linear-gradient(135deg, rgba(76, 150, 120, 0.48), rgba(46, 106, 84, 0.56));
+}
+
+.modal-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.modal-subline {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+.slider-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.slider-val-badge {
+  font-size: 12px;
+  color: var(--gold-bright);
+  font-variant-numeric: tabular-nums;
+}
+
+.opt-range-slider {
+  width: 100%;
+  accent-color: var(--gold);
+  cursor: pointer;
+}
+
+/* Byoyomi <= 10s Non-Blocking Screen-Edge Pulse & Center-Bottom Countdown Banner */
+.byoyomi-edge-pulse {
+  position: fixed;
+  inset: 0;
+  z-index: 18;
+  pointer-events: none;
+  box-shadow: inset 0 0 85px rgba(242, 168, 52, 0.28);
+  border: 2px solid rgba(242, 168, 52, 0.28);
+  animation: byoyomiEdgeAmber 1s ease-in-out infinite;
+}
+
+.byoyomi-edge-pulse.critical {
+  box-shadow: inset 0 0 110px rgba(235, 68, 54, 0.46);
+  border-color: rgba(255, 90, 74, 0.45);
+  animation: byoyomiEdgeRed 0.58s ease-in-out infinite;
+}
+
+@keyframes byoyomiEdgeAmber {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 0.95; }
+}
+
+@keyframes byoyomiEdgeRed {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+
+.byoyomi-countdown-banner {
+  position: fixed;
+  left: 50%;
+  bottom: 92px;
+  transform: translateX(-50%);
+  z-index: 22;
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 18px;
+  border-radius: 16px;
+  background: rgba(28, 20, 12, 0.88);
+  border: 1.5px solid rgba(245, 178, 66, 0.65);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.55), 0 0 24px rgba(245, 178, 66, 0.25);
+  backdrop-filter: blur(12px);
+}
+
+.byoyomi-countdown-banner.critical {
+  background: rgba(50, 14, 14, 0.92);
+  border-color: rgba(255, 96, 84, 0.82);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.65), 0 0 32px rgba(245, 66, 54, 0.42);
+}
+
+.byoyomi-countdown-banner.pop-tick .byoyomi-count-num {
+  animation: countdownTickPop 0.34s cubic-bezier(0.22, 1.3, 0.36, 1);
+}
+
+@keyframes countdownTickPop {
+  0% { transform: scale(1.42); }
+  100% { transform: scale(1); }
+}
+
+.byoyomi-count-num {
+  min-width: 46px;
+  height: 46px;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  font-size: 26px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+  background: rgba(245, 178, 66, 0.22);
+  color: #ffd57e;
+  border: 1px solid rgba(245, 178, 66, 0.5);
+}
+
+.byoyomi-countdown-banner.critical .byoyomi-count-num {
+  background: rgba(245, 72, 60, 0.28);
+  color: #ff9c92;
+  border-color: rgba(255, 108, 96, 0.65);
+}
+
+.byoyomi-count-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.byoyomi-count-title {
+  font-size: 14px;
+  font-weight: 800;
+  color: #fff3de;
+}
+
+.byoyomi-count-sub {
+  font-size: 11px;
+  color: rgba(255, 224, 180, 0.86);
+}
+
+/* Beginner Tutorial Coach Panel & Curriculum Modal */
+.tutorial-coach-panel {
+  position: fixed;
+  left: 18px;
+  bottom: 92px;
+  width: min(360px, calc(100vw - 24px));
+  z-index: 25;
+  background: rgba(18, 22, 20, 0.92);
+  border: 1px solid rgba(118, 212, 168, 0.48);
+  border-radius: 16px;
+  padding: 14px 16px;
+  box-shadow: 0 18px 46px rgba(0, 0, 0, 0.62);
+  backdrop-filter: blur(14px);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tut-coach-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.tut-coach-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: #8ee4bd;
+  margin-bottom: 2px;
+}
+
+.tut-coach-title {
+  font-size: 15px;
+  font-weight: 800;
+  color: #f4f7f2;
+}
+
+.tut-coach-step {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(118, 212, 168, 0.16);
+  color: #a9f0cf;
+  white-space: nowrap;
+}
+
+.tut-coach-text {
+  font-size: 13px;
+  line-height: 1.5;
+  color: #e6ebe4;
+}
+
+.tut-coach-feedback {
+  font-size: 12px;
+  line-height: 1.45;
+  padding: 7px 10px;
+  border-radius: 10px;
+  background: rgba(94, 198, 138, 0.18);
+  border: 1px solid rgba(94, 198, 138, 0.42);
+  color: #b8f6cf;
+}
+
+.tut-coach-feedback.error {
+  background: rgba(224, 86, 76, 0.18);
+  border-color: rgba(224, 86, 76, 0.42);
+  color: #ffb8b2;
+}
+
+.tut-coach-hint {
+  font-size: 12px;
+  line-height: 1.4;
+  padding: 7px 10px;
+  border-radius: 10px;
+  background: rgba(224, 174, 88, 0.16);
+  border: 1px solid rgba(224, 174, 88, 0.36);
+  color: #f6dc9f;
+}
+
+.tut-coach-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.modal-card.modal-tutorial-card {
+  width: min(780px, 95vw);
+  max-height: min(88dvh, 780px);
+  overflow-y: auto;
+}
+
+.tutorial-group {
+  margin-bottom: 16px;
+}
+
+.tutorial-group-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #8ee4bd;
+  margin-bottom: 8px;
+  letter-spacing: 0.04em;
+}
+
+.tutorial-cards-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+.tutorial-lesson-card {
+  text-align: left;
+  padding: 12px 13px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: var(--text-main);
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  transition: border-color 0.15s ease, background 0.15s ease, transform 0.15s ease;
+}
+
+.tutorial-lesson-card:hover {
+  border-color: rgba(124, 214, 174, 0.55);
+  background: rgba(118, 212, 168, 0.09);
+  transform: translateY(-1px);
+}
+
+.tutorial-lesson-card.completed {
+  border-color: rgba(118, 212, 168, 0.42);
+  background: rgba(58, 128, 96, 0.18);
+}
+
+.tut-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 11px;
+}
+
+.tut-card-badge {
+  color: #f3c67c;
+  font-weight: 600;
+}
+
+.tut-card-status {
+  color: #9be8c3;
+  font-weight: 700;
+}
+
+.tut-card-title {
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.tut-card-desc {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+/* Ban Notice Modal */
+.modal-card.modal-ban-card {
+  width: min(440px, 92vw);
+}
+
+.ban-alert-badge {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(220, 72, 64, 0.2);
+  border: 1px solid rgba(235, 90, 80, 0.45);
+  color: #ffb8b2;
+  font-size: 13px;
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+
+.ban-info-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.28);
+  font-size: 12.5px;
+}
+
+.ban-info-grid > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.ban-info-grid span {
+  color: var(--text-muted);
+}
+
+.ban-duration {
+  color: #ffd088;
+}
+
+.ban-help-note {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* ============================================================================
+ * Dedicated Mobile Baduk UI (body[data-ui-layout="mobile"])
+ * ============================================================================ */
+.mobile-only {
+  display: none;
+}
+
+body[data-ui-layout='mobile'] .top-bar,
+body[data-ui-layout='mobile'] .players-hud-row .player-col-wrap,
+body[data-ui-layout='mobile'] .bottom-dock,
+body[data-ui-layout='mobile'] #web-live-users-badge {
+  display: none !important;
+}
+
+body[data-ui-layout='mobile'] #ui-root {
+  padding: max(4px, env(safe-area-inset-top)) max(6px, env(safe-area-inset-right))
+    max(6px, env(safe-area-inset-bottom)) max(6px, env(safe-area-inset-left));
+}
+
+body[data-ui-layout='mobile'] .mobile-only {
+  display: flex;
+}
+
+body[data-ui-layout='mobile'] .mobile-only.hidden {
+  display: none !important;
+}
+
+body[data-ui-layout='mobile'] .mobile-top-bar {
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 12px;
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  backdrop-filter: blur(12px);
+}
+
+body[data-ui-layout='mobile'] .mob-top-left,
+body[data-ui-layout='mobile'] .mob-top-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+body[data-ui-layout='mobile'] .mob-brand-seal {
+  width: 24px;
+  height: 24px;
+  border-radius: 5px;
+  background: linear-gradient(135deg, #c93d2b, #8f2215);
+  color: #fff6ec;
+  font-size: 11px;
+  font-weight: 800;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+body[data-ui-layout='mobile'] .mob-title {
+  font-size: 12.5px;
+  font-weight: 800;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+body[data-ui-layout='mobile'] .mob-online-badge {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(92, 198, 138, 0.22);
+  color: #9bf0be;
+  white-space: nowrap;
+}
+
+body[data-ui-layout='mobile'] .mobile-top-bar .btn-sm {
+  padding: 5px 8px;
+  font-size: 11.5px;
+}
+
+body[data-ui-layout='mobile'] .mobile-player-strip {
+  margin-top: 5px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 10px;
+  border-radius: 10px;
+  background: rgba(18, 14, 10, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(8px);
+}
+
+body[data-ui-layout='mobile'] .mobile-player-strip.self {
+  margin-top: 0;
+  margin-bottom: 6px;
+}
+
+body[data-ui-layout='mobile'] .mobile-player-strip.active-turn {
+  border-color: rgba(235, 184, 92, 0.75);
+  box-shadow: 0 0 14px rgba(235, 184, 92, 0.22);
+}
+
+body[data-ui-layout='mobile'] .mob-player-left,
+body[data-ui-layout='mobile'] .mob-player-right {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+body[data-ui-layout='mobile'] .mob-dot {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+body[data-ui-layout='mobile'] .mob-player-name {
+  font-size: 12.5px;
+  font-weight: 700;
+  max-width: 128px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+body[data-ui-layout='mobile'] .mob-coord-badge {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #e6d5bc;
+  max-width: 96px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+body[data-ui-layout='mobile'] .mob-cap-pill {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+body[data-ui-layout='mobile'] .mob-clock-pill {
+  font-size: 12px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.35);
+}
+
+body[data-ui-layout='mobile'] .mob-clock-pill.urgent {
+  color: #ff9c8e;
+  background: rgba(205, 50, 42, 0.3);
+}
+
+body[data-ui-layout='mobile'] .mobile-bottom-dock {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 5px;
+  padding: 6px;
+  border-radius: 14px;
+  background: var(--panel-bg-strong);
+  border: 1px solid var(--panel-border);
+  backdrop-filter: blur(12px);
+}
+
+body[data-ui-layout='mobile'] .spectator-mode #mob-btn-pass,
+body[data-ui-layout='mobile'] .spectator-mode #mob-btn-undo,
+body[data-ui-layout='mobile'] .spectator-mode #mob-btn-ai-hint {
+  opacity: 0.38;
+  pointer-events: none;
+}
+
+body[data-ui-layout='mobile'] .mob-dock-btn {
+  min-height: 40px;
+  padding: 6px 4px;
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+body[data-ui-layout='mobile'] .mobile-more-sheet {
+  position: fixed;
+  left: 8px;
+  right: 8px;
+  bottom: 108px;
+  z-index: 32;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 16px;
+  background: rgba(22, 17, 13, 0.96);
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--shadow-lg);
+}
+
+body[data-ui-layout='mobile'] .mob-sheet-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--gold-bright);
+}
+
+body[data-ui-layout='mobile'] .mob-sheet-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
+}
+
+body[data-ui-layout='mobile'] .mob-sheet-grid .btn-sm {
+  min-height: 36px;
+  font-size: 11.5px;
+}
+
+body[data-ui-layout='mobile'] #pending-move-bar {
+  margin-bottom: 6px;
+}
+
+body[data-ui-layout='mobile'] .byoyomi-countdown-banner {
+  bottom: 118px;
+  padding: 8px 14px;
+  width: min(320px, calc(100vw - 20px));
+}
+
+body[data-ui-layout='mobile'] .tutorial-coach-panel {
+  left: 8px;
+  right: 8px;
+  width: auto;
+  bottom: 114px;
+  padding: 10px 12px;
+}
+
+body[data-ui-layout='mobile'] .chat-popover {
+  position: fixed;
+  left: 8px;
+  right: 8px;
+  bottom: 112px;
+  width: auto;
+  z-index: 31;
+}
+
 

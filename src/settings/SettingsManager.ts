@@ -4,6 +4,9 @@ export type EffectiveInputMode = 'instant' | 'confirm' | 'double_tap';
 export type PhysicsIntensity = 'realistic' | 'subtle' | 'minimal';
 export type LightingTheme = 'hanok_warm' | 'studio_bright' | 'night_lantern';
 export type VisualQuality = 'ultra' | 'high' | 'standard';
+export type BoardGrainIntensity = 'classic' | 'soft' | 'plain';
+export type GridLineContrast = 'normal' | 'bold' | 'high';
+export type UILayoutMode = 'auto' | 'desktop' | 'mobile';
 
 export interface UserSettings {
   stoneMotionStyle: StoneMotionStyle;
@@ -14,7 +17,11 @@ export interface UserSettings {
   touchLoupeEnabled: boolean;
   physicsIntensity: PhysicsIntensity;
   lightingTheme: LightingTheme;
+  lightingBrightness: number; // 0.5 ~ 1.5
   visualQuality: VisualQuality;
+  boardGrainIntensity: BoardGrainIntensity;
+  gridLineContrast: GridLineContrast;
+  uiLayoutMode: UILayoutMode;
   bloomEnabled: boolean;
   ornateFinishEnabled: boolean;
   showCoordinates: boolean;
@@ -28,6 +35,14 @@ export function getDefaultVisualQuality(): VisualQuality {
   return isMobileOrTouchViewport() ? 'high' : 'ultra';
 }
 
+export function getDefaultBoardGrain(): BoardGrainIntensity {
+  return isMobileOrTouchViewport() ? 'soft' : 'classic';
+}
+
+export function getDefaultGridLineContrast(): GridLineContrast {
+  return isMobileOrTouchViewport() ? 'high' : 'normal';
+}
+
 export const DEFAULT_USER_SETTINGS: UserSettings = {
   stoneMotionStyle: 'realistic',
   trueVerticalView: false,
@@ -37,7 +52,11 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   touchLoupeEnabled: true,
   physicsIntensity: 'realistic',
   lightingTheme: 'hanok_warm',
+  lightingBrightness: 1.0,
   visualQuality: 'ultra',
+  boardGrainIntensity: 'classic',
+  gridLineContrast: 'normal',
+  uiLayoutMode: 'auto',
   bloomEnabled: true,
   ornateFinishEnabled: true,
   showCoordinates: true,
@@ -54,6 +73,9 @@ const VALID_INPUTS = new Set<PlacementInputMode>(['auto', 'instant', 'confirm', 
 const VALID_PHYSICS = new Set<PhysicsIntensity>(['realistic', 'subtle', 'minimal']);
 const VALID_THEMES = new Set<LightingTheme>(['hanok_warm', 'studio_bright', 'night_lantern']);
 const VALID_QUALITIES = new Set<VisualQuality>(['ultra', 'high', 'standard']);
+const VALID_GRAINS = new Set<BoardGrainIntensity>(['classic', 'soft', 'plain']);
+const VALID_LINE_CONTRASTS = new Set<GridLineContrast>(['normal', 'bold', 'high']);
+const VALID_UI_LAYOUTS = new Set<UILayoutMode>(['auto', 'desktop', 'mobile']);
 
 export function isMobileOrTouchViewport(): boolean {
   if (typeof window === 'undefined') return false;
@@ -72,10 +94,19 @@ export function resolveEffectiveInputMode(mode: PlacementInputMode): EffectiveIn
   return mode;
 }
 
+export function resolveEffectiveUiLayout(mode: UILayoutMode): 'desktop' | 'mobile' {
+  if (mode === 'auto') {
+    return isMobileOrTouchViewport() ? 'mobile' : 'desktop';
+  }
+  return mode;
+}
+
 function createPlatformDefaults(): UserSettings {
   return {
     ...DEFAULT_USER_SETTINGS,
     visualQuality: getDefaultVisualQuality(),
+    boardGrainIntensity: getDefaultBoardGrain(),
+    gridLineContrast: getDefaultGridLineContrast(),
   };
 }
 
@@ -103,8 +134,20 @@ function sanitizeSettings(raw: Partial<UserSettings> | null | undefined): UserSe
   if (raw.lightingTheme && VALID_THEMES.has(raw.lightingTheme)) {
     base.lightingTheme = raw.lightingTheme;
   }
+  if (typeof raw.lightingBrightness === 'number' && Number.isFinite(raw.lightingBrightness)) {
+    base.lightingBrightness = Math.max(0.5, Math.min(1.5, Math.round(raw.lightingBrightness * 100) / 100));
+  }
   if (raw.visualQuality && VALID_QUALITIES.has(raw.visualQuality)) {
     base.visualQuality = raw.visualQuality;
+  }
+  if (raw.boardGrainIntensity && VALID_GRAINS.has(raw.boardGrainIntensity)) {
+    base.boardGrainIntensity = raw.boardGrainIntensity;
+  }
+  if (raw.gridLineContrast && VALID_LINE_CONTRASTS.has(raw.gridLineContrast)) {
+    base.gridLineContrast = raw.gridLineContrast;
+  }
+  if (raw.uiLayoutMode && VALID_UI_LAYOUTS.has(raw.uiLayoutMode)) {
+    base.uiLayoutMode = raw.uiLayoutMode;
   }
   if (typeof raw.bloomEnabled === 'boolean') base.bloomEnabled = raw.bloomEnabled;
   if (typeof raw.ornateFinishEnabled === 'boolean') base.ornateFinishEnabled = raw.ornateFinishEnabled;

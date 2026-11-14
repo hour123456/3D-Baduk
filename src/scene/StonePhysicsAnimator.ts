@@ -117,6 +117,7 @@ export class StonePhysicsAnimator {
 
   private lidShakeBlack = 0;
   private lidShakeWhite = 0;
+  private lastBoardNudgeSoundMs = 0;
   private bodiesScratch: StonePhysicsBody[] = [];
 
   constructor(params: {
@@ -345,7 +346,13 @@ export class StonePhysicsAnimator {
     return which === 'black' ? this.bowlStonesBlack : this.bowlStonesWhite;
   }
 
-  public stirBowl(which: 'black' | 'white', intensity = 0.8, playSound = true): void {
+  public stirBowl(
+    which: 'black' | 'white',
+    intensity = 0.8,
+    playSound = true,
+    dirX?: number,
+    dirZ?: number
+  ): void {
     const items = which === 'black' ? this.bowlStonesBlack : this.bowlStonesWhite;
     const clamped = Math.max(0.25, Math.min(1.25, intensity));
 
@@ -355,21 +362,74 @@ export class StonePhysicsAnimator {
       this.bowlAwakeTimerWhite = 0.92;
     }
 
+    const dirLen =
+      dirX !== undefined && dirZ !== undefined ? Math.hypot(dirX, dirZ) : 0;
+    const hasDirection = dirLen > 1e-4;
+    const ux = hasDirection ? (dirX as number) / dirLen : 0;
+    const uz = hasDirection ? (dirZ as number) / dirLen : 0;
+
     for (let i = 0; i < items.length; i++) {
-      const layerFactor = 0.4 + (i / items.length) * 0.85;
+      const layerFactor = 0.45 + (i / items.length) * 0.85;
       const amp = 0.095 * clamped * layerFactor;
       const p = items[i].particle;
-      p.vx += (Math.random() - 0.5) * amp * 13;
-      p.vy += Math.random() * amp * 8;
-      p.vz += (Math.random() - 0.5) * amp * 13;
-      p.angVx += (Math.random() - 0.5) * clamped * 9;
-      p.angVz += (Math.random() - 0.5) * clamped * 9;
+
+      if (hasDirection) {
+        // 85% pushed along touched/dragged vector + 15% natural pile scatter, with matching directional roll torque
+        const speedMag = amp * 12.2;
+        const scatterMag = amp * 2.1;
+        p.vx += ux * speedMag + (Math.random() - 0.5) * scatterMag;
+        p.vz += uz * speedMag + (Math.random() - 0.5) * scatterMag;
+        p.vy += (0.35 + Math.random() * 0.65) * amp * 6.5;
+        p.angVx += uz * clamped * 7.8;
+        p.angVz -= ux * clamped * 7.8;
+      } else {
+        // Toolbar manual stir button: gentle organic circular swirl inside the bowl
+        const angle = Math.atan2(p.z, p.x) + Math.PI * 0.5;
+        const swirlSpeed = amp * 9.5;
+        p.vx += Math.cos(angle) * swirlSpeed + (Math.random() - 0.5) * amp * 3.5;
+        p.vz += Math.sin(angle) * swirlSpeed + (Math.random() - 0.5) * amp * 3.5;
+        p.vy += Math.random() * amp * 5.5;
+        p.angVx += Math.sin(angle) * clamped * 5.0;
+        p.angVz -= Math.cos(angle) * clamped * 5.0;
+      }
     }
 
     if (playSound) {
       const side = which === 'black' ? 'right' : 'left';
       this.audio.playBowlRattle(side, clamped, which === 'black');
     }
+  }
+
+  public nudgeBoardStone(
+    x: number,
+    y: number,
+    dirX: number,
+    dirZ: number,
+    strength = 1.0
+  ): boolean {
+    const idx = y * this.metrics.size + x;
+    const entry = this.boardStones.get(idx);
+    if (!entry) return false;
+
+    const nudged = this.physicsWorld.nudgeStone(entry.body, dirX, dirZ, strength);
+    if (nudged) {
+      const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      if (now - this.lastBoardNudgeSoundMs > 95) {
+        this.lastBoardNudgeSoundMs = now;
+        const pan = Math.max(-0.75, Math.min(0.75, entry.body.x / 2.2));
+        this.audio.playStoneCollisionClink(
+          Math.min(0.42, 0.18 * strength),
+          entry.color === BLACK,
+          pan
+        );
+      }
+    }
+    return nudged;
+  }
+
+  public getBoardStoneBody(x: number, y: number): Readonly<StonePhysicsBody> | null {
+    const idx = y * this.metrics.size + x;
+    return this.boardStones.get(idx)?.body ?? null;
   }
 
   private humanJitter(x: number, y: number): THREE.Vector2 {

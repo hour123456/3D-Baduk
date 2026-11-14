@@ -34,10 +34,20 @@ import {
 } from './settings/SettingsManager';
 import { ProfileManager, generateDefaultNickname } from './profile/ProfileManager';
 import { MultiBrokerTransport } from './online/MultiBrokerTransport';
-import { OnlineMatchManager, normalizeRoomCode } from './online/OnlineMatchManager';
+import {
+  OnlineMatchCallbacks,
+  OnlineMatchManager,
+  normalizeRoomCode,
+} from './online/OnlineMatchManager';
 import { SyncSnapshotPayload } from './online/types';
+import { TutorialController } from './tutorial/TutorialController';
 
-class BadukApp {
+export interface BadukAppOptions {
+  adminMode?: boolean;
+  adminCallbacks?: Partial<OnlineMatchCallbacks>;
+}
+
+export class BadukApp {
   private profile: ProfileManager;
   private settings: SettingsManager;
   private online: OnlineMatchManager;
@@ -47,6 +57,8 @@ class BadukApp {
   private ai: AIController;
   private ui: UIManager;
   private clock: GameClock;
+  private tutorial = new TutorialController();
+  private adminMode = false;
 
   private aiThinking = false;
   private hintThinking = false;
@@ -60,7 +72,8 @@ class BadukApp {
   private doubleTapAt = 0;
   private moveBlackWinrates: Array<number | undefined> = [];
 
-  constructor() {
+  constructor(options: BadukAppOptions = {}) {
+    this.adminMode = Boolean(options.adminMode);
     this.profile = new ProfileManager();
     this.settings = new SettingsManager();
     const initialSettings = this.settings.get();
@@ -103,6 +116,9 @@ class BadukApp {
       onByoyomiWarning: (_color, secLeft) => {
         this.audio.playByoyomiTick(secLeft);
       },
+      onUrgentCountdown: (state) => {
+        this.ui?.updateUrgentCountdown(state);
+      },
       onTimeout: (timedOutColor) => {
         if (this.engine.phase !== 'playing' || this.isSpectating()) return;
         this.ai.cancelPending();
@@ -131,61 +147,94 @@ class BadukApp {
       onHoverLeave: () => {
         this.ui?.setCoordStatus(this.engine.phase === 'scoring' ? '사석 클릭 지정' : '대기 중');
       },
+      isPointOccupied: (x, y) => this.engine.getStone(x, y) !== EMPTY,
+      isScoringPhase: () => this.engine.phase === 'scoring',
     });
     this.applySettingsToScene(initialSettings, false);
 
     const transport = new MultiBrokerTransport(this.profile.getClientId());
-    this.online = new OnlineMatchManager(this.profile, transport, {
-      onStatusChange: (status, label) => {
-        this.ui?.setOnlineTransportState(status, label);
-      },
-      onPhaseChange: (phase) => {
-        this.ui?.setOnlineLobbyPhase(phase);
-      },
-      onOpenRoomsUpdated: (rooms) => {
-        this.ui?.renderOpenRooms(rooms);
-      },
-      onWaitingRoomReady: (room, isPublic) => {
-        this.ui?.showWaitingRoom(room, isPublic);
-        this.ui?.showToast(
-          isPublic
-            ? `공개 대국방(${room.roomCode})이 개설되었습니다.`
-            : `비공개 대국방(${room.roomCode})이 개설되었습니다.`
-        );
-      },
-      onMatchStart: (cfg, role, isRematch) => {
-        this.audio.ensureReady();
-        this.ui.markGameStartedAndCloseModals();
-        this.ui.setOnlineInGameHUD(true, role.roomCode, role.myColor, 'player', role.spectatorCount ?? 0);
-        this.startNewGame(cfg, true);
-        this.online.updateHostMoveCount(0);
-        const stoneLabel = role.myColor === BLACK ? '흑번(선공)' : '백번(덤 수령)';
-        this.ui.showToast(
-          `${isRematch ? '재대국 시작!' : '온라인 매칭 성사!'} ${role.opponentName}님과 대국합니다 (${stoneLabel})`
-        );
-      },
-      onSpectateStart: (cfg, _init, snapshot, spectatorCount) => {
-        this.audio.ensureReady();
-        this.ui.markGameStartedAndCloseModals();
-        this.ui.setOnlineInGameHUD(true, cfg.roomCode, undefined, 'spectator', spectatorCount);
-        this.startNewGame(cfg, true);
-        if (snapshot) {
-          this.applySyncSnapshot(snapshot, true);
-        }
-        this.ui.showToast(`실시간 관전 입장! ${cfg.blackName || '흑'} vs ${cfg.whiteName || '백'}`);
-      },
-      onSpectatorCountUpdated: (count) => {
-        this.ui?.updateSpectatorCount(count);
-      },
-      onPresenceUpdated: (stats) => {
-        this.ui?.updateLivePresence(stats);
-      },
-      onRoomPasswordRequired: (action, roomCode, title) => {
-        this.ui?.promptRoomPassword(action, roomCode, title);
-      },
-      onRoomPasswordRejected: (action, roomCode, reason) => {
-        this.ui?.promptRoomPassword(action, roomCode, undefined, reason);
-      },
+    this.online = new OnlineMatchManager(
+      this.profile,
+      transport,
+      {
+        onStatusChange: (status, label) => {
+          this.ui?.setOnlineTransportState(status, label);
+          options.adminCallbacks?.onStatusChange?.(status, label);
+        },
+        onPhaseChange: (phase, detail) => {
+          this.ui?.setOnlineLobbyPhase(phase);
+          options.adminCallbacks?.onPhaseChange?.(phase, detail);
+        },
+        onOpenRoomsUpdated: (rooms) => {
+          this.ui?.renderOpenRooms(rooms);
+          options.adminCallbacks?.onOpenRoomsUpdated?.(rooms);
+        },
+        onWaitingRoomReady: (room, isPublic) => {
+          this.ui?.showWaitingRoom(room, isPublic);
+          this.ui?.showToast(
+            isPublic
+              ? `공개 대국방(${room.roomCode})이 개설되었습니다.`
+              : `비공개 대국방(${room.roomCode})이 개설되었습니다.`
+          );
+        },
+        onMatchStart: (cfg, role, isRematch) => {
+          this.exitTutorialMode(true);
+          this.audio.ensureReady();
+          this.ui.markGameStartedAndCloseModals();
+          this.ui.setOnlineInGameHUD(true, role.roomCode, role.myColor, 'player', role.spectatorCount ?? 0);
+          this.startNewGame(cfg, true);
+          this.online.updateHostMoveCount(0);
+          const stoneLabel = role.myColor === BLACK ? '흑번(선공)' : '백번(덤 수령)';
+          this.ui.showToast(
+            `${isRematch ? '재대국 시작!' : '온라인 매칭 성사!'} ${role.opponentName}님과 대국합니다 (${stoneLabel})`
+          );
+        },
+        onSpectateStart: (cfg, init, snapshot, spectatorCount) => {
+          this.exitTutorialMode(true);
+          this.audio.ensureReady();
+          this.ui.markGameStartedAndCloseModals();
+          const role = this.online.getSessionRole() === 'admin_stealth' ? 'admin_stealth' : 'spectator';
+          this.ui.setOnlineInGameHUD(true, cfg.roomCode, undefined, role, spectatorCount);
+          this.startNewGame(cfg, true);
+          if (snapshot) {
+            this.applySyncSnapshot(snapshot, true);
+          }
+          this.ui.showToast(
+            role === 'admin_stealth'
+              ? `🛡 은밀 관전 연결됨: ${cfg.blackName || '흑'} vs ${cfg.whiteName || '백'}`
+              : `실시간 관전 입장! ${cfg.blackName || '흑'} vs ${cfg.whiteName || '백'}`
+          );
+          options.adminCallbacks?.onSpectateStart?.(cfg, init, snapshot, spectatorCount);
+        },
+        onSpectatorCountUpdated: (count) => {
+          this.ui?.updateSpectatorCount(count);
+        },
+        onPresenceUpdated: (stats) => {
+          this.ui?.updateLivePresence(stats);
+          options.adminCallbacks?.onPresenceUpdated?.(stats);
+        },
+        onRoomPasswordRequired: (action, roomCode, title) => {
+          this.ui?.promptRoomPassword(action, roomCode, title);
+        },
+        onRoomPasswordRejected: (action, roomCode, reason) => {
+          this.ui?.promptRoomPassword(action, roomCode, undefined, reason);
+        },
+        onSelfBanned: (ban) => {
+          this.clock.stop();
+          this.ui?.setOnlineInGameHUD(false);
+          this.ui?.showBanNotice(ban);
+        },
+        onRoomForceClosed: (reason) => {
+          this.clock.stop();
+          this.ui?.hideOnlinePrompt();
+          this.ui?.setOnlineInGameHUD(false);
+          this.ui?.openSetupModal(true);
+          this.ui?.showToast(reason || '관리자에 의해 대국방이 강제 종료되었습니다.', true);
+        },
+        onLiveUsersChanged: options.adminCallbacks?.onLiveUsersChanged,
+        onBanRegistryChanged: options.adminCallbacks?.onBanRegistryChanged,
+        onAdminMonitorChat: options.adminCallbacks?.onAdminMonitorChat,
+        onAdminStealthJoined: options.adminCallbacks?.onAdminStealthJoined,
       onRemoteMove: (payload) => {
         if (this.engine.config.mode !== 'online' || this.engine.phase !== 'playing') return;
         if (payload.moveNumber !== this.engine.history.length + 1) {
@@ -344,11 +393,17 @@ class BadukApp {
       onOpponentLeft: (opponentName) => {
         this.ui.hideOnlinePrompt();
         if (this.isSpectating()) {
+          const wasStealth = this.online.getSessionRole() === 'admin_stealth';
           this.clock.stop();
-          this.online.leaveCurrentSession(false);
+          void this.online.cancelMatchmakingOrRoom();
           this.ui.setOnlineInGameHUD(false);
-          this.ui.openSetupModal(true);
-          this.ui.showToast(`대국자(${opponentName})가 퇴장하여 관전을 종료합니다.`);
+          if (!wasStealth) {
+            this.ui.openSetupModal(true);
+            this.ui.showToast(`대국자(${opponentName})가 퇴장하여 관전을 종료합니다.`);
+          } else {
+            this.ui.showToast(`은밀 관전 중 대국자(${opponentName})가 퇴장했습니다.`);
+          }
+          options.adminCallbacks?.onOpponentLeft?.(opponentName);
           return;
         }
         if (this.engine.phase === 'playing' || this.engine.phase === 'scoring') {
@@ -374,11 +429,17 @@ class BadukApp {
       onSyncSnapshotReceived: (snap) => this.applySyncSnapshot(snap),
       onError: (msg) => {
         this.ui?.showToast(msg, true);
+        options.adminCallbacks?.onError?.(msg);
       },
-    });
+    },
+    { adminMode: this.adminMode }
+  );
 
     this.ui = new UIManager(uiRoot, this.profile.getNickname(), initialSettings, {
-      onStartNewGame: (cfg) => this.startNewGame(cfg, false),
+      onStartNewGame: (cfg) => {
+        this.exitTutorialMode(true);
+        this.startNewGame(cfg, false);
+      },
       onPass: () => this.handleHumanPass(),
       onUndo: () => this.handleUndo(),
       onResign: () => this.handleResign(),
@@ -480,12 +541,21 @@ class BadukApp {
       },
       onGetInviteUrl: () => this.online.getInviteUrl(),
       onLeaveOnlineMatch: () => {
+        const wasStealth = this.online.getSessionRole() === 'admin_stealth';
         const wasSpectator = this.isSpectating();
         this.online.leaveCurrentSession(false);
         this.clock.stop();
         this.ui.setOnlineInGameHUD(false);
-        this.ui.openSetupModal(true);
-        this.ui.showToast(wasSpectator ? '관전을 종료했습니다.' : '온라인 대국방에서 퇴장했습니다.');
+        if (!wasStealth) {
+          this.ui.openSetupModal(true);
+        }
+        this.ui.showToast(
+          wasStealth
+            ? '은밀 관전을 종료했습니다.'
+            : wasSpectator
+              ? '관전을 종료했습니다.'
+              : '온라인 대국방에서 퇴장했습니다.'
+        );
       },
       onSendOnlineChat: (text) => {
         if (this.engine.config.mode !== 'online') return;
@@ -518,6 +588,22 @@ class BadukApp {
         this.ui.setRematchButtonPending();
         this.ui.showToast('상대방에게 온라인 재대국을 신청했습니다.');
       },
+      onOpenTutorialModal: () => {
+        this.ui.openTutorialModal(
+          this.tutorial.getLessons(),
+          this.tutorial.getCompletedLessonIds()
+        );
+      },
+      onStartTutorialLesson: (lessonId) => this.startTutorialLesson(lessonId),
+      onToggleTutorialHint: () => {
+        this.tutorial.toggleHint();
+        this.refreshTutorialCoachAndBoard(null);
+      },
+      onRetryTutorialStep: () => this.loadCurrentTutorialStep(),
+      onTutorialNextStep: () => this.advanceTutorialStep(),
+      onExitTutorial: () => {
+        this.exitTutorialMode(false);
+      },
     });
 
     const initialCam = this.pickPreferredCameraPreset(defaultConfig);
@@ -525,12 +611,35 @@ class BadukApp {
     this.ui.setCameraPresetActive(initialCam);
     this.ui.updateGameHeader(defaultConfig);
     this.syncAllUI();
-    this.checkUrlRoomInvite();
 
-    // Start live concurrent user presence ONLY on Web builds (hidden inside Electron desktop app)
-    if (typeof window !== 'undefined' && !window.electronAPI?.isElectron) {
+    if (typeof window !== 'undefined') {
+      window.addEventListener('resize', () => {
+        this.ui?.applyUiLayoutMode(this.settings.get().uiLayoutMode);
+      });
+    }
+
+    if (!this.adminMode) {
+      this.checkUrlRoomInvite();
+      // Start live presence reporting for both web and desktop clients so Admin sees connected players.
+      // (#web-live-users-badge remains hidden on Electron desktop clients.)
       void this.online.startPresenceTracking().catch(() => {});
     }
+  }
+
+  public getOnlineManager(): OnlineMatchManager {
+    return this.online;
+  }
+
+  public getUI(): UIManager {
+    return this.ui;
+  }
+
+  public getProfile(): ProfileManager {
+    return this.profile;
+  }
+
+  public getSettingsManager(): SettingsManager {
+    return this.settings;
   }
 
   private isSpectating(): boolean {
@@ -562,10 +671,12 @@ class BadukApp {
     this.scene.stoneAnimator.setPhysicsIntensity(s.physicsIntensity);
     this.scene.setLockVerticalRotation(s.lockVerticalRotation);
     this.scene.setTouchLoupeEnabled(s.touchLoupeEnabled);
-    this.scene.setLightingTheme(s.lightingTheme);
+    this.scene.setLightingConfig(s.lightingTheme, s.lightingBrightness);
+    this.scene.setBoardVisualStyle(s.boardGrainIntensity, s.gridLineContrast);
     this.scene.setCoordinatesVisible(s.showCoordinates);
     this.audio.setVolume(s.soundVolume);
     this.audio.setMuted(s.soundMuted);
+    this.ui?.applyUiLayoutMode(s.uiLayoutMode);
 
     if (updateCamera) {
       const preset = this.pickPreferredCameraPreset(this.engine.config);
@@ -613,6 +724,7 @@ class BadukApp {
 
   private isHumanTurn(): boolean {
     if (this.isSpectating()) return false;
+    if (this.tutorial.isActive() && this.tutorial.isAwaitingNextStep()) return false;
     if (this.engine.phase !== 'playing' || this.aiThinking) return false;
     if (this.engine.config.mode === 'local2p') return true;
     return this.engine.currentTurn === this.engine.config.humanColor;
@@ -626,6 +738,8 @@ class BadukApp {
 
     this.audio.ensureReady();
     this.ai.cancelPending();
+    this.clock.stop();
+    this.scene.clearTutorialTargets();
     this.aiThinking = false;
     this.hintThinking = false;
     this.pendingOnlineUndo = false;
@@ -677,6 +791,23 @@ class BadukApp {
       return { valid: false, showGhost: false, color: this.engine.currentTurn };
     }
 
+    if (this.tutorial.isActive()) {
+      const tutStep = this.tutorial.getCurrentStep();
+      if (this.tutorial.isAwaitingNextStep()) {
+        this.ui.setCoordStatus(`${label} · 다음 단계 진행 대기`);
+        return { valid: false, showGhost: false, color: this.engine.currentTurn };
+      }
+      if (tutStep?.actionType === 'mark_dead') {
+        const hasStone = this.engine.getStone(x, y) !== EMPTY;
+        this.ui.setCoordStatus(hasStone ? `${label} · 클릭하여 사석 지정` : label);
+        return { valid: hasStone, showGhost: false, color: this.engine.currentTurn };
+      }
+      if (tutStep?.actionType !== 'move') {
+        this.ui.setCoordStatus(label);
+        return { valid: false, showGhost: false, color: this.engine.currentTurn };
+      }
+    }
+
     if (this.engine.phase === 'scoring') {
       const hasStone = this.engine.getStone(x, y) !== EMPTY;
       this.ui.setCoordStatus(hasStone ? `${label} · 클릭하여 사석 전환` : `${label}`);
@@ -726,6 +857,10 @@ class BadukApp {
   private handleIntersectionClick(x: number, y: number): void {
     this.audio.ensureReady();
     if (this.isSpectating()) return;
+    if (this.tutorial.isActive()) {
+      this.handleTutorialBoardClick(x, y);
+      return;
+    }
 
     if (this.engine.phase === 'scoring') {
       if (this.engine.getStone(x, y) === EMPTY) return;
@@ -1093,6 +1228,10 @@ class BadukApp {
   }
 
   private handleHumanPass(): void {
+    if (this.tutorial.isActive()) {
+      this.handleTutorialPass();
+      return;
+    }
     if (!this.isHumanTurn()) return;
     const passColor = this.engine.currentTurn;
     const rec = this.executePass(passColor, false, false);
@@ -1176,6 +1315,10 @@ class BadukApp {
   }
 
   private confirmScoring(): void {
+    if (this.tutorial.isActive()) {
+      this.handleTutorialConfirmScore();
+      return;
+    }
     if (this.engine.phase !== 'scoring' || this.isSpectating()) return;
     if (this.engine.config.mode === 'online') {
       this.online.sendScoreAgree(this.deadStoneMask);
@@ -1525,6 +1668,7 @@ class BadukApp {
   private loadSgfContent(sgfText: string): void {
     try {
       const parsed = parseSgf(sgfText);
+      this.exitTutorialMode(true);
       void this.online.cancelMatchmakingOrRoom();
       this.ui.setOnlineInGameHUD(false);
       this.ai.cancelPending();
@@ -1603,8 +1747,312 @@ class BadukApp {
       gameType: this.engine.config.gameType,
     });
   }
+
+  private startTutorialLesson(lessonId: string): void {
+    void this.online.cancelMatchmakingOrRoom();
+    this.ui.setOnlineInGameHUD(false);
+    this.ai.cancelPending();
+    this.aiThinking = false;
+    this.clock.stop();
+
+    const lesson = this.tutorial.startLesson(lessonId);
+    if (!lesson) return;
+
+    this.ui.markGameStartedAndCloseModals();
+    this.ui.closeTutorialModal();
+    this.loadCurrentTutorialStep();
+  }
+
+  private loadCurrentTutorialStep(): void {
+    const lesson = this.tutorial.getCurrentLesson();
+    const step = this.tutorial.getCurrentStep();
+    const stepIdx = this.tutorial.getCurrentStepIndex();
+    if (!lesson || !step) return;
+
+    this.tutorial.resetCurrentStep();
+    const cfg = this.tutorial.buildGameConfigForLesson(lesson);
+    this.engine = this.createEngine(cfg);
+    this.deadStoneMask = new Uint8Array(cfg.boardSize * cfg.boardSize);
+    this.moveBlackWinrates = [];
+
+    // Find nearest ancestor step with explicit setupStones and replay moves deterministically
+    let baseIdx = 0;
+    for (let i = stepIdx; i >= 0; i--) {
+      if (lesson.steps[i].setupStones !== undefined) {
+        baseIdx = i;
+        break;
+      }
+    }
+
+    const setupList = lesson.steps[baseIdx]?.setupStones ?? [];
+    for (const pt of setupList) {
+      if (this.engine instanceof GoEngine) {
+        this.engine.setCustomSetupStone(pt.x, pt.y, pt.color);
+      } else {
+        this.engine.board[pt.y * cfg.boardSize + pt.x] = pt.color;
+      }
+    }
+
+    for (let i = baseIdx; i < stepIdx; i++) {
+      const prev = lesson.steps[i];
+      this.engine.currentTurn = prev.turnColor;
+      if (prev.actionType === 'move' && prev.acceptedMoves?.[0]) {
+        const mv = prev.acceptedMoves[0];
+        this.engine.playMove(mv.x, mv.y);
+        if (this.engine.phase === 'finished') {
+          this.engine.phase = 'playing';
+        }
+        if (prev.opponentReply) {
+          this.engine.currentTurn = prev.opponentReply.color;
+          this.engine.playMove(prev.opponentReply.x, prev.opponentReply.y);
+          if ((this.engine.phase as string) === 'finished') {
+            this.engine.phase = 'playing';
+          }
+        }
+      } else if (prev.actionType === 'pass') {
+        this.engine.pass();
+        this.engine.pass();
+      } else if (prev.actionType === 'mark_dead' && prev.targetDeadCoord) {
+        this.engine.phase = 'scoring';
+        this.deadStoneMask = toggleDeadChainAt(
+          this.engine.board,
+          this.engine.size,
+          this.deadStoneMask,
+          prev.targetDeadCoord.x,
+          prev.targetDeadCoord.y
+        );
+      }
+    }
+
+    this.engine.currentTurn = step.turnColor;
+    if (step.actionType === 'mark_dead' || step.actionType === 'confirm_score') {
+      this.engine.phase = 'scoring';
+    }
+
+    this.clock.stop();
+    this.clearPendingMove();
+    this.clearAIHints();
+    this.scene.setBoardSize(cfg.boardSize);
+    this.scene.stoneAnimator.syncBoardSnapshot(
+      this.engine.board,
+      cfg.boardSize,
+      this.engine.captures
+    );
+    this.scene.updateMarkers(null, null, this.engine.koPoint);
+    this.scene.clearMoveNumbers();
+    this.scene.renderOmokWinningLine(null);
+    this.refreshForbiddenOverlay();
+
+    if (this.engine.phase === 'scoring') {
+      this.ui.updateOnlineScoringAgreement(false, null, null);
+      this.refreshScoringPreview();
+    } else {
+      this.scene.stoneAnimator.updateDeadMaskVisuals(null);
+      this.scene.clearTerritoryMarkers();
+    }
+
+    const cam = this.pickPreferredCameraPreset(cfg);
+    this.scene.setCameraPreset(cam);
+    this.ui.setCameraPresetActive(cam);
+    this.ui.updateGameHeader(cfg);
+    this.ui.configureReviewBar(false, 0, 0);
+    this.syncAllUI();
+    this.refreshTutorialCoachAndBoard(null, false);
+  }
+
+  private handleTutorialBoardClick(x: number, y: number): void {
+    const step = this.tutorial.getCurrentStep();
+    if (!step) return;
+
+    if (step.actionType === 'mark_dead') {
+      const outcome = this.tutorial.evaluateDeadStoneAttempt(x, y);
+      if (!outcome.accepted) {
+        this.refreshTutorialCoachAndBoard(outcome.feedback, true);
+        this.ui.showToast(outcome.feedback, true);
+        return;
+      }
+      this.deadStoneMask = toggleDeadChainAt(
+        this.engine.board,
+        this.engine.size,
+        this.deadStoneMask,
+        x,
+        y
+      );
+      this.audio.playStonePickup('right', true);
+      this.audio.playCeremonialChime('start');
+      this.refreshScoringPreview();
+      this.refreshTutorialCoachAndBoard(outcome.feedback, false);
+      return;
+    }
+
+    const outcome = this.tutorial.evaluateMoveAttempt(x, y);
+    if (!outcome.accepted) {
+      const illegal = this.engine.validateMove(x, y, this.engine.currentTurn);
+      if (!illegal.valid && illegal.reason && illegal.reason !== 'OCCUPIED') {
+        this.ui.showToast(this.engine.getIllegalReasonKorean(illegal.reason), true);
+      } else {
+        this.ui.showToast(outcome.feedback, true);
+      }
+      this.refreshTutorialCoachAndBoard(outcome.feedback, true);
+      return;
+    }
+
+    this.engine.currentTurn = step.turnColor;
+    const moveRes = this.engine.playMove(x, y);
+    if (moveRes.valid && moveRes.record) {
+      this.scene.clearHover();
+      this.applyMoveToScene(
+        x,
+        y,
+        moveRes.record.color,
+        moveRes.capturedCoords ?? [],
+        moveRes.adjacentTotalCount ?? 0
+      );
+      if (this.engine.phase === 'finished' && this.engine.result?.winningLine) {
+        this.scene.renderOmokWinningLine(this.engine.result.winningLine);
+        this.engine.phase = 'playing';
+      }
+    }
+
+    if (outcome.needsOpponentReply) {
+      const reply = outcome.needsOpponentReply;
+      window.setTimeout(() => {
+        if (!this.tutorial.isActive()) return;
+        this.engine.currentTurn = reply.color;
+        const rep = this.engine.playMove(reply.x, reply.y);
+        if (rep.valid && rep.record) {
+          this.applyMoveToScene(
+            reply.x,
+            reply.y,
+            rep.record.color,
+            rep.capturedCoords ?? [],
+            rep.adjacentTotalCount ?? 0
+          );
+          this.syncAllUI();
+        }
+      }, 420);
+    }
+
+    this.audio.playCeremonialChime('start');
+    this.syncAllUI();
+    this.refreshTutorialCoachAndBoard(outcome.feedback, false);
+  }
+
+  private handleTutorialPass(): void {
+    const outcome = this.tutorial.evaluatePassAttempt();
+    if (!outcome.accepted) {
+      this.refreshTutorialCoachAndBoard(outcome.feedback, true);
+      this.ui.showToast(outcome.feedback, true);
+      return;
+    }
+
+    this.engine.pass();
+    this.engine.pass();
+    this.deadStoneMask = new Uint8Array(this.engine.size * this.engine.size);
+    this.scene.updateMarkers(null, null, null);
+    this.ui.updateOnlineScoringAgreement(false, null, null);
+    this.refreshScoringPreview();
+    this.syncAllUI();
+    this.audio.playCeremonialChime('start');
+    this.refreshTutorialCoachAndBoard(outcome.feedback, false);
+  }
+
+  private handleTutorialConfirmScore(): void {
+    const outcome = this.tutorial.evaluateConfirmScoreAttempt();
+    if (!outcome.accepted) {
+      this.refreshTutorialCoachAndBoard(outcome.feedback, true);
+      this.ui.showToast(outcome.feedback, true);
+      return;
+    }
+    const breakdown = calculateScore({
+      board: this.engine.board,
+      size: this.engine.size,
+      ruleset: this.engine.config.ruleset,
+      komi: this.engine.config.komi,
+      captures: this.engine.captures,
+      deadStoneMask: this.deadStoneMask,
+    });
+    const res = buildScoreGameResult(breakdown);
+    this.audio.playWinCelebrationChime();
+    this.refreshTutorialCoachAndBoard(
+      `${outcome.feedback} (최종 결과: ${res.summaryText})`,
+      false
+    );
+  }
+
+  private refreshTutorialCoachAndBoard(feedback: string | null, isError = false): void {
+    const lesson = this.tutorial.getCurrentLesson();
+    const step = this.tutorial.getCurrentStep();
+    if (!lesson || !step) return;
+
+    const awaitingNext = this.tutorial.isAwaitingNextStep();
+    const stepIdx = this.tutorial.getCurrentStepIndex();
+    this.scene.renderTutorialTargets(awaitingNext ? [] : this.tutorial.getActiveHighlights());
+    this.ui.showTutorialCoach({
+      lesson,
+      step,
+      stepIndex: stepIdx,
+      feedback,
+      isErrorFeedback: isError,
+      hintVisible: this.tutorial.isShowingHint(),
+      awaitingNext,
+      isFinalStep: stepIdx >= lesson.steps.length - 1,
+    });
+  }
+
+  private advanceTutorialStep(): void {
+    const res = this.tutorial.advanceToNextStep();
+    if (res.hasNextStep) {
+      this.loadCurrentTutorialStep();
+      return;
+    }
+    if (res.nextLesson) {
+      this.ui.showToast('과정을 완료했습니다! 다음 과정으로 이어집니다.');
+      this.startTutorialLesson(res.nextLesson.id);
+      return;
+    }
+    this.exitTutorialMode(true);
+    this.ui.showToast('축하합니다! 전 입문 과정을 모두 수료하셨습니다!');
+    this.ui.openTutorialModal(
+      this.tutorial.getLessons(),
+      this.tutorial.getCompletedLessonIds()
+    );
+  }
+
+  private exitTutorialMode(silent: boolean): void {
+    if (!this.tutorial.isActive()) return;
+    this.tutorial.exit();
+    this.scene.clearTutorialTargets();
+    this.ui.hideTutorialCoach();
+    if (!silent) {
+      this.startNewGame({
+        ...this.engine.config,
+        boardSize: 19,
+        gameType: 'baduk',
+        ruleset: 'korean',
+        handicap: 0,
+        komi: 6.5,
+        superko: true,
+        mode: 'ai',
+        humanColor: BLACK,
+        aiDifficulty: 3,
+        mainTimeSeconds: 600,
+        byoyomiSeconds: 30,
+        byoyomiPeriods: 3,
+        blackName: this.profile.getNickname(),
+        whiteName: 'AI 중급 (Lv.3)',
+      });
+      this.ui.showToast('입문 튜토리얼을 종료했습니다.');
+    }
+  }
 }
 
-window.addEventListener('DOMContentLoaded', () => {
-  new BadukApp();
-});
+if (
+  typeof window !== 'undefined' &&
+  !(window as { __SUDAM_ADMIN_ENTRY__?: boolean }).__SUDAM_ADMIN_ENTRY__ &&
+  !window.electronAPI?.isAdmin
+) {
+  window.addEventListener('DOMContentLoaded', () => {
+    new BadukApp();
+  });
+}

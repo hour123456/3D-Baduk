@@ -13,7 +13,7 @@ function createWindow() {
     minWidth: 1024,
     minHeight: 680,
     backgroundColor: '#14100c',
-    title: '3D 정통 바둑 — 수담(手談) v3.0',
+    title: '3D 정통 바둑 — 수담(手談) v4.0',
     autoHideMenuBar: true,
     show: false,
     webPreferences: {

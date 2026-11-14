@@ -12,10 +12,20 @@ export interface ClockSnapshot {
   white: PlayerClockState;
 }
 
+export interface UrgentCountdownState {
+  active: boolean;
+  color: PlayerColor | null;
+  secondsLeft: number;
+  periodsLeft: number;
+  totalWindowSeconds: number;
+  isByoyomi: boolean;
+}
+
 export interface ClockCallbacks {
   onTick: (state: { black: PlayerClockState; white: PlayerClockState; activeColor: PlayerColor | null }) => void;
   onByoyomiWarning: (color: PlayerColor, secondsRemaining: number) => void;
   onTimeout: (color: PlayerColor) => void;
+  onUrgentCountdown?: (state: UrgentCountdownState) => void;
 }
 
 export class GameClock {
@@ -29,6 +39,7 @@ export class GameClock {
   private timerId: number | null = null;
   private lastTimestamp = 0;
   private lastAnnouncedSecond: { [K in PlayerColor]: number } = { 1: -1, 2: -1 };
+  private lastUrgentSignature = '';
   private callbacks: ClockCallbacks;
 
   constructor(callbacks: ClockCallbacks) {
@@ -129,12 +140,20 @@ export class GameClock {
 
     if (!st.inByoyomi) {
       st.mainTimeLeft -= dt;
+      if (this.initialPeriods === 0) {
+        const ceilMain = Math.ceil(st.mainTimeLeft);
+        if (ceilMain >= 1 && ceilMain <= 10 && this.lastAnnouncedSecond[color] !== ceilMain) {
+          this.lastAnnouncedSecond[color] = ceilMain;
+          this.callbacks.onByoyomiWarning(color, ceilMain);
+        }
+      }
       if (st.mainTimeLeft <= 0) {
         const overflow = -st.mainTimeLeft;
         st.mainTimeLeft = 0;
         if (st.byoyomiPeriodsLeft > 0) {
           st.inByoyomi = true;
           st.byoyomiTimeLeft = Math.max(0.1, this.byoyomiDuration - overflow);
+          this.lastAnnouncedSecond[color] = -1;
         } else {
           this.stop();
           this.callbacks.onTimeout(color);
@@ -166,12 +185,70 @@ export class GameClock {
     this.emitTick();
   }
 
+  private computeUrgentState(): UrgentCountdownState {
+    if (!this.activeColor || this.unlimited) {
+      return {
+        active: false,
+        color: null,
+        secondsLeft: 0,
+        periodsLeft: 0,
+        totalWindowSeconds: 10,
+        isByoyomi: false,
+      };
+    }
+
+    const st = this.activeColor === BLACK ? this.black : this.white;
+    if (st.inByoyomi) {
+      const sec = Math.ceil(st.byoyomiTimeLeft);
+      if (sec >= 1 && sec <= 10) {
+        return {
+          active: true,
+          color: this.activeColor,
+          secondsLeft: sec,
+          periodsLeft: st.byoyomiPeriodsLeft,
+          totalWindowSeconds: Math.min(10, Math.max(1, this.byoyomiDuration)),
+          isByoyomi: true,
+        };
+      }
+    } else if (this.initialPeriods === 0) {
+      const sec = Math.ceil(st.mainTimeLeft);
+      if (sec >= 1 && sec <= 10) {
+        return {
+          active: true,
+          color: this.activeColor,
+          secondsLeft: sec,
+          periodsLeft: 0,
+          totalWindowSeconds: 10,
+          isByoyomi: false,
+        };
+      }
+    }
+
+    return {
+      active: false,
+      color: this.activeColor,
+      secondsLeft: 0,
+      periodsLeft: st.byoyomiPeriodsLeft,
+      totalWindowSeconds: 10,
+      isByoyomi: st.inByoyomi,
+    };
+  }
+
   private emitTick(): void {
     this.callbacks.onTick({
       black: { ...this.black },
       white: { ...this.white },
       activeColor: this.activeColor,
     });
+
+    if (this.callbacks.onUrgentCountdown) {
+      const urgent = this.computeUrgentState();
+      const sig = `${urgent.active}:${urgent.color}:${urgent.secondsLeft}:${urgent.periodsLeft}:${urgent.isByoyomi}`;
+      if (sig !== this.lastUrgentSignature) {
+        this.lastUrgentSignature = sig;
+        this.callbacks.onUrgentCountdown(urgent);
+      }
+    }
   }
 
   public formatClockText(color: PlayerColor): string {

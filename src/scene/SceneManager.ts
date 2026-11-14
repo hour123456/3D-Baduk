@@ -19,7 +19,12 @@ import {
 import { coordToLabel } from '../rules/GoEngine';
 import type { AISuggestion } from '../ai/MctsEngine';
 import { AcousticStoneAudioEngine } from '../audio/AcousticStoneAudioEngine';
-import type { LightingTheme, VisualQuality } from '../settings/SettingsManager';
+import type {
+  BoardGrainIntensity,
+  GridLineContrast,
+  LightingTheme,
+  VisualQuality,
+} from '../settings/SettingsManager';
 import { BoardGridMetrics, getBoardMetrics } from './ProceduralTextures';
 import { BuiltRoomAssets, buildTraditionalBadukRoom } from './GobanBuilder';
 import { StonePhysicsAnimator, createBiconvexStoneGeometry } from './StonePhysicsAnimator';
@@ -39,6 +44,8 @@ export interface SceneCallbacks {
   ) => { valid: boolean; reason?: string; showGhost: boolean; color: PlayerColor };
   onIntersectionClick: (x: number, y: number, pointerType?: string) => void;
   onHoverLeave: () => void;
+  isPointOccupied?: (x: number, y: number) => boolean;
+  isScoringPhase?: () => boolean;
 }
 
 export class SceneManager {
@@ -73,12 +80,22 @@ export class SceneManager {
   private lanternFill!: THREE.DirectionalLight;
 
   private showCoordinates = true;
+  private lightingTheme: LightingTheme = 'hanok_warm';
+  private lightingBrightness = 1.0;
+  private boardGrainIntensity: BoardGrainIntensity = 'classic';
+  private gridLineContrast: GridLineContrast = 'normal';
   private raycaster = new THREE.Raycaster();
   private pointerNdc = new THREE.Vector2(-99, -99);
   private pointerDownPos = new THREE.Vector2();
   private lastHoveredCoordKey = '';
   private lastBowlHoverMs = 0;
   private pointerDownOnBowl = false;
+  private pointerDownOnOccupiedStone = false;
+  private pointerDownBowlPoint: THREE.Vector3 | null = null;
+  private lastBowlDragPoint: THREE.Vector3 | null = null;
+  private pointerDownBoardPoint: THREE.Vector3 | null = null;
+  private lastBoardDragPoint: THREE.Vector3 | null = null;
+  private lastStoneNudgeMs = 0;
 
   // Touch guard & Magnifier Loupe state
   private activePointers = new Set<number>();
@@ -105,6 +122,7 @@ export class SceneManager {
   private forbiddenMarkerGroup: THREE.Group;
   private persistentForbiddenGroup = new THREE.Group();
   private hintGroup = new THREE.Group();
+  private tutorialTargetGroup = new THREE.Group();
   private winningLineGroup = new THREE.Group();
 
   private lastMoveMarker: THREE.Mesh;
@@ -159,7 +177,7 @@ export class SceneManager {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setSize(container.clientWidth, container.clientHeight);
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.06;
+    this.renderer.toneMappingExposure = 0.88;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.domElement.style.touchAction = 'none';
@@ -173,7 +191,7 @@ export class SceneManager {
     const pmrem = new THREE.PMREMGenerator(this.renderer);
     const roomEnv = new RoomEnvironment();
     this.scene.environment = pmrem.fromScene(roomEnv, 0.04).texture;
-    this.scene.environmentIntensity = 0.42;
+    this.scene.environmentIntensity = 0.24;
     roomEnv.dispose();
     pmrem.dispose();
 
@@ -319,6 +337,7 @@ export class SceneManager {
     this.scene.add(this.territoryGroup);
     this.scene.add(this.persistentForbiddenGroup);
     this.scene.add(this.hintGroup);
+    this.scene.add(this.tutorialTargetGroup);
     this.scene.add(this.winningLineGroup);
 
     // 6. Floating 2.6x Touch Magnifier Loupe Canvas (rendered seamlessly before frame swap)
@@ -354,7 +373,7 @@ export class SceneManager {
     this.composer.setSize(w, h);
 
     this.renderPass = new RenderPass(this.scene, this.activeCamera);
-    this.bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), 0.22, 0.5, 0.88);
+    this.bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), 0.11, 0.42, 0.98);
     this.outputPass = new OutputPass();
     this.smaaPass = new SMAAPass(
       w * this.renderer.getPixelRatio(),
@@ -371,10 +390,10 @@ export class SceneManager {
   }
 
   private setupLighting(): void {
-    this.hemiLight = new THREE.HemisphereLight(0xffe9c8, 0x3a2618, 0.68);
+    this.hemiLight = new THREE.HemisphereLight(0xffe9c8, 0x3a2618, 0.44);
     this.scene.add(this.hemiLight);
 
-    this.sunLight = new THREE.DirectionalLight(0xfff0d4, 2.25);
+    this.sunLight = new THREE.DirectionalLight(0xfff0d4, 1.35);
     this.sunLight.position.set(-3.6, 7.2, -3.8);
     this.sunLight.castShadow = true;
     this.sunLight.shadow.mapSize.set(2048, 2048);
@@ -389,7 +408,7 @@ export class SceneManager {
     this.sunLight.shadow.normalBias = 0.012;
     this.scene.add(this.sunLight);
 
-    this.lanternFill = new THREE.DirectionalLight(0xffd7a3, 0.72);
+    this.lanternFill = new THREE.DirectionalLight(0xffd7a3, 0.38);
     this.lanternFill.position.set(4.5, 4.2, 4.8);
     this.scene.add(this.lanternFill);
   }
@@ -449,41 +468,73 @@ export class SceneManager {
   }
 
   public setLightingTheme(theme: LightingTheme): void {
+    this.setLightingConfig(theme, this.lightingBrightness);
+  }
+
+  public setLightingConfig(theme: LightingTheme, brightness = 1.0): void {
+    this.lightingTheme = theme;
+    this.lightingBrightness = Math.max(0.5, Math.min(1.5, brightness));
+    const b = this.lightingBrightness;
+    const expScale = 0.72 + 0.28 * b;
+
     if (theme === 'studio_bright') {
       this.scene.background = new THREE.Color(0x282018);
       this.scene.fog = new THREE.FogExp2(0x282018, 0.022);
+      this.scene.environmentIntensity = 0.28 * b;
       this.hemiLight.color.setHex(0xffffff);
       this.hemiLight.groundColor.setHex(0x523c28);
-      this.hemiLight.intensity = 0.94;
+      this.hemiLight.intensity = 0.54 * b;
       this.sunLight.color.setHex(0xfff9ee);
-      this.sunLight.intensity = 2.65;
+      this.sunLight.intensity = 1.52 * b;
       this.lanternFill.color.setHex(0xffe8cb);
-      this.lanternFill.intensity = 0.92;
-      this.renderer.toneMappingExposure = 1.14;
+      this.lanternFill.intensity = 0.34 * b;
+      this.renderer.toneMappingExposure = 0.92 * expScale;
     } else if (theme === 'night_lantern') {
       this.scene.background = new THREE.Color(0x0c0806);
       this.scene.fog = new THREE.FogExp2(0x0c0806, 0.052);
+      this.scene.environmentIntensity = 0.18 * b;
       this.hemiLight.color.setHex(0xffcb8c);
       this.hemiLight.groundColor.setHex(0x20130c);
-      this.hemiLight.intensity = 0.45;
+      this.hemiLight.intensity = 0.28 * b;
       this.sunLight.color.setHex(0xffd9a0);
-      this.sunLight.intensity = 1.85;
+      this.sunLight.intensity = 0.92 * b;
       this.lanternFill.color.setHex(0xffb45c);
-      this.lanternFill.intensity = 0.85;
-      this.renderer.toneMappingExposure = 0.96;
+      this.lanternFill.intensity = 0.72 * b;
+      this.renderer.toneMappingExposure = 0.84 * expScale;
     } else {
       // 'hanok_warm'
       this.scene.background = new THREE.Color(0x16110c);
       this.scene.fog = new THREE.FogExp2(0x16110c, 0.036);
+      this.scene.environmentIntensity = 0.24 * b;
       this.hemiLight.color.setHex(0xffe9c8);
       this.hemiLight.groundColor.setHex(0x3a2618);
-      this.hemiLight.intensity = 0.68;
+      this.hemiLight.intensity = 0.44 * b;
       this.sunLight.color.setHex(0xfff0d4);
-      this.sunLight.intensity = 2.25;
+      this.sunLight.intensity = 1.35 * b;
       this.lanternFill.color.setHex(0xffd7a3);
-      this.lanternFill.intensity = 0.72;
-      this.renderer.toneMappingExposure = 1.06;
+      this.lanternFill.intensity = 0.38 * b;
+      this.renderer.toneMappingExposure = 0.88 * expScale;
     }
+
+    this.room.setLightingBrightness(b);
+  }
+
+  public setBoardVisualStyle(
+    grainIntensity: BoardGrainIntensity,
+    lineContrast: GridLineContrast
+  ): void {
+    if (
+      this.boardGrainIntensity === grainIntensity &&
+      this.gridLineContrast === lineContrast
+    ) {
+      return;
+    }
+    this.boardGrainIntensity = grainIntensity;
+    this.gridLineContrast = lineContrast;
+    this.room.updateBoardTop(this.metrics, this.showCoordinates, {
+      grainIntensity: this.boardGrainIntensity,
+      lineContrast: this.gridLineContrast,
+    });
   }
 
   public setTouchLoupeEnabled(enabled: boolean): void {
@@ -507,12 +558,16 @@ export class SceneManager {
 
   public setBoardSize(size: BoardSize): void {
     this.metrics = getBoardMetrics(size);
-    this.room.updateBoardTop(this.metrics, this.showCoordinates);
+    this.room.updateBoardTop(this.metrics, this.showCoordinates, {
+      grainIntensity: this.boardGrainIntensity,
+      lineContrast: this.gridLineContrast,
+    });
     this.stoneAnimator.setMetrics(this.metrics);
     this.clearHover();
     this.setPendingMove(null);
     this.clearTerritoryMarkers();
     this.clearMoveNumbers();
+    this.clearTutorialTargets();
     this.renderPersistentForbiddenPoints([]);
     this.renderHintSuggestions([]);
     this.renderOmokWinningLine(null);
@@ -521,14 +576,20 @@ export class SceneManager {
 
   public toggleCoordinates(): boolean {
     this.showCoordinates = !this.showCoordinates;
-    this.room.updateBoardTop(this.metrics, this.showCoordinates);
+    this.room.updateBoardTop(this.metrics, this.showCoordinates, {
+      grainIntensity: this.boardGrainIntensity,
+      lineContrast: this.gridLineContrast,
+    });
     return this.showCoordinates;
   }
 
   public setCoordinatesVisible(visible: boolean): void {
     if (this.showCoordinates !== visible) {
       this.showCoordinates = visible;
-      this.room.updateBoardTop(this.metrics, this.showCoordinates);
+      this.room.updateBoardTop(this.metrics, this.showCoordinates, {
+        grainIntensity: this.boardGrainIntensity,
+        lineContrast: this.gridLineContrast,
+      });
     }
   }
 
@@ -913,6 +974,79 @@ export class SceneManager {
     }
   }
 
+  public renderTutorialTargets(
+    targets: Array<{ x: number; y: number; kind: 'target' | 'warning' | 'info' }>
+  ): void {
+    this.clearTutorialTargets();
+    if (!targets || targets.length === 0) return;
+
+    const r = this.metrics.stoneRadius;
+    for (const t of targets) {
+      const pos = this.stoneAnimator.gridToWorld(t.x, t.y);
+      const colorHex =
+        t.kind === 'target' ? 0x4be096 : t.kind === 'warning' ? 0xe64833 : 0x67b6ff;
+
+      if (t.kind === 'warning') {
+        const mat = new THREE.MeshBasicMaterial({
+          color: colorHex,
+          transparent: true,
+          opacity: 0.9,
+          side: THREE.DoubleSide,
+          depthTest: false,
+        });
+        const b1 = new THREE.Mesh(new THREE.PlaneGeometry(r * 1.15, r * 0.24), mat);
+        b1.rotation.x = -Math.PI / 2;
+        b1.rotation.z = Math.PI / 4;
+        b1.position.set(pos.x, 0.011, pos.z);
+        b1.renderOrder = 15;
+        const b2 = new THREE.Mesh(new THREE.PlaneGeometry(r * 1.15, r * 0.24), mat.clone());
+        b2.rotation.x = -Math.PI / 2;
+        b2.rotation.z = -Math.PI / 4;
+        b2.position.set(pos.x, 0.011, pos.z);
+        b2.renderOrder = 15;
+        this.tutorialTargetGroup.add(b1, b2);
+      } else {
+        const outer = new THREE.Mesh(
+          new THREE.RingGeometry(r * 0.72, r * 1.04, 32),
+          new THREE.MeshBasicMaterial({
+            color: colorHex,
+            transparent: true,
+            opacity: 0.92,
+            side: THREE.DoubleSide,
+            depthTest: false,
+          })
+        );
+        outer.rotation.x = -Math.PI / 2;
+        outer.position.set(pos.x, 0.011, pos.z);
+        outer.renderOrder = 15;
+
+        const centerDot = new THREE.Mesh(
+          new THREE.CircleGeometry(r * 0.28, 24),
+          new THREE.MeshBasicMaterial({
+            color: colorHex,
+            transparent: true,
+            opacity: 0.85,
+            side: THREE.DoubleSide,
+            depthTest: false,
+          })
+        );
+        centerDot.rotation.x = -Math.PI / 2;
+        centerDot.position.set(pos.x, 0.012, pos.z);
+        centerDot.renderOrder = 15;
+
+        this.tutorialTargetGroup.add(outer, centerDot);
+      }
+    }
+  }
+
+  public clearTutorialTargets(): void {
+    while (this.tutorialTargetGroup.children.length > 0) {
+      const ch = this.tutorialTargetGroup.children.pop() as THREE.Mesh;
+      ch.geometry.dispose();
+      if (ch.material instanceof THREE.Material) ch.material.dispose();
+    }
+  }
+
   public clearTerritoryMarkers(): void {
     while (this.territoryGroup.children.length > 0) {
       this.territoryGroup.children.pop();
@@ -960,6 +1094,8 @@ export class SceneManager {
       this.clearHover();
       this.touchDraggingLoupe = false;
       this.loupeCoord = null;
+      this.lastBoardDragPoint = null;
+      this.lastBowlDragPoint = null;
       this.callbacks.onHoverLeave();
     });
 
@@ -974,6 +1110,8 @@ export class SceneManager {
         this.touchDraggingLoupe = false;
         this.loupeCoord = null;
         this.pointerDownOnBowl = false;
+        this.pointerDownOnOccupiedStone = false;
+        this.controls.enabled = true;
         return;
       }
 
@@ -983,6 +1121,27 @@ export class SceneManager {
         false
       );
       this.pointerDownOnBowl = bowlHits.length > 0;
+      if (bowlHits.length > 0) {
+        this.pointerDownBowlPoint = bowlHits[0].point.clone();
+        this.lastBowlDragPoint = bowlHits[0].point.clone();
+        this.controls.enabled = false;
+      } else {
+        this.pointerDownBowlPoint = null;
+        this.lastBowlDragPoint = null;
+      }
+
+      const boardHit = this.raycastBoardPointAndCoord();
+      if (boardHit) {
+        this.pointerDownBoardPoint = boardHit.point.clone();
+        this.lastBoardDragPoint = boardHit.point.clone();
+        this.pointerDownOnOccupiedStone = Boolean(
+          this.callbacks.isPointOccupied?.(boardHit.coord.x, boardHit.coord.y)
+        );
+      } else {
+        this.pointerDownBoardPoint = null;
+        this.lastBoardDragPoint = null;
+        this.pointerDownOnOccupiedStone = false;
+      }
 
       if (e.pointerType === 'touch' && this.touchLoupeEnabled) {
         const coord = this.handlePointerHover();
@@ -997,6 +1156,8 @@ export class SceneManager {
       this.activePointers.delete(e.pointerId);
       if (this.activePointers.size === 0) {
         this.pointerDownOnBowl = false;
+        this.pointerDownOnOccupiedStone = false;
+        this.controls.enabled = true;
       }
       this.touchDraggingLoupe = false;
       this.loupeCoord = null;
@@ -1011,7 +1172,26 @@ export class SceneManager {
 
       const dragThreshold = e.pointerType === 'touch' ? 14 : 7;
       const movedDist = Math.hypot(e.clientX - this.pointerDownPos.x, e.clientY - this.pointerDownPos.y);
-      if (movedDist > dragThreshold) return;
+      if (movedDist > dragThreshold) {
+        // Gentle directional flick when finishing a drag gesture inside a bowl
+        if (this.lastBowlDragPoint && this.pointerDownBowlPoint) {
+          this.updateNdcFromClient(e.clientX, e.clientY);
+          this.raycaster.setFromCamera(this.pointerNdc, this.activeCamera);
+          const bowlHits = this.raycaster.intersectObjects(
+            [this.room.blackBowl.bowlCollider, this.room.whiteBowl.bowlCollider],
+            false
+          );
+          if (bowlHits.length > 0) {
+            const side = bowlHits[0].object.userData.bowlSide as 'black' | 'white';
+            const dx = bowlHits[0].point.x - this.pointerDownBowlPoint.x;
+            const dz = bowlHits[0].point.z - this.pointerDownBowlPoint.z;
+            if (Math.hypot(dx, dz) > 0.02) {
+              this.stoneAnimator.stirBowl(side, 0.9, true, dx, dz);
+            }
+          }
+        }
+        return;
+      }
 
       this.updateNdcFromClient(e.clientX, e.clientY);
       this.handlePointerClick(e.pointerType);
@@ -1033,7 +1213,7 @@ export class SceneManager {
     });
   }
 
-  private raycastBoardIntersection(): Coord | null {
+  private raycastBoardPointAndCoord(): { coord: Coord; point: THREE.Vector3 } | null {
     this.raycaster.setFromCamera(this.pointerNdc, this.activeCamera);
     const hits = this.raycaster.intersectObject(this.room.gobanTopMesh, false);
     if (hits.length === 0) return null;
@@ -1051,7 +1231,11 @@ export class SceneManager {
     if (Math.abs(fx - gx) > 0.46 || Math.abs(fy - gy) > 0.46) {
       return null;
     }
-    return { x: gx, y: gy };
+    return { coord: { x: gx, y: gy }, point: pt };
+  }
+
+  private raycastBoardIntersection(): Coord | null {
+    return this.raycastBoardPointAndCoord()?.coord ?? null;
   }
 
   private handlePointerHover(): Coord | null {
@@ -1063,12 +1247,23 @@ export class SceneManager {
     );
     if (bowlHits.length > 0) {
       const side = bowlHits[0].object.userData.bowlSide as 'black' | 'white';
-      // Only rattle bowl stones while actively pressing/dragging on the bowl itself
+      const hitPt = bowlHits[0].point;
+      // Rattle bowl stones strictly along the direction the user drags/pushes inside the bowl
       if (this.pointerDownOnBowl && this.activePointers.size === 1) {
         const now = performance.now();
-        if (now - this.lastBowlHoverMs > 180) {
-          this.lastBowlHoverMs = now;
-          this.stoneAnimator.stirBowl(side, 0.58, true);
+        const prev = this.lastBowlDragPoint;
+        if (prev) {
+          const dx = hitPt.x - prev.x;
+          const dz = hitPt.z - prev.z;
+          const moveDist = Math.hypot(dx, dz);
+          if (moveDist > 0.025 && now - this.lastBowlHoverMs > 85) {
+            this.lastBowlHoverMs = now;
+            this.lastBowlDragPoint = hitPt.clone();
+            const strength = Math.max(0.45, Math.min(1.15, moveDist * 7.5));
+            this.stoneAnimator.stirBowl(side, strength, true, dx, dz);
+          }
+        } else {
+          this.lastBowlDragPoint = hitPt.clone();
         }
       }
       this.renderer.domElement.style.cursor = 'pointer';
@@ -1076,13 +1271,34 @@ export class SceneManager {
       return null;
     }
 
-    const coord = this.raycastBoardIntersection();
-    if (!coord) {
+    const hit = this.raycastBoardPointAndCoord();
+    if (!hit) {
+      this.lastBoardDragPoint = null;
       this.renderer.domElement.style.cursor = 'default';
       this.clearHover();
       this.callbacks.onHoverLeave();
       return null;
     }
+
+    const { coord, point } = hit;
+    const isScoring = Boolean(this.callbacks.isScoringPhase?.());
+    const isOccupied = Boolean(this.callbacks.isPointOccupied?.(coord.x, coord.y));
+
+    if (!isScoring && isOccupied) {
+      const prev = this.lastBoardDragPoint;
+      if (prev) {
+        const dx = point.x - prev.x;
+        const dz = point.z - prev.z;
+        const dist = Math.hypot(dx, dz);
+        const now = performance.now();
+        if (dist > 0.014 && now - this.lastStoneNudgeMs > 65) {
+          this.lastStoneNudgeMs = now;
+          const strength = Math.max(0.4, Math.min(1.35, dist * 9.5));
+          this.stoneAnimator.nudgeBoardStone(coord.x, coord.y, dx, dz, strength);
+        }
+      }
+    }
+    this.lastBoardDragPoint = point.clone();
 
     const key = `${coord.x},${coord.y}`;
     const info = this.callbacks.onIntersectionHover(coord.x, coord.y);
@@ -1132,13 +1348,50 @@ export class SceneManager {
     );
     if (bowlHits.length > 0) {
       const side = bowlHits[0].object.userData.bowlSide as 'black' | 'white';
-      this.stoneAnimator.stirBowl(side, 1.05, true);
+      const anchor = side === 'black' ? this.room.blackBowl : this.room.whiteBowl;
+      const hitPt = bowlHits[0].point;
+
+      let dirX = 0;
+      let dirZ = 0;
+      if (this.pointerDownBowlPoint) {
+        const swipeDx = hitPt.x - this.pointerDownBowlPoint.x;
+        const swipeDz = hitPt.z - this.pointerDownBowlPoint.z;
+        if (Math.hypot(swipeDx, swipeDz) > 0.025) {
+          dirX = swipeDx;
+          dirZ = swipeDz;
+        }
+      }
+      if (Math.hypot(dirX, dirZ) <= 0.025) {
+        // Push stones inward from the point on the bowl that the user poked
+        dirX = anchor.bowlCenter.x - hitPt.x;
+        dirZ = anchor.bowlCenter.z - hitPt.z;
+      }
+      this.stoneAnimator.stirBowl(side, 0.95, true, dirX, dirZ);
       return;
     }
 
-    const coord = this.raycastBoardIntersection();
-    if (coord) {
-      this.callbacks.onIntersectionClick(coord.x, coord.y, pointerType);
+    const hit = this.raycastBoardPointAndCoord();
+    if (hit) {
+      const isScoring = Boolean(this.callbacks.isScoringPhase?.());
+      const isOccupied = Boolean(this.callbacks.isPointOccupied?.(hit.coord.x, hit.coord.y));
+      if (!isScoring && (isOccupied || this.pointerDownOnOccupiedStone)) {
+        const stonePos = this.stoneAnimator.gridToWorld(hit.coord.x, hit.coord.y);
+        let dirX = stonePos.x - hit.point.x;
+        let dirZ = stonePos.z - hit.point.z;
+        if (this.pointerDownBoardPoint) {
+          const swipeX = hit.point.x - this.pointerDownBoardPoint.x;
+          const swipeZ = hit.point.z - this.pointerDownBoardPoint.z;
+          if (Math.hypot(swipeX, swipeZ) > 0.015) {
+            dirX = swipeX;
+            dirZ = swipeZ;
+          }
+        }
+        if (Math.hypot(dirX, dirZ) < 1e-4) {
+          dirZ = -1;
+        }
+        this.stoneAnimator.nudgeBoardStone(hit.coord.x, hit.coord.y, dirX, dirZ, 0.85);
+      }
+      this.callbacks.onIntersectionClick(hit.coord.x, hit.coord.y, pointerType);
     }
   }
 

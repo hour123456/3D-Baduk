@@ -33,6 +33,7 @@ export interface StonePhysicsBody {
   aoAlpha: number;
   rippleAge: number; // < 0 means inactive, >= 0 expands and fades
   hasMoved: boolean;
+  nudgeAllowance?: number;
 }
 
 export interface BowlPhysicsParticle {
@@ -198,9 +199,9 @@ export class StonePhysicsWorld {
         vz: 0,
         rotX: signZ * 0.16,
         rotY: Math.random() * Math.PI * 2,
-        rotZ: (Math.random() - 0.5) * 0.12,
+        rotZ: 0,
         angVx: -signZ * 1.4,
-        angVz: (Math.random() - 0.5) * 1.2,
+        angVz: 0,
         radius,
         halfHeight,
         motionStyle: 'classic_bowl',
@@ -238,12 +239,12 @@ export class StonePhysicsWorld {
       vx: (restX - startX) / flightDuration,
       vy: -2.4,
       vz: (restZ - startZ) / flightDuration,
-      // Held between index & middle fingertip: slight forward/side rim pitch
+      // Held between index & middle fingertip: slight forward rim pitch without sideways wobble
       rotX: signZ * 0.34,
       rotY: Math.random() * Math.PI * 2,
-      rotZ: (Math.random() > 0.5 ? 1 : -1) * 0.16,
+      rotZ: 0,
       angVx: -signZ * 3.8,
-      angVz: (Math.random() - 0.5) * 2.4,
+      angVz: 0,
       radius,
       halfHeight,
       motionStyle: 'realistic',
@@ -329,9 +330,9 @@ export class StonePhysicsWorld {
           s.vx = (s.restX - s.startPosX) * 0.55;
           s.vy = -2.35 * (0.35 + 0.65 * intensity);
           s.vz = (s.restZ - s.startPosZ) * 0.55;
-          // Impart belly-slap counter-rocking torque
-          s.angVx = (s.color === BLACK ? 1 : -1) * 9.5 * (0.4 + 0.6 * intensity);
-          s.angVz = (Math.random() - 0.5) * 6.0 * intensity;
+          // Impart clean forward belly-slap torque (zero sideways spinning)
+          s.angVx = (s.color === BLACK ? 1 : -1) * 8.5 * (0.4 + 0.6 * intensity);
+          s.angVz = 0;
           s.impactFired = true;
           s.rippleAge = 0;
           s.aoAlpha = 1;
@@ -460,17 +461,22 @@ export class StonePhysicsWorld {
         s.rotX += s.angVx * subDt;
         s.rotZ += s.angVz * subDt;
 
+        if (s.nudgeAllowance && s.nudgeAllowance > 0) {
+          s.nudgeAllowance = Math.max(0, s.nudgeAllowance - subDt * 1.35);
+        }
+
         // Horizontal home restoring force (keeps grid coordinates legible) + Coulomb sliding friction
         const dx = s.restX - s.x;
         const dz = s.restZ - s.z;
-        const anchorK = 36;
+        const nudgeRatio = s.nudgeAllowance ?? 0;
+        const anchorK = nudgeRatio > 0.05 ? 20 : 36;
         s.vx += dx * anchorK * subDt;
         s.vz += dz * anchorK * subDt;
 
         const speed = Math.hypot(s.vx, s.vz);
         if (speed > 0.0005) {
           // Coulomb deceleration + viscous damping
-          const drag = Math.exp(-15.5 * subDt);
+          const drag = Math.exp(-13.5 * subDt);
           s.vx *= drag;
           s.vz *= drag;
         } else if (Math.hypot(dx, dz) < 0.0008) {
@@ -483,10 +489,10 @@ export class StonePhysicsWorld {
         s.x += s.vx * subDt;
         s.z += s.vz * subDt;
 
-        // Clamp horizontal drift strictly inside 11% of stone radius so intersection alignment stays crisp
+        // Clamp horizontal drift strictly inside intersection radius (allows wider temporary tilt when touched)
         const driftX = s.x - s.restX;
         const driftZ = s.z - s.restZ;
-        const maxDrift = s.radius * 0.11;
+        const maxDrift = s.radius * (0.11 + 0.17 * nudgeRatio);
         const driftDist = Math.hypot(driftX, driftZ);
         if (driftDist > maxDrift) {
           const clampScale = maxDrift / driftDist;
@@ -513,6 +519,36 @@ export class StonePhysicsWorld {
         }
       }
     }
+  }
+
+  /**
+   * Nudges a single resting board stone strictly along (dirX, dirZ) when touched or brushed.
+   */
+  public nudgeStone(
+    stone: StonePhysicsBody,
+    dirX: number,
+    dirZ: number,
+    strength = 1.0
+  ): boolean {
+    if (stone.flightActive) return false;
+    const len = Math.hypot(dirX, dirZ);
+    if (len < 1e-4) return false;
+
+    const nx = dirX / len;
+    const nz = dirZ / len;
+    const scale =
+      Math.max(0.2, Math.min(1.8, strength)) *
+      Math.max(0.45, this.getIntensityScale());
+
+    stone.vx = Math.max(-1.6, Math.min(1.6, stone.vx + nx * 0.48 * scale));
+    stone.vz = Math.max(-1.6, Math.min(1.6, stone.vz + nz * 0.48 * scale));
+    stone.vy = Math.max(stone.vy, 0.085 * scale);
+    // Roll/tilt forward in the pushed direction (Right-hand rule: +rotX tilts +Z, -rotZ tilts +X)
+    stone.angVx += nz * 8.2 * scale;
+    stone.angVz -= nx * 8.2 * scale;
+    stone.nudgeAllowance = 1.0;
+    stone.hasMoved = true;
+    return true;
   }
 
   /**

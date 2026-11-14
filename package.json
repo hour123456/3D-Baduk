@@ -1,8 +1,8 @@
 {
   "name": "baduk-3d-master",
   "private": true,
-  "version": "3.0.0",
-  "description": "고품격 3D 정통 바둑·오목 게임 — 수담(手談) v3.0 (실시간 멀티·관전·초정밀 물리·장인 마감)",
+  "version": "4.0.0",
+  "description": "고품격 3D 정통 바둑·오목 게임 — 수담(手談) v4.0 (실시간 멀티·관전·초정밀 물리·입문 튜토리얼·모바일 전용 UI)",
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite --port 5173",
@@ -22,7 +22,8 @@
     },
     "files": [
       "dist/**/*",
-      "electron/**/*"
+      "electron/main.cjs",
+      "electron/preload.cjs"
     ],
     "win": {
       "target": [

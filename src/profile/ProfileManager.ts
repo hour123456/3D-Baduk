@@ -1,9 +1,11 @@
 export interface PlayerProfile {
   clientId: string;
+  accountId: string;
   nickname: string;
 }
 
 const LOCAL_STORAGE_KEY = 'sudam_player_profile_v1';
+const LOCAL_ACCOUNT_KEY = 'sudam_account_id_v1';
 const SESSION_CLIENT_KEY = 'sudam_tab_client_id_v1';
 const SESSION_NICK_KEY = 'sudam_tab_nickname_v1';
 
@@ -27,6 +29,15 @@ export function generateRandomClientId(): string {
   return `sd_${ts}_${rand}`;
 }
 
+export function generateRandomAccountId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `acc_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
+  }
+  const rand = Math.random().toString(36).slice(2, 10);
+  const ts = Date.now().toString(36);
+  return `acc_${ts}_${rand}`;
+}
+
 export function generateDefaultNickname(): string {
   const prefix = BADUK_TITLES[Math.floor(Math.random() * BADUK_TITLES.length)];
   const num = Math.floor(1000 + Math.random() * 9000);
@@ -35,12 +46,31 @@ export function generateDefaultNickname(): string {
 
 export class ProfileManager {
   private clientId: string;
+  private accountId: string;
   private nickname: string;
   private listeners: Set<(nickname: string) => void> = new Set();
 
   constructor() {
     this.clientId = this.loadOrCreateClientId();
+    this.accountId = this.loadOrCreateAccountId();
     this.nickname = this.loadOrCreateNickname();
+  }
+
+  private loadOrCreateAccountId(): string {
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        const existing = window.localStorage.getItem(LOCAL_ACCOUNT_KEY);
+        if (existing && existing.startsWith('acc_')) {
+          return existing;
+        }
+        const created = generateRandomAccountId();
+        window.localStorage.setItem(LOCAL_ACCOUNT_KEY, created);
+        return created;
+      }
+    } catch {
+      // Ignore storage access errors
+    }
+    return generateRandomAccountId();
   }
 
   private loadOrCreateClientId(): string {
@@ -97,12 +127,17 @@ export class ProfileManager {
   public getProfile(): PlayerProfile {
     return {
       clientId: this.clientId,
+      accountId: this.accountId,
       nickname: this.nickname,
     };
   }
 
   public getClientId(): string {
     return this.clientId;
+  }
+
+  public getAccountId(): string {
+    return this.accountId;
   }
 
   public getNickname(): string {

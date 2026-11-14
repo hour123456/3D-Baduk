@@ -13,6 +13,7 @@ import {
   ScoreBreakdown,
 } from '../rules/types';
 import {
+  AdminBanEntry,
   CreateRoomOptions,
   OnlineScoreAgreementState,
   OnlineSessionPhase,
@@ -22,15 +23,22 @@ import {
   QuickMatchSizePref,
   RoomSummary,
 } from '../online/types';
+import { formatBanDurationRemaining } from '../online/adminSecurity';
+import { UrgentCountdownState } from '../rules/clock';
 import {
+  BoardGrainIntensity,
+  GridLineContrast,
   LightingTheme,
   PhysicsIntensity,
   PlacementInputMode,
+  resolveEffectiveUiLayout,
   StoneMotionStyle,
+  UILayoutMode,
   UserSettings,
   VisualQuality,
 } from '../settings/SettingsManager';
 import { CameraPreset } from '../scene/SceneManager';
+import { TutorialLesson, TutorialStep } from '../tutorial/TutorialCurriculum';
 
 export interface UIActions {
   onStartNewGame: (config: GameConfig) => void;
@@ -76,6 +84,14 @@ export interface UIActions {
   onLeaveOnlineMatch: () => void;
   onSendOnlineChat: (text: string) => void;
   onRequestOnlineRematch: () => void;
+
+  // Beginner Tutorial & Learning actions
+  onOpenTutorialModal: () => void;
+  onStartTutorialLesson: (lessonId: string) => void;
+  onToggleTutorialHint: () => void;
+  onRetryTutorialStep: () => void;
+  onTutorialNextStep: () => void;
+  onExitTutorial: () => void;
 }
 
 const AI_LEVEL_DESCRIPTIONS: Record<AIDifficulty, string> = {
@@ -292,6 +308,68 @@ export class UIManager {
   private toastContainerEl!: HTMLElement;
   private hasStartedOnce = false;
 
+  // Byoyomi 10s urgent visual alert
+  private byoyomiPulseEl!: HTMLElement;
+  private byoyomiBannerEl!: HTMLElement;
+  private byoyomiBannerNumEl!: HTMLElement;
+  private byoyomiBannerLabelEl!: HTMLElement;
+  private byoyomiBannerSubEl!: HTMLElement;
+  private lastBannerCount: number | null = null;
+
+  // Beginner Tutorial Coach & Selector
+  private tutorialCoachEl!: HTMLElement;
+  private tutorialCoachTitleEl!: HTMLElement;
+  private tutorialCoachStepEl!: HTMLElement;
+  private tutorialCoachTextEl!: HTMLElement;
+  private tutorialCoachFeedbackEl!: HTMLElement;
+  private tutorialCoachHintEl!: HTMLElement;
+  private tutorialNextBtn!: HTMLButtonElement;
+  private tutorialModalEl!: HTMLElement;
+  private tutorialLessonGridEl!: HTMLElement;
+  private tutorialProgressSummaryEl!: HTMLElement;
+
+  // Account/IP Ban Blocker Modal
+  private banModalEl!: HTMLElement;
+  private banModalBodyEl!: HTMLElement;
+
+  // Dedicated Mobile HUD Elements
+  private mobTitleEl!: HTMLElement;
+  private mobOnlineBadgeEl!: HTMLElement;
+  private mobLeaveOnlineBtn!: HTMLButtonElement;
+  private mobOppCardEl!: HTMLElement;
+  private mobOppDotEl!: HTMLElement;
+  private mobOppNameEl!: HTMLElement;
+  private mobOppCapEl!: HTMLElement;
+  private mobOppClockEl!: HTMLElement;
+  private mobSelfCardEl!: HTMLElement;
+  private mobSelfDotEl!: HTMLElement;
+  private mobSelfNameEl!: HTMLElement;
+  private mobSelfCapEl!: HTMLElement;
+  private mobSelfClockEl!: HTMLElement;
+  private mobCoordBadgeEl!: HTMLElement;
+  private mobPassBtn!: HTMLButtonElement;
+  private mobUndoBtn!: HTMLButtonElement;
+  private mobAiHintBtn!: HTMLButtonElement;
+  private mobChatBtn!: HTMLButtonElement;
+  private mobChatBadgeEl!: HTMLElement;
+  private mobMoreSheetEl!: HTMLElement;
+  private mobSheetCoordsBtn!: HTMLButtonElement;
+  private mobSheetNumsBtn!: HTMLButtonElement;
+  private mobSheetHintBtn!: HTMLButtonElement;
+  private mobSheetResignBtn!: HTMLButtonElement;
+  private mobSheetResultBtn!: HTMLButtonElement;
+  private lastHudConfig?: GameConfig;
+  private lastHudStatus?: {
+    turn: PlayerColor;
+    phase: GamePhase;
+    captures: { black: number; white: number };
+    aiThinking: boolean;
+    moveCount: number;
+    mode?: 'ai' | 'local2p' | 'online';
+    humanColor?: PlayerColor;
+    gameType?: GameType;
+  };
+
   constructor(
     root: HTMLElement,
     initialNickname: string,
@@ -354,8 +432,37 @@ export class UIManager {
             </div>
             <div class="divider-v"></div>
             <button class="btn btn-sm btn-gold" id="btn-open-setup">새 대국 · 온라인</button>
-            <button class="btn btn-sm" id="btn-open-options" title="모션 · 수직뷰 · 모바일 입력 · 물리 · 조명 설정">⚙ 옵션</button>
+            <button class="btn btn-sm btn-tutorial-nav" id="btn-open-tutorial" title="초보자를 위한 바둑·오목 입문 튜토리얼">입문 학습</button>
+            <button class="btn btn-sm" id="btn-open-options" title="조명 밝기 · 반상 선명도 · 모션 · 모바일 UI 설정">⚙ 옵션</button>
             <button class="btn btn-sm" id="btn-fullscreen" title="전체화면 (F11)">전체화면</button>
+          </div>
+        </div>
+
+        <!-- Dedicated Mobile Top Bar (Shown only when uiLayout = mobile) -->
+        <div class="mobile-top-bar mobile-only interactive" id="mobile-top-bar">
+          <div class="mob-top-left">
+            <span class="mob-brand-seal">手談</span>
+            <span class="mob-title" id="mob-ui-title">수담 3D</span>
+            <span class="mob-online-badge hidden" id="mob-online-badge">온라인</span>
+            <button class="btn btn-sm btn-danger hidden" id="mob-btn-leave-online">나가기</button>
+          </div>
+          <div class="mob-top-actions">
+            <button class="btn btn-sm btn-tutorial-nav" id="mob-btn-tutorial">학습</button>
+            <button class="btn btn-sm" id="mob-btn-vview" data-cam="true_top">수직뷰</button>
+            <button class="btn btn-sm btn-gold" id="mob-btn-setup">대국</button>
+            <button class="btn btn-sm" id="mob-btn-options">⚙</button>
+          </div>
+        </div>
+
+        <!-- Dedicated Mobile Slim Opponent Strip -->
+        <div class="mobile-player-strip opp mobile-only" id="mobile-opponent-bar">
+          <div class="mob-player-left">
+            <span class="stone-icon white mob-dot" id="mob-opp-dot"></span>
+            <span class="mob-player-name" id="mob-opp-name">백 대국자</span>
+          </div>
+          <div class="mob-player-right">
+            <span class="mob-cap-pill">사석 <strong id="mob-opp-cap">0</strong></span>
+            <span class="mob-clock-pill" id="mob-opp-clock">무제한</span>
           </div>
         </div>
 
@@ -488,6 +595,83 @@ export class UIManager {
           <button class="btn" id="btn-open-sgf">기보 열기</button>
           <button class="btn btn-gold hidden" id="btn-show-result">계가 결과표</button>
         </div>
+
+        <!-- Dedicated Mobile Slim Self Strip -->
+        <div class="mobile-player-strip self mobile-only" id="mobile-self-bar">
+          <div class="mob-player-left">
+            <span class="stone-icon black mob-dot" id="mob-self-dot"></span>
+            <span class="mob-player-name" id="mob-self-name">흑 대국자</span>
+            <span class="mob-coord-badge" id="mob-coord-badge">대기</span>
+          </div>
+          <div class="mob-player-right">
+            <span class="mob-cap-pill">사석 <strong id="mob-self-cap">0</strong></span>
+            <span class="mob-clock-pill" id="mob-self-clock">무제한</span>
+          </div>
+        </div>
+
+        <!-- Dedicated Mobile Thumb-Friendly 5-Button Dock -->
+        <div class="mobile-bottom-dock mobile-only interactive" id="mobile-bottom-dock">
+          <button class="btn mob-dock-btn" id="mob-btn-pass">한수쉼</button>
+          <button class="btn mob-dock-btn" id="mob-btn-undo">무르기</button>
+          <button class="btn mob-dock-btn btn-ai-hint" id="mob-btn-ai-hint">AI추천</button>
+          <button class="btn mob-dock-btn hidden" id="mob-btn-chat">
+            <span>채팅</span>
+            <span class="chat-unread-badge hidden" id="mob-chat-unread-badge">0</span>
+          </button>
+          <button class="btn mob-dock-btn" id="mob-btn-more">더보기 ▴</button>
+        </div>
+
+        <!-- Mobile Slide-up More Action Sheet -->
+        <div class="mobile-more-sheet mobile-only interactive hidden" id="mobile-more-sheet">
+          <div class="mob-sheet-header">
+            <span>대국 보조 · 시점 · 반상 설정</span>
+            <button class="btn btn-sm" id="mob-btn-close-more">닫기</button>
+          </div>
+          <div class="mob-sheet-grid">
+            <button class="btn btn-sm" data-cam="true_top">수직뷰</button>
+            <button class="btn btn-sm" data-cam="default">기본뷰</button>
+            <button class="btn btn-sm" data-cam="cinema">입체뷰</button>
+            <button class="btn btn-sm" id="mob-sheet-coords">좌표 눈금</button>
+            <button class="btn btn-sm" id="mob-sheet-nums">수순 번호</button>
+            <button class="btn btn-sm" id="mob-sheet-hint">형세 보기</button>
+            <button class="btn btn-sm" id="mob-sheet-stir">잘그락</button>
+            <button class="btn btn-sm" id="mob-sheet-nick">닉네임</button>
+            <button class="btn btn-sm" id="mob-sheet-save-sgf">SGF 저장</button>
+            <button class="btn btn-sm" id="mob-sheet-open-sgf">기보 열기</button>
+            <button class="btn btn-sm btn-gold hidden" id="mob-sheet-result">계가 결과</button>
+            <button class="btn btn-sm btn-danger" id="mob-sheet-resign">기권하기</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Byoyomi <= 10s Non-Blocking Edge Pulse & Center-Bottom Countdown Banner -->
+      <div class="byoyomi-edge-pulse hidden" id="byoyomi-edge-pulse" aria-hidden="true"></div>
+      <div class="byoyomi-countdown-banner hidden" id="byoyomi-countdown-banner" aria-live="polite">
+        <div class="byoyomi-count-num" id="byoyomi-count-num">10</div>
+        <div class="byoyomi-count-copy">
+          <div class="byoyomi-count-title" id="byoyomi-count-title">초읽기 카운트다운</div>
+          <div class="byoyomi-count-sub" id="byoyomi-count-sub">남은 초읽기 3회</div>
+        </div>
+      </div>
+
+      <!-- Interactive Tutorial Coach Panel (Non-Blocking) -->
+      <div class="tutorial-coach-panel interactive hidden" id="tutorial-coach-panel">
+        <div class="tut-coach-header">
+          <div>
+            <div class="tut-coach-badge">초보자 입문 튜토리얼</div>
+            <h4 class="tut-coach-title" id="tut-coach-title">단수와 따내기</h4>
+          </div>
+          <span class="tut-coach-step" id="tut-coach-step">1 / 3단계</span>
+        </div>
+        <p class="tut-coach-text" id="tut-coach-text"></p>
+        <div class="tut-coach-feedback hidden" id="tut-coach-feedback"></div>
+        <div class="tut-coach-hint hidden" id="tut-coach-hint"></div>
+        <div class="tut-coach-actions">
+          <button class="btn btn-sm" id="btn-tut-hint">힌트 보기</button>
+          <button class="btn btn-sm" id="btn-tut-retry">단계 초기화</button>
+          <button class="btn btn-sm btn-gold hidden" id="btn-tut-next">다음 단계 ▶</button>
+          <button class="btn btn-sm btn-danger" id="btn-tut-exit">학습 종료</button>
+        </div>
       </div>
 
       <!-- Toast Notifications -->
@@ -498,7 +682,10 @@ export class UIManager {
         <div class="modal-card modal-wide">
           <div class="modal-header">
             <h2>대국 설정 — 수담(手談)</h2>
-            <button class="btn btn-sm hidden" id="btn-close-setup">닫기</button>
+            <div class="modal-header-actions">
+              <button class="btn btn-sm btn-tutorial-nav" id="btn-setup-open-tutorial">📖 초보자 입문·학습</button>
+              <button class="btn btn-sm hidden" id="btn-close-setup">닫기</button>
+            </div>
           </div>
 
           <!-- Persistent Player Nickname Bar -->
@@ -1016,7 +1203,38 @@ export class UIManager {
           </div>
 
           <div class="options-section">
-            <div class="options-section-title">물리 엔진 · 반상 조명 테마</div>
+            <div class="options-section-title">UI 레이아웃 &amp; 반상 격자선 가시성 (모바일 선명도)</div>
+            <div class="form-section" style="margin-bottom: 10px;">
+              <span class="form-label">화면 인터페이스 (UI) 모드</span>
+              <div class="seg-group" id="seg-opt-ui-layout">
+                <button class="seg-btn" data-val="auto">자동 (PC / 모바일 맞춤)</button>
+                <button class="seg-btn" data-val="mobile">모바일 전용 컴팩트 UI</button>
+                <button class="seg-btn" data-val="desktop">PC 와이드 UI</button>
+              </div>
+            </div>
+            <div class="form-section" style="margin-bottom: 10px;">
+              <span class="form-label">반상 나무결 농도 (배경 무늬 진하기)</span>
+              <div class="seg-group" id="seg-opt-grain">
+                <button class="seg-btn" data-val="classic">전통 나뭇결</button>
+                <button class="seg-btn" data-val="soft">부드러운 은은결</button>
+                <button class="seg-btn" data-val="plain">단색 무지 (최고 시인성)</button>
+              </div>
+            </div>
+            <div class="form-section" style="margin-bottom: 10px;">
+              <span class="form-label">바둑판 가로·세로 선 대비 (선명도)</span>
+              <div class="seg-group" id="seg-opt-line-contrast">
+                <button class="seg-btn" data-val="normal">기본 먹선</button>
+                <button class="seg-btn" data-val="bold">진한 먹선</button>
+                <button class="seg-btn" data-val="high">고대비 선명+밝은 외곽선</button>
+              </div>
+            </div>
+            <button class="btn btn-sm btn-gold" id="btn-opt-mobile-visibility" style="width: 100%;">
+              📱 모바일 추천: 은은결 + 고대비 격자선 즉시 적용
+            </button>
+          </div>
+
+          <div class="options-section">
+            <div class="options-section-title">물리 엔진 · 반상 조명 테마 및 밝기</div>
             <div class="form-section" style="margin-bottom: 10px;">
               <span class="form-label">강체 물리 충돌 시뮬레이션</span>
               <div class="seg-group" id="seg-opt-physics">
@@ -1025,13 +1243,28 @@ export class UIManager {
                 <button class="seg-btn" data-val="minimal">경량 (저전력)</button>
               </div>
             </div>
-            <div>
+            <div class="form-section" style="margin-bottom: 10px;">
               <span class="form-label">조명 분위기</span>
               <div class="seg-group" id="seg-opt-lighting">
                 <button class="seg-btn" data-val="hanok_warm">전통 한옥</button>
                 <button class="seg-btn" data-val="studio_bright">밝은 대국실</button>
                 <button class="seg-btn" data-val="night_lantern">야간 호롱불</button>
               </div>
+            </div>
+            <div>
+              <div class="slider-label-row">
+                <span class="form-label">반상 조명 밝기 (눈부심 조절)</span>
+                <strong class="slider-val-badge" id="lbl-opt-brightness">100%</strong>
+              </div>
+              <input
+                type="range"
+                class="opt-range-slider"
+                id="slider-opt-brightness"
+                min="50"
+                max="150"
+                step="5"
+                value="100"
+              />
             </div>
           </div>
 
@@ -1058,6 +1291,33 @@ export class UIManager {
           <div class="options-footer">
             <button class="btn" id="btn-options-reset">기본값 복원</button>
             <button class="btn btn-gold" id="btn-options-close-footer">설정 저장 후 닫기</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Beginner Tutorial & Learning Curriculum Modal -->
+      <div class="modal-backdrop hidden" id="modal-tutorial">
+        <div class="modal-card modal-wide modal-tutorial-card">
+          <div class="modal-header">
+            <div>
+              <h2>초보자 입문 튜토리얼 &amp; 실전 학습</h2>
+              <div class="modal-subline" id="tutorial-progress-summary">완료한 학습: 0 / 9</div>
+            </div>
+            <button class="btn btn-sm" id="btn-close-tutorial">닫기</button>
+          </div>
+          <div class="tutorial-lesson-grid" id="tutorial-lesson-grid"></div>
+        </div>
+      </div>
+
+      <!-- Account / IP Ban Blocker Modal -->
+      <div class="modal-backdrop hidden" id="modal-ban-notice">
+        <div class="modal-card modal-ban-card">
+          <div class="modal-header">
+            <h2>온라인 서비스 이용 제한 안내</h2>
+          </div>
+          <div id="ban-notice-body" class="ban-notice-body"></div>
+          <div class="modal-footer">
+            <button class="btn btn-gold" id="btn-close-ban-modal">확인</button>
           </div>
         </div>
       </div>
@@ -1160,6 +1420,56 @@ export class UIManager {
     this.optionsModalEl = this.root.querySelector('#modal-options')!;
     this.toastContainerEl = this.root.querySelector('#toast-container')!;
 
+    // Byoyomi 10s urgent visual alert refs
+    this.byoyomiPulseEl = this.root.querySelector('#byoyomi-edge-pulse')!;
+    this.byoyomiBannerEl = this.root.querySelector('#byoyomi-countdown-banner')!;
+    this.byoyomiBannerNumEl = this.root.querySelector('#byoyomi-count-num')!;
+    this.byoyomiBannerLabelEl = this.root.querySelector('#byoyomi-count-title')!;
+    this.byoyomiBannerSubEl = this.root.querySelector('#byoyomi-count-sub')!;
+
+    // Tutorial Coach & Selector Modal refs
+    this.tutorialCoachEl = this.root.querySelector('#tutorial-coach-panel')!;
+    this.tutorialCoachTitleEl = this.root.querySelector('#tut-coach-title')!;
+    this.tutorialCoachStepEl = this.root.querySelector('#tut-coach-step')!;
+    this.tutorialCoachTextEl = this.root.querySelector('#tut-coach-text')!;
+    this.tutorialCoachFeedbackEl = this.root.querySelector('#tut-coach-feedback')!;
+    this.tutorialCoachHintEl = this.root.querySelector('#tut-coach-hint')!;
+    this.tutorialNextBtn = this.root.querySelector('#btn-tut-next') as HTMLButtonElement;
+    this.tutorialModalEl = this.root.querySelector('#modal-tutorial')!;
+    this.tutorialLessonGridEl = this.root.querySelector('#tutorial-lesson-grid')!;
+    this.tutorialProgressSummaryEl = this.root.querySelector('#tutorial-progress-summary')!;
+
+    // Ban Modal refs
+    this.banModalEl = this.root.querySelector('#modal-ban-notice')!;
+    this.banModalBodyEl = this.root.querySelector('#ban-notice-body')!;
+
+    // Dedicated Mobile HUD refs
+    this.mobTitleEl = this.root.querySelector('#mob-ui-title')!;
+    this.mobOnlineBadgeEl = this.root.querySelector('#mob-online-badge')!;
+    this.mobLeaveOnlineBtn = this.root.querySelector('#mob-btn-leave-online') as HTMLButtonElement;
+    this.mobOppCardEl = this.root.querySelector('#mobile-opponent-bar')!;
+    this.mobOppDotEl = this.root.querySelector('#mob-opp-dot')!;
+    this.mobOppNameEl = this.root.querySelector('#mob-opp-name')!;
+    this.mobOppCapEl = this.root.querySelector('#mob-opp-cap')!;
+    this.mobOppClockEl = this.root.querySelector('#mob-opp-clock')!;
+    this.mobSelfCardEl = this.root.querySelector('#mobile-self-bar')!;
+    this.mobSelfDotEl = this.root.querySelector('#mob-self-dot')!;
+    this.mobSelfNameEl = this.root.querySelector('#mob-self-name')!;
+    this.mobSelfCapEl = this.root.querySelector('#mob-self-cap')!;
+    this.mobSelfClockEl = this.root.querySelector('#mob-self-clock')!;
+    this.mobCoordBadgeEl = this.root.querySelector('#mob-coord-badge')!;
+    this.mobPassBtn = this.root.querySelector('#mob-btn-pass') as HTMLButtonElement;
+    this.mobUndoBtn = this.root.querySelector('#mob-btn-undo') as HTMLButtonElement;
+    this.mobAiHintBtn = this.root.querySelector('#mob-btn-ai-hint') as HTMLButtonElement;
+    this.mobChatBtn = this.root.querySelector('#mob-btn-chat') as HTMLButtonElement;
+    this.mobChatBadgeEl = this.root.querySelector('#mob-chat-unread-badge')!;
+    this.mobMoreSheetEl = this.root.querySelector('#mobile-more-sheet')!;
+    this.mobSheetCoordsBtn = this.root.querySelector('#mob-sheet-coords') as HTMLButtonElement;
+    this.mobSheetNumsBtn = this.root.querySelector('#mob-sheet-nums') as HTMLButtonElement;
+    this.mobSheetHintBtn = this.root.querySelector('#mob-sheet-hint') as HTMLButtonElement;
+    this.mobSheetResignBtn = this.root.querySelector('#mob-sheet-resign') as HTMLButtonElement;
+    this.mobSheetResultBtn = this.root.querySelector('#mob-sheet-result') as HTMLButtonElement;
+
     // Camera preset buttons
     this.camPresetBtns = Array.from(this.root.querySelectorAll<HTMLButtonElement>('[data-cam]'));
     this.camPresetBtns.forEach((btn) => {
@@ -1188,6 +1498,89 @@ export class UIManager {
     this.root.querySelector('#btn-open-options')!.addEventListener('click', () => this.openOptionsModal());
     this.root.querySelector('#btn-fullscreen')!.addEventListener('click', () => this.actions.onToggleFullscreen());
     this.leaveOnlineBtn.addEventListener('click', () => this.actions.onLeaveOnlineMatch());
+
+    // Beginner Tutorial controls (Top bar + Setup modal + Mobile bar + Coach panel)
+    const openTutorial = () => this.actions.onOpenTutorialModal();
+    this.root.querySelector('#btn-open-tutorial')!.addEventListener('click', openTutorial);
+    this.root.querySelector('#btn-setup-open-tutorial')!.addEventListener('click', openTutorial);
+    this.root.querySelector('#mob-btn-tutorial')!.addEventListener('click', openTutorial);
+    this.root.querySelector('#btn-close-tutorial')!.addEventListener('click', () => this.closeTutorialModal());
+    this.root.querySelector('#btn-tut-hint')!.addEventListener('click', () => this.actions.onToggleTutorialHint());
+    this.root.querySelector('#btn-tut-retry')!.addEventListener('click', () => this.actions.onRetryTutorialStep());
+    this.tutorialNextBtn.addEventListener('click', () => this.actions.onTutorialNextStep());
+    this.root.querySelector('#btn-tut-exit')!.addEventListener('click', () => this.actions.onExitTutorial());
+
+    // Ban notice modal dismiss
+    this.root.querySelector('#btn-close-ban-modal')!.addEventListener('click', () => {
+      this.banModalEl.classList.add('hidden');
+    });
+
+    // Dedicated Mobile HUD button bindings
+    this.root.querySelector('#mob-btn-setup')!.addEventListener('click', () => this.openSetupModal());
+    this.root.querySelector('#mob-btn-options')!.addEventListener('click', () => this.openOptionsModal());
+    this.mobLeaveOnlineBtn.addEventListener('click', () => this.actions.onLeaveOnlineMatch());
+    this.mobPassBtn.addEventListener('click', () => this.actions.onPass());
+    this.mobUndoBtn.addEventListener('click', () => this.actions.onUndo());
+    this.mobAiHintBtn.addEventListener('click', () => this.actions.onRequestAIHint());
+    this.mobChatBtn.addEventListener('click', () => {
+      const hidden = this.chatPopoverEl.classList.toggle('hidden');
+      this.chatToggleBtn.classList.toggle('btn-active', !hidden);
+      this.mobChatBtn.classList.toggle('btn-active', !hidden);
+      if (!hidden) {
+        this.mobMoreSheetEl.classList.add('hidden');
+        this.chatUnreadCount = 0;
+        this.syncChatUnreadBadge();
+        this.chatInputEl.focus();
+      }
+    });
+    this.root.querySelector('#mob-btn-more')!.addEventListener('click', () => {
+      this.mobMoreSheetEl.classList.toggle('hidden');
+    });
+    this.root.querySelector('#mob-btn-close-more')!.addEventListener('click', () => {
+      this.mobMoreSheetEl.classList.add('hidden');
+    });
+    this.mobSheetCoordsBtn.addEventListener('click', () => {
+      const on = this.actions.onToggleCoordinates();
+      this.coordsBtn.classList.toggle('btn-active', on);
+      this.mobSheetCoordsBtn.classList.toggle('btn-active', on);
+    });
+    this.mobSheetNumsBtn.addEventListener('click', () => {
+      const on = this.actions.onToggleMoveNumbers();
+      this.moveNumBtn.classList.toggle('btn-active', on);
+      this.mobSheetNumsBtn.classList.toggle('btn-active', on);
+    });
+    this.mobSheetHintBtn.addEventListener('click', () => {
+      const on = this.actions.onToggleTerritoryHint();
+      this.hintBtn.classList.toggle('btn-active', on);
+      this.mobSheetHintBtn.classList.toggle('btn-active', on);
+      this.mobMoreSheetEl.classList.add('hidden');
+    });
+    this.root.querySelector('#mob-sheet-stir')!.addEventListener('click', () => {
+      this.actions.onStirBowls();
+      this.mobMoreSheetEl.classList.add('hidden');
+    });
+    this.root.querySelector('#mob-sheet-nick')!.addEventListener('click', () => {
+      this.mobMoreSheetEl.classList.add('hidden');
+      this.nickModalInputEl.value = this.currentNickname;
+      this.nickModalEl.classList.remove('hidden');
+      this.nickModalInputEl.focus();
+    });
+    this.root.querySelector('#mob-sheet-save-sgf')!.addEventListener('click', () => {
+      this.mobMoreSheetEl.classList.add('hidden');
+      this.actions.onSaveSgf();
+    });
+    this.root.querySelector('#mob-sheet-open-sgf')!.addEventListener('click', () => {
+      this.mobMoreSheetEl.classList.add('hidden');
+      this.actions.onOpenSgf();
+    });
+    this.mobSheetResultBtn.addEventListener('click', () => {
+      this.mobMoreSheetEl.classList.add('hidden');
+      this.resultModalEl.classList.remove('hidden');
+    });
+    this.mobSheetResignBtn.addEventListener('click', () => {
+      this.mobMoreSheetEl.classList.add('hidden');
+      this.actions.onResign();
+    });
 
     // Nickname controls (Top bar modal + Setup bar)
     this.root.querySelector('#btn-profile-nick')!.addEventListener('click', () => {
@@ -1677,6 +2070,40 @@ export class UIManager {
     this.bindSegmented('#seg-opt-lighting', (val) => {
       this.syncOptionsDOM(this.actions.onUpdateSettings({ lightingTheme: val as LightingTheme }));
     });
+    this.bindSegmented('#seg-opt-ui-layout', (val) => {
+      this.syncOptionsDOM(this.actions.onUpdateSettings({ uiLayoutMode: val as UILayoutMode }));
+    });
+    this.bindSegmented('#seg-opt-grain', (val) => {
+      this.syncOptionsDOM(
+        this.actions.onUpdateSettings({ boardGrainIntensity: val as BoardGrainIntensity })
+      );
+    });
+    this.bindSegmented('#seg-opt-line-contrast', (val) => {
+      this.syncOptionsDOM(
+        this.actions.onUpdateSettings({ gridLineContrast: val as GridLineContrast })
+      );
+    });
+    this.root.querySelector('#btn-opt-mobile-visibility')!.addEventListener('click', () => {
+      this.syncOptionsDOM(
+        this.actions.onUpdateSettings({
+          boardGrainIntensity: 'soft',
+          gridLineContrast: 'high',
+        })
+      );
+      this.showToast('모바일 선명 격자선 프리셋(은은결 + 고대비)이 적용되었습니다.');
+    });
+    const brightnessSlider = this.root.querySelector('#slider-opt-brightness') as HTMLInputElement;
+    brightnessSlider.addEventListener('input', () => {
+      const pct = Number(brightnessSlider.value);
+      const lbl = this.root.querySelector('#lbl-opt-brightness');
+      if (lbl) lbl.textContent = `${pct}%`;
+      this.syncOptionsDOM(this.actions.onUpdateSettings({ lightingBrightness: pct / 100 }));
+    });
+    this.mobMoreSheetEl.querySelectorAll<HTMLButtonElement>('[data-cam]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        this.mobMoreSheetEl.classList.add('hidden');
+      });
+    });
 
     const bindCheckbox = (selector: string, key: keyof UserSettings) => {
       const el = this.root.querySelector(selector) as HTMLInputElement;
@@ -2022,14 +2449,27 @@ export class UIManager {
 
   private refreshOnlineHudLabel(): void {
     if (!this.currentOnlineRoomCode) return;
+    if (this.onlineSessionRole === 'admin_stealth') {
+      this.onlineHudTextEl.textContent = `🛡 은밀 관전 (${this.currentOnlineRoomCode})`;
+      if (this.mobOnlineBadgeEl) {
+        this.mobOnlineBadgeEl.textContent = `🛡 ${this.currentOnlineRoomCode}`;
+      }
+      return;
+    }
     if (this.onlineSessionRole === 'spectator') {
       this.onlineHudTextEl.textContent = `👁 실시간 관전 (${this.currentOnlineRoomCode}) · 관전자 ${this.currentSpectatorCount}명`;
+      if (this.mobOnlineBadgeEl) {
+        this.mobOnlineBadgeEl.textContent = `👁 ${this.currentSpectatorCount}`;
+      }
       return;
     }
     const stoneTxt = this.currentOnlineMyColor === BLACK ? '흑번' : this.currentOnlineMyColor === WHITE ? '백번' : '';
     const pingPart = typeof this.currentOnlinePingMs === 'number' ? ` · ${this.currentOnlinePingMs}ms` : '';
     const specPart = this.currentSpectatorCount > 0 ? ` · 👁 ${this.currentSpectatorCount}명` : '';
     this.onlineHudTextEl.textContent = `방 ${this.currentOnlineRoomCode}${stoneTxt ? ` (${stoneTxt})` : ''}${pingPart}${specPart}`;
+    if (this.mobOnlineBadgeEl) {
+      this.mobOnlineBadgeEl.textContent = `${this.currentOnlineRoomCode}${stoneTxt ? `(${stoneTxt[0]})` : ''}`;
+    }
   }
 
   public setOnlineInGameHUD(
@@ -2045,12 +2485,19 @@ export class UIManager {
     this.currentOnlinePingMs = undefined;
     this.currentSpectatorCount = spectatorCount;
 
-    const isSpectator = active && sessionRole === 'spectator';
+    const isStealth = active && sessionRole === 'admin_stealth';
+    const isSpectator = active && (sessionRole === 'spectator' || isStealth);
     this.root.classList.toggle('spectator-mode', isSpectator);
     this.onlineHudPillEl.classList.toggle('hidden', !active);
     this.leaveOnlineBtn.classList.toggle('hidden', !active);
-    this.chatToggleBtn.classList.toggle('hidden', !active);
-    this.leaveOnlineBtn.textContent = isSpectator ? '관전 종료' : '방 나가기';
+    this.chatToggleBtn.classList.toggle('hidden', !active || isStealth);
+    this.leaveOnlineBtn.textContent = isStealth ? '은밀 관전 종료' : isSpectator ? '관전 종료' : '방 나가기';
+
+    if (this.mobOnlineBadgeEl) {
+      this.mobOnlineBadgeEl.classList.toggle('hidden', !active);
+      this.mobLeaveOnlineBtn.classList.toggle('hidden', !active);
+      this.mobChatBtn.classList.toggle('hidden', !active || isStealth);
+    }
 
     const toggleLabel = this.chatToggleBtn.querySelector('#chat-toggle-label');
     if (toggleLabel) {
@@ -2070,6 +2517,7 @@ export class UIManager {
     if (!active) {
       this.chatPopoverEl.classList.add('hidden');
       this.chatToggleBtn.classList.remove('btn-active');
+      if (this.mobChatBtn) this.mobChatBtn.classList.remove('btn-active');
       this.clearChatHistory();
       this.hideOnlinePrompt();
     } else {
@@ -2098,13 +2546,15 @@ export class UIManager {
   }
 
   private syncChatUnreadBadge(): void {
-    if (!this.chatUnreadBadgeEl) return;
-    if (this.chatUnreadCount <= 0) {
-      this.chatUnreadBadgeEl.classList.add('hidden');
-      this.chatUnreadBadgeEl.textContent = '0';
-    } else {
-      this.chatUnreadBadgeEl.textContent = this.chatUnreadCount > 99 ? '99+' : String(this.chatUnreadCount);
-      this.chatUnreadBadgeEl.classList.remove('hidden');
+    const label = this.chatUnreadCount > 99 ? '99+' : String(this.chatUnreadCount);
+    const hasUnread = this.chatUnreadCount > 0;
+    if (this.chatUnreadBadgeEl) {
+      this.chatUnreadBadgeEl.textContent = label;
+      this.chatUnreadBadgeEl.classList.toggle('hidden', !hasUnread);
+    }
+    if (this.mobChatBadgeEl) {
+      this.mobChatBadgeEl.textContent = label;
+      this.mobChatBadgeEl.classList.toggle('hidden', !hasUnread);
     }
   }
 
@@ -2203,18 +2653,30 @@ export class UIManager {
     }
   }
 
+  private getMobileSelfColor(): PlayerColor {
+    return this.lastHudConfig?.humanColor === WHITE ? WHITE : BLACK;
+  }
+
   public updateGameHeader(config: GameConfig): void {
+    this.lastHudConfig = { ...config };
     const isOmok = config.gameType === 'omok';
     this.brandTitleEl.textContent = isOmok ? '수담 3D 오목' : '수담 3D 바둑';
-    const isSpectator = this.onlineSessionRole === 'spectator';
+    if (this.mobTitleEl) {
+      this.mobTitleEl.textContent = isOmok ? `오목 ${config.boardSize}` : `바둑 ${config.boardSize}`;
+    }
 
-    const modeText = isSpectator
-      ? '실시간 관전 중계'
-      : config.mode === 'ai'
-        ? `AI ${AI_LEVEL_NAMES[config.aiDifficulty]}`
-        : config.mode === 'online'
-          ? `온라인 실시간`
-          : '2인 맞대국';
+    const isStealth = this.onlineSessionRole === 'admin_stealth';
+    const isSpectator = this.onlineSessionRole === 'spectator' || isStealth;
+
+    const modeText = isStealth
+      ? '관리자 은밀 관전'
+      : isSpectator
+        ? '실시간 관전 중계'
+        : config.mode === 'ai'
+          ? `AI ${AI_LEVEL_NAMES[config.aiDifficulty]}`
+          : config.mode === 'online'
+            ? `온라인 실시간`
+            : '2인 맞대국';
 
     if (isOmok) {
       const omokRuleText = (config.omokRuleset ?? 'renju') === 'renju' ? '렌주룰(금수)' : '자유룰';
@@ -2246,10 +2708,26 @@ export class UIManager {
     this.hintBtn.classList.toggle('hidden', isOmok);
     this.passBtn.classList.toggle('hidden', isOmok);
     this.undoBtn.textContent = !isSpectator && config.mode === 'online' ? '무르기 요청' : '무르기';
+
+    if (this.mobOppNameEl && this.mobSelfNameEl) {
+      const selfColor = this.getMobileSelfColor();
+      const oppColor = selfColor === BLACK ? WHITE : BLACK;
+      const blackLabel = config.blackName || '흑 대국자';
+      const whiteLabel = config.whiteName || '백 대국자';
+      this.mobSelfDotEl.className = `stone-icon ${selfColor === BLACK ? 'black' : 'white'} mob-dot`;
+      this.mobOppDotEl.className = `stone-icon ${oppColor === BLACK ? 'black' : 'white'} mob-dot`;
+      this.mobSelfNameEl.textContent = selfColor === BLACK ? blackLabel : whiteLabel;
+      this.mobOppNameEl.textContent = oppColor === BLACK ? blackLabel : whiteLabel;
+      this.mobSheetHintBtn.classList.toggle('hidden', isOmok);
+      this.mobPassBtn.classList.toggle('hidden', isOmok);
+    }
   }
 
   public setCoordStatus(text: string): void {
     this.coordBadgeEl.textContent = text;
+    if (this.mobCoordBadgeEl) {
+      this.mobCoordBadgeEl.textContent = text;
+    }
   }
 
   public updatePlayersStatus(params: {
@@ -2262,6 +2740,7 @@ export class UIManager {
     humanColor?: PlayerColor;
     gameType?: GameType;
   }): void {
+    this.lastHudStatus = { ...params, captures: { ...params.captures } };
     const { turn, phase, captures, aiThinking, moveCount, mode, humanColor, gameType } = params;
     const isOmok = gameType === 'omok';
     this.blackCapturesEl.parentElement!.classList.toggle('hidden', isOmok);
@@ -2277,7 +2756,8 @@ export class UIManager {
     this.whiteTurnPill.textContent = aiThinking && turn === WHITE ? '수읽기 중...' : '착수 차례';
 
     const isOnline = mode === 'online';
-    const isSpectator = this.onlineSessionRole === 'spectator';
+    const isSpectator =
+      this.onlineSessionRole === 'spectator' || this.onlineSessionRole === 'admin_stealth';
     const isMyTurn = !isSpectator && (!isOnline || turn === humanColor);
 
     this.passBtn.disabled = isSpectator || !isPlaying || aiThinking || !isMyTurn;
@@ -2287,6 +2767,22 @@ export class UIManager {
 
     this.scoringBannerEl.classList.toggle('hidden', phase !== 'scoring');
     this.showResultBtn.classList.toggle('hidden', phase !== 'finished' && phase !== 'review');
+
+    if (this.mobSelfCardEl && this.mobOppCardEl) {
+      const selfColor = this.getMobileSelfColor();
+      const oppColor = selfColor === BLACK ? WHITE : BLACK;
+      this.mobSelfCapEl.textContent = String(selfColor === BLACK ? captures.black : captures.white);
+      this.mobOppCapEl.textContent = String(oppColor === BLACK ? captures.black : captures.white);
+      this.mobSelfCapEl.parentElement!.classList.toggle('hidden', isOmok);
+      this.mobOppCapEl.parentElement!.classList.toggle('hidden', isOmok);
+      this.mobSelfCardEl.classList.toggle('active-turn', isPlaying && turn === selfColor);
+      this.mobOppCardEl.classList.toggle('active-turn', isPlaying && turn === oppColor);
+      this.mobPassBtn.disabled = this.passBtn.disabled;
+      this.mobUndoBtn.disabled = this.undoBtn.disabled;
+      this.mobSheetResignBtn.disabled = this.resignBtn.disabled;
+      this.mobAiHintBtn.disabled = this.aiHintBtn.disabled;
+      this.mobSheetResultBtn.classList.toggle('hidden', phase !== 'finished' && phase !== 'review');
+    }
   }
 
   public updateClocks(
@@ -2299,6 +2795,15 @@ export class UIManager {
     this.whiteClockEl.textContent = whiteText;
     this.blackClockEl.classList.toggle('urgent', blackUrgent);
     this.whiteClockEl.classList.toggle('urgent', whiteUrgent);
+
+    if (this.mobSelfClockEl && this.mobOppClockEl) {
+      const selfColor = this.getMobileSelfColor();
+      const selfIsBlack = selfColor === BLACK;
+      this.mobSelfClockEl.textContent = selfIsBlack ? blackText : whiteText;
+      this.mobOppClockEl.textContent = selfIsBlack ? whiteText : blackText;
+      this.mobSelfClockEl.classList.toggle('urgent', selfIsBlack ? blackUrgent : whiteUrgent);
+      this.mobOppClockEl.classList.toggle('urgent', selfIsBlack ? whiteUrgent : blackUrgent);
+    }
   }
 
   public updateScoringBannerTally(score: ScoreBreakdown): void {
@@ -2313,10 +2818,16 @@ export class UIManager {
 
   public setHintButtonActive(active: boolean): void {
     this.hintBtn.classList.toggle('btn-active', active);
+    if (this.mobSheetHintBtn) {
+      this.mobSheetHintBtn.classList.toggle('btn-active', active);
+    }
   }
 
   public setMoveNumbersButtonActive(active: boolean): void {
     this.moveNumBtn.classList.toggle('btn-active', active);
+    if (this.mobSheetNumsBtn) {
+      this.mobSheetNumsBtn.classList.toggle('btn-active', active);
+    }
   }
 
   public configureReviewBar(
@@ -2559,6 +3070,15 @@ export class UIManager {
     markSeg('#seg-opt-input', s.inputMode);
     markSeg('#seg-opt-physics', s.physicsIntensity);
     markSeg('#seg-opt-lighting', s.lightingTheme);
+    markSeg('#seg-opt-ui-layout', s.uiLayoutMode);
+    markSeg('#seg-opt-grain', s.boardGrainIntensity);
+    markSeg('#seg-opt-line-contrast', s.gridLineContrast);
+
+    const brightnessPct = Math.round((s.lightingBrightness ?? 1) * 100);
+    const brightnessSlider = this.root.querySelector('#slider-opt-brightness') as HTMLInputElement | null;
+    if (brightnessSlider) brightnessSlider.value = String(brightnessPct);
+    const brightnessLbl = this.root.querySelector('#lbl-opt-brightness');
+    if (brightnessLbl) brightnessLbl.textContent = `${brightnessPct}%`;
 
     (this.root.querySelector('#opt-bloom') as HTMLInputElement).checked = s.bloomEnabled;
     (this.root.querySelector('#opt-ornate-finish') as HTMLInputElement).checked = s.ornateFinishEnabled;
@@ -2570,12 +3090,199 @@ export class UIManager {
     (this.root.querySelector('#opt-show-forbidden') as HTMLInputElement).checked = s.showForbiddenPoints;
     (this.root.querySelector('#opt-show-coords') as HTMLInputElement).checked = s.showCoordinates;
     this.coordsBtn.classList.toggle('btn-active', s.showCoordinates);
+    if (this.mobSheetCoordsBtn) {
+      this.mobSheetCoordsBtn.classList.toggle('btn-active', s.showCoordinates);
+    }
 
     const volSlider = this.root.querySelector('#slider-volume') as HTMLInputElement;
     volSlider.value = String(Math.round(s.soundVolume * 100));
     const muteBtn = this.root.querySelector('#btn-mute') as HTMLButtonElement;
     muteBtn.textContent = s.soundMuted ? '음소거됨' : '음향';
     muteBtn.classList.toggle('btn-danger', s.soundMuted);
+
+    this.applyUiLayoutMode(s.uiLayoutMode);
+  }
+
+  public applyUiLayoutMode(mode: UILayoutMode = this.settings.uiLayoutMode): 'desktop' | 'mobile' {
+    const effective = resolveEffectiveUiLayout(mode);
+    if (typeof document !== 'undefined' && document.body) {
+      document.body.dataset.uiLayout = effective;
+    }
+    this.root.classList.toggle('mobile-ui-layout', effective === 'mobile');
+    if (effective === 'desktop' && this.mobMoreSheetEl) {
+      this.mobMoreSheetEl.classList.add('hidden');
+    }
+    if (this.lastHudConfig) {
+      const selfColor = this.getMobileSelfColor();
+      const oppColor = selfColor === BLACK ? WHITE : BLACK;
+      this.mobSelfDotEl.className = `stone-icon ${selfColor === BLACK ? 'black' : 'white'} mob-dot`;
+      this.mobOppDotEl.className = `stone-icon ${oppColor === BLACK ? 'black' : 'white'} mob-dot`;
+    }
+    if (this.lastHudStatus) {
+      const { turn, phase, captures } = this.lastHudStatus;
+      const selfColor = this.getMobileSelfColor();
+      const oppColor = selfColor === BLACK ? WHITE : BLACK;
+      this.mobSelfCapEl.textContent = String(selfColor === BLACK ? captures.black : captures.white);
+      this.mobOppCapEl.textContent = String(oppColor === BLACK ? captures.black : captures.white);
+      this.mobSelfCardEl.classList.toggle('active-turn', phase === 'playing' && turn === selfColor);
+      this.mobOppCardEl.classList.toggle('active-turn', phase === 'playing' && turn === oppColor);
+    }
+    return effective;
+  }
+
+  public updateUrgentCountdown(state: UrgentCountdownState): void {
+    if (!this.byoyomiBannerEl || !this.byoyomiPulseEl) return;
+    if (!state.active || state.secondsLeft <= 0) {
+      this.lastBannerCount = null;
+      this.byoyomiPulseEl.classList.add('hidden');
+      this.byoyomiPulseEl.classList.remove('critical');
+      this.byoyomiBannerEl.classList.add('hidden');
+      this.byoyomiBannerEl.classList.remove('critical', 'pop-tick');
+      return;
+    }
+
+    const isCritical = state.secondsLeft <= 5;
+    const playerTxt = state.color === BLACK ? '흑(Black)' : '백(White)';
+    this.byoyomiPulseEl.classList.remove('hidden');
+    this.byoyomiPulseEl.classList.toggle('critical', isCritical);
+    this.byoyomiBannerEl.classList.remove('hidden');
+    this.byoyomiBannerEl.classList.toggle('critical', isCritical);
+
+    this.byoyomiBannerNumEl.textContent = String(state.secondsLeft);
+    this.byoyomiBannerLabelEl.textContent = state.isByoyomi
+      ? `${playerTxt} 초읽기 ${state.secondsLeft}초`
+      : `${playerTxt} 제한시간 ${state.secondsLeft}초`;
+    this.byoyomiBannerSubEl.textContent = state.isByoyomi
+      ? state.periodsLeft <= 1
+        ? '마지막 초읽기입니다! 시간 초과 시 패배'
+        : `남은 초읽기 ${state.periodsLeft}회`
+      : '제한시간이 곧 만료됩니다!';
+
+    if (this.lastBannerCount !== state.secondsLeft) {
+      this.lastBannerCount = state.secondsLeft;
+      this.byoyomiBannerEl.classList.remove('pop-tick');
+      void this.byoyomiBannerEl.offsetWidth;
+      this.byoyomiBannerEl.classList.add('pop-tick');
+    }
+  }
+
+  public openTutorialModal(
+    lessons: ReadonlyArray<TutorialLesson>,
+    completedIds: ReadonlySet<string>
+  ): void {
+    this.tutorialProgressSummaryEl.textContent = `완료한 학습: ${completedIds.size} / ${lessons.length}`;
+    const basics = lessons.filter(
+      (l) => l.category === '기초' || l.category === '규칙' || l.category === '종국 · 계가'
+    );
+    const tactics = lessons.filter(
+      (l) => l.category !== '기초' && l.category !== '규칙' && l.category !== '종국 · 계가'
+    );
+
+    const renderGroup = (heading: string, list: TutorialLesson[]) => `
+      <div class="tutorial-group">
+        <div class="tutorial-group-title">${escapeHtml(heading)}</div>
+        <div class="tutorial-cards-row">
+          ${list
+            .map((lesson) => {
+              const done = completedIds.has(lesson.id);
+              const badge = lesson.gameType === 'omok' ? '오목 렌주' : `${lesson.boardSize}줄 바둑`;
+              return `
+                <button class="tutorial-lesson-card${done ? ' completed' : ''}" data-tut-lesson="${escapeHtml(lesson.id)}">
+                  <div class="tut-card-top">
+                    <span class="tut-card-badge">${escapeHtml(badge)} · ${lesson.steps.length}단계</span>
+                    <span class="tut-card-status">${done ? '✓ 완료' : '학습하기 ▶'}</span>
+                  </div>
+                  <div class="tut-card-title">${escapeHtml(lesson.title)}</div>
+                  <div class="tut-card-desc">${escapeHtml(lesson.subtitle)}</div>
+                </button>
+              `;
+            })
+            .join('')}
+        </div>
+      </div>
+    `;
+
+    this.tutorialLessonGridEl.innerHTML =
+      renderGroup('바둑 기초 · 규칙 · 계가 입문', basics) +
+      renderGroup('사활·맥점 & 오목 렌주룰', tactics);
+
+    this.tutorialLessonGridEl.querySelectorAll<HTMLButtonElement>('[data-tut-lesson]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const id = btn.dataset.tutLesson;
+        if (!id) return;
+        this.closeTutorialModal();
+        this.actions.onStartTutorialLesson(id);
+      });
+    });
+
+    this.tutorialModalEl.classList.remove('hidden');
+  }
+
+  public closeTutorialModal(): void {
+    this.tutorialModalEl.classList.add('hidden');
+  }
+
+  public showTutorialCoach(params: {
+    lesson: TutorialLesson;
+    step: TutorialStep;
+    stepIndex: number;
+    feedback: string | null;
+    isErrorFeedback?: boolean;
+    hintVisible: boolean;
+    awaitingNext: boolean;
+    isFinalStep: boolean;
+  }): void {
+    const { lesson, step, stepIndex, feedback, isErrorFeedback, hintVisible, awaitingNext, isFinalStep } =
+      params;
+    this.tutorialCoachEl.classList.remove('hidden');
+    this.tutorialCoachTitleEl.textContent = lesson.title;
+    this.tutorialCoachStepEl.textContent = `${stepIndex + 1} / ${lesson.steps.length}단계`;
+    this.tutorialCoachTextEl.textContent = step.instruction;
+
+    if (feedback) {
+      this.tutorialCoachFeedbackEl.textContent = feedback;
+      this.tutorialCoachFeedbackEl.classList.remove('hidden');
+      this.tutorialCoachFeedbackEl.classList.toggle('error', Boolean(isErrorFeedback));
+    } else {
+      this.tutorialCoachFeedbackEl.classList.add('hidden');
+    }
+
+    if (hintVisible && step.hintText) {
+      this.tutorialCoachHintEl.textContent = `💡 힌트: ${step.hintText}`;
+      this.tutorialCoachHintEl.classList.remove('hidden');
+    } else {
+      this.tutorialCoachHintEl.classList.add('hidden');
+    }
+
+    this.tutorialNextBtn.classList.toggle('hidden', !awaitingNext);
+    this.tutorialNextBtn.textContent = isFinalStep ? '과정 완료하기 ✓' : '다음 단계 ▶';
+  }
+
+  public hideTutorialCoach(): void {
+    if (this.tutorialCoachEl) {
+      this.tutorialCoachEl.classList.add('hidden');
+    }
+  }
+
+  public showBanNotice(ban: AdminBanEntry): void {
+    const targetLabel =
+      ban.targetType === 'both'
+        ? '계정 + 접속 IP 동시 차단'
+        : ban.targetType === 'ip'
+          ? '접속 IP 차단'
+          : '계정 ID 차단';
+    const remaining = formatBanDurationRemaining(ban.expiresAt);
+    this.banModalBodyEl.innerHTML = `
+      <div class="ban-alert-badge">🚫 온라인 멀티플레이 접근이 제한되었습니다</div>
+      <div class="ban-info-grid">
+        <div><span>제한 구분</span><strong>${escapeHtml(targetLabel)}</strong></div>
+        <div><span>대상 닉네임</span><strong>${escapeHtml(ban.targetNickname || '알 수 없음')}</strong></div>
+        <div><span>남은 기간</span><strong class="ban-duration">${escapeHtml(remaining)}</strong></div>
+        <div><span>사유</span><strong>${escapeHtml(ban.reason || '관리자 정책 위반')}</strong></div>
+      </div>
+      <p class="ban-help-note">오프라인 AI 대국 및 입문 튜토리얼은 계속 이용하실 수 있습니다.</p>
+    `;
+    this.banModalEl.classList.remove('hidden');
   }
 
   public setRematchButtonPending(): void {

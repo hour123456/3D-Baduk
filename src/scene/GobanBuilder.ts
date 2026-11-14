@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import {
   BoardGridMetrics,
+  GobanVisualOptions,
   createGobanSideTexture,
   createGobanTopTextures,
   createJujubeWoodTexture,
@@ -27,14 +28,16 @@ export interface BuiltRoomAssets {
   ornateGroup: THREE.Group;
   lanternLight: THREE.PointLight;
   setOrnateFinish: (enabled: boolean) => void;
+  setLightingBrightness: (brightness: number) => void;
   setTextureAnisotropy: (anisotropy: number) => void;
-  updateBoardTop: (metrics: BoardGridMetrics, showCoords: boolean) => void;
+  updateBoardTop: (metrics: BoardGridMetrics, showCoords: boolean, visualOpts?: GobanVisualOptions) => void;
   updateAtmosphere: (dt: number, elapsed: number) => void;
 }
 
 export function buildTraditionalBadukRoom(
   initialMetrics: BoardGridMetrics,
-  showCoords = true
+  showCoords = true,
+  initialVisualOpts: GobanVisualOptions = {}
 ): BuiltRoomAssets {
   const root = new THREE.Group();
 
@@ -108,10 +111,10 @@ export function buildTraditionalBadukRoom(
   const paperPanel = new THREE.Mesh(
     new THREE.PlaneGeometry(13.5, 6.2),
     new THREE.MeshStandardMaterial({
-      color: 0xf5e6c8,
-      emissive: new THREE.Color(0xffd699),
-      emissiveIntensity: 0.24,
-      roughness: 0.92,
+      color: 0xf0dec0,
+      emissive: new THREE.Color(0xffcf88),
+      emissiveIntensity: 0.14,
+      roughness: 0.94,
     })
   );
   screenGroup.add(paperPanel);
@@ -135,7 +138,7 @@ export function buildTraditionalBadukRoom(
   root.add(screenGroup);
 
   // 3. Thick Kaya Wood Goban (비자나무 각반, Top Surface at Y = 0)
-  let topTexBundle = createGobanTopTextures(initialMetrics, showCoords);
+  let topTexBundle = createGobanTopTextures(initialMetrics, showCoords, initialVisualOpts);
 
   const sideMat = new THREE.MeshStandardMaterial({
     map: sideGrainTex,
@@ -150,11 +153,11 @@ export function buildTraditionalBadukRoom(
   const topMat = new THREE.MeshPhysicalMaterial({
     map: topTexBundle.map,
     bumpMap: topTexBundle.bumpMap,
-    bumpScale: 0.0045,
+    bumpScale: 0.004,
     roughnessMap: topTexBundle.roughnessMap,
-    roughness: 0.85,
-    clearcoat: 0.24,
-    clearcoatRoughness: 0.32,
+    roughness: 0.92,
+    clearcoat: 0.14,
+    clearcoatRoughness: 0.42,
   });
   const bottomMat = new THREE.MeshStandardMaterial({
     color: 0x9b6728,
@@ -436,12 +439,12 @@ export function buildTraditionalBadukRoom(
 
   const nacreMat = new THREE.MeshPhysicalMaterial({
     map: motherOfPearlTex,
-    roughness: 0.14,
-    metalness: 0.12,
-    clearcoat: 1.0,
-    clearcoatRoughness: 0.06,
-    iridescence: 1.0,
-    iridescenceIOR: 1.44,
+    roughness: 0.26,
+    metalness: 0.08,
+    clearcoat: 0.42,
+    clearcoatRoughness: 0.22,
+    iridescence: 0.72,
+    iridescenceIOR: 1.38,
   });
 
   // 7a. Brass Corner Brackets & Nacre Coasters on Side Stands
@@ -516,7 +519,7 @@ export function buildTraditionalBadukRoom(
   lanternGroup.add(lCap);
   ornateGroup.add(lanternGroup);
 
-  const lanternLight = new THREE.PointLight(0xffba6b, 1.25, 10.5, 1.75);
+  const lanternLight = new THREE.PointLight(0xffba6b, 0.72, 10.5, 1.8);
   lanternLight.position.set(lanternPos.x + 0.15, lanternPos.y + 0.72, lanternPos.z + 0.15);
   ornateGroup.add(lanternLight);
 
@@ -552,10 +555,20 @@ export function buildTraditionalBadukRoom(
   ornateGroup.add(dustMotes);
 
   let ornateEnabled = true;
+  let lightingBrightness = 1.0;
   const setOrnateFinish = (enabled: boolean) => {
     ornateEnabled = enabled;
     ornateGroup.visible = enabled;
-    lanternLight.intensity = enabled ? 1.25 : 0;
+    lanternLight.intensity = enabled ? 0.72 * lightingBrightness : 0;
+  };
+
+  const setLightingBrightness = (brightness: number) => {
+    lightingBrightness = Math.max(0.5, Math.min(1.5, brightness));
+    (paperPanel.material as THREE.MeshStandardMaterial).emissiveIntensity = 0.14 * lightingBrightness;
+    (lCore.material as THREE.MeshStandardMaterial).emissiveIntensity = 0.92 * lightingBrightness;
+    if (ornateEnabled) {
+      lanternLight.intensity = 0.72 * lightingBrightness;
+    }
   };
 
   const setTextureAnisotropy = (aniso: number) => {
@@ -570,16 +583,22 @@ export function buildTraditionalBadukRoom(
     topTexBundle.map.needsUpdate = true;
   };
 
-  const updateBoardTop = (metrics: BoardGridMetrics, coordsVisible: boolean) => {
+  const updateBoardTop = (
+    metrics: BoardGridMetrics,
+    coordsVisible: boolean,
+    visualOpts: GobanVisualOptions = {}
+  ) => {
     const prevAniso = topTexBundle.map.anisotropy;
     topTexBundle.map.dispose();
     topTexBundle.bumpMap.dispose();
     topTexBundle.roughnessMap.dispose();
-    topTexBundle = createGobanTopTextures(metrics, coordsVisible);
+    topTexBundle = createGobanTopTextures(metrics, coordsVisible, visualOpts);
     topTexBundle.map.anisotropy = prevAniso;
     topMat.map = topTexBundle.map;
     topMat.bumpMap = topTexBundle.bumpMap;
     topMat.roughnessMap = topTexBundle.roughnessMap;
+    const isMatte = visualOpts.grainIntensity === 'soft' || visualOpts.grainIntensity === 'plain';
+    topMat.clearcoat = isMatte ? 0.06 : 0.14;
     topMat.needsUpdate = true;
   };
 
@@ -614,7 +633,7 @@ export function buildTraditionalBadukRoom(
         );
       }
       mAttr.needsUpdate = true;
-      lanternLight.intensity = 1.2 + Math.sin(elapsed * 4.2) * 0.07;
+      lanternLight.intensity = (0.72 + Math.sin(elapsed * 4.2) * 0.04) * lightingBrightness;
     }
   };
 
@@ -627,6 +646,7 @@ export function buildTraditionalBadukRoom(
     ornateGroup,
     lanternLight,
     setOrnateFinish,
+    setLightingBrightness,
     setTextureAnisotropy,
     updateBoardTop,
     updateAtmosphere,

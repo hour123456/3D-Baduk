@@ -2,8 +2,12 @@ import { BLACK, WHITE, BoardSize, GameConfig, GameType, OmokRulesetType, PlayerC
 import { ClockSnapshot } from '../rules/clock';
 import { ProfileManager } from '../profile/ProfileManager';
 import {
+  AdminBanEntry,
+  AdminInterceptedChatMessage,
+  AdminStealthWelcomePayload,
   CreateRoomOptions,
   DeadTogglePacketPayload,
+  LiveConnectedUserRecord,
   MovePacketPayload,
   OnlineEnvelope,
   OnlineMatchInitPayload,
@@ -19,13 +23,27 @@ import {
   QuickMatchSizePref,
   RoomSummary,
   ScoreAgreePacketPayload,
+  SignedAdminForceClosePayload,
+  SignedAdminStealthInspectPayload,
+  SignedBanRegistryPayload,
   SyncSnapshotPayload,
 } from './types';
+import {
+  canonicalizePayload,
+  detectPublicIp,
+  encryptIpForAdmin,
+  findActiveBanForIdentity,
+  formatBanDurationRemaining,
+  hashIpAddress,
+  isBanActive,
+  verifyAdminSignature,
+} from './adminSecurity';
 
 const TOPIC_PREFIX = 'sudam-3d-baduk-v1';
 const ROOM_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const ROOM_TTL_MS = 25000;
 const PRESENCE_TTL_MS = 28000;
+const ADMIN_CMD_MAX_AGE_MS = 120000;
 
 function generateChatToken(): string {
   return `${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`;
@@ -81,6 +99,19 @@ export interface OnlineMatchCallbacks {
   onSyncRequested: () => SyncSnapshotPayload | null;
   onSyncSnapshotReceived: (snapshot: SyncSnapshotPayload) => void;
   onError: (message: string) => void;
+
+  // Admin Console & Ban / Moderation Callbacks
+  onLiveUsersChanged?: (users: LiveConnectedUserRecord[]) => void;
+  onBanRegistryChanged?: (bans: AdminBanEntry[]) => void;
+  onSelfBanned?: (ban: AdminBanEntry) => void;
+  onRoomForceClosed?: (reason: string) => void;
+  onAdminMonitorChat?: (msg: AdminInterceptedChatMessage) => void;
+  onAdminStealthJoined?: (welcome: AdminStealthWelcomePayload) => void;
+}
+
+export interface OnlineMatchManagerOptions {
+  adminMode?: boolean;
+  simulatedPublicIp?: string;
 }
 
 interface QuickMatchSeekPayload {
@@ -116,6 +147,8 @@ interface RoomJoinReqPayload {
   roomCode: string;
   guestId: string;
   guestName: string;
+  accountId?: string;
+  ipHash?: string;
   password?: string;
 }
 
@@ -123,6 +156,8 @@ interface SpectateJoinReqPayload {
   roomCode: string;
   spectatorId: string;
   spectatorName: string;
+  accountId?: string;
+  ipHash?: string;
   password?: string;
 }
 
@@ -137,6 +172,8 @@ export class OnlineMatchManager {
   private profile: ProfileManager;
   private transport: OnlineTransport;
   private callbacks: OnlineMatchCallbacks;
+  private adminMode = false;
+  private simulatedPublicIp?: string;
 
   private phase: OnlineSessionPhase = 'idle';
   private sessionRole: OnlineSessionRole = 'none';
@@ -170,8 +207,23 @@ export class OnlineMatchManager {
 
   private presenceTracking = false;
   private presencePeers = new Map<string, { activity: PresenceActivity; updatedAt: number }>();
+  private liveUsers = new Map<string, LiveConnectedUserRecord>();
   private presenceHbTimer: ReturnType<typeof setInterval> | null = null;
   private presencePruneTimer: ReturnType<typeof setInterval> | null = null;
+
+  // Client network identity & ban enforcement
+  private connectedAt = Date.now();
+  private myIpHash = '';
+  private myEncryptedIp = '';
+  private myIpReadyPromise: Promise<void> | null = null;
+  private banRegistry: AdminBanEntry[] = [];
+  private adminSubscribed = false;
+  private pendingBanVerifyPromise: Promise<void> | null = null;
+
+  // Admin stealth room monitoring state
+  private stealthTargetHostId = '';
+  private stealthTargetGuestId = '';
+  private stealthJoinTimeout: ReturnType<typeof setTimeout> | null = null;
 
   // Join room retry timer
   private joinRetryTimer: ReturnType<typeof setInterval> | null = null;
@@ -200,16 +252,23 @@ export class OnlineMatchManager {
   constructor(
     profile: ProfileManager,
     transport: OnlineTransport,
-    callbacks: OnlineMatchCallbacks
+    callbacks: OnlineMatchCallbacks,
+    options?: OnlineMatchManagerOptions
   ) {
     this.profile = profile;
     this.transport = transport;
     this.callbacks = callbacks;
+    this.adminMode = Boolean(options?.adminMode);
+    this.simulatedPublicIp = options?.simulatedPublicIp;
 
     this.transport.onStatusChange((status, label) => {
       this.callbacks.onStatusChange(status, label);
-      if (status === 'connected' && this.phase === 'in_game' && this.activeRoomCode) {
-        this.sendRoomPacket('sync_request', { roomCode: this.activeRoomCode });
+      if (status === 'connected') {
+        this.adminSubscribed = false;
+        void this.subscribeAdminChannels();
+        if (this.phase === 'in_game' && this.activeRoomCode) {
+          this.sendRoomPacket('sync_request', { roomCode: this.activeRoomCode });
+        }
       }
     });
 
@@ -219,7 +278,7 @@ export class OnlineMatchManager {
 
     if (typeof window !== 'undefined') {
       window.addEventListener('beforeunload', () => {
-        if (this.presenceTracking && this.transport.isConnected()) {
+        if (!this.adminMode && this.presenceTracking && this.transport.isConnected()) {
           this.transport.publish(
             this.presenceTopic(),
             this.makeEnvelope('presence_bye', { clientId: this.profile.getClientId() })
@@ -316,9 +375,116 @@ export class OnlineMatchManager {
     return `${TOPIC_PREFIX}/room/${roomCode}/spectator_chat`;
   }
 
+  private adminBansTopic(): string {
+    return `${TOPIC_PREFIX}/admin/bans`;
+  }
+
+  private adminEventsTopic(): string {
+    return `${TOPIC_PREFIX}/admin/events`;
+  }
+
+  private isElectronClient(): boolean {
+    return typeof window !== 'undefined' && Boolean(window.electronAPI?.isElectron);
+  }
+
+  private async ensureClientNetworkIdentity(): Promise<void> {
+    if (this.adminMode || this.myIpHash) return;
+    if (!this.myIpReadyPromise) {
+      this.myIpReadyPromise = (async () => {
+        try {
+          const detected = this.simulatedPublicIp || (await detectPublicIp()) || '127.0.0.1';
+          this.myIpHash = await hashIpAddress(detected);
+          this.myEncryptedIp = await encryptIpForAdmin(detected);
+        } catch {
+          this.myIpHash = await hashIpAddress('0.0.0.0');
+          this.myEncryptedIp = '';
+        }
+      })();
+    }
+    await this.myIpReadyPromise;
+  }
+
+  private async subscribeAdminChannels(): Promise<void> {
+    if (this.adminSubscribed || !this.transport.isConnected()) return;
+    this.adminSubscribed = true;
+    try {
+      await this.transport.subscribe(this.adminBansTopic());
+      await this.transport.subscribe(this.adminEventsTopic());
+      if (this.pendingBanVerifyPromise) {
+        await this.pendingBanVerifyPromise;
+      }
+    } catch {
+      this.adminSubscribed = false;
+    }
+  }
+
   public async ensureConnected(): Promise<void> {
+    await this.ensureClientNetworkIdentity();
     await this.transport.connect();
     await this.transport.subscribe(this.directTopic(this.profile.getClientId()));
+    await this.subscribeAdminChannels();
+    if (this.pendingBanVerifyPromise) {
+      await this.pendingBanVerifyPromise;
+    }
+  }
+
+  private getProfileAccountId(): string {
+    return typeof this.profile.getAccountId === 'function'
+      ? this.profile.getAccountId()
+      : this.profile.getClientId();
+  }
+
+  public getBanRegistry(): AdminBanEntry[] {
+    return this.banRegistry.filter((b) => isBanActive(b));
+  }
+
+  public getActiveBanForSelf(): AdminBanEntry | null {
+    if (this.adminMode) return null;
+    return findActiveBanForIdentity(this.banRegistry, {
+      accountId: this.getProfileAccountId(),
+      clientId: this.profile.getClientId(),
+      ipHash: this.myIpHash,
+    });
+  }
+
+  private enforceBanOnSelf(): AdminBanEntry | null {
+    const ban = this.getActiveBanForSelf();
+    if (!ban) return null;
+    if (this.phase !== 'idle') {
+      void this.cancelMatchmakingOrRoom();
+    }
+    this.callbacks.onSelfBanned?.(ban);
+    return ban;
+  }
+
+  public getLiveConnectedUsers(): LiveConnectedUserRecord[] {
+    const now = Date.now();
+    const out: LiveConnectedUserRecord[] = [];
+    for (const [id, rec] of this.liveUsers.entries()) {
+      if (now - rec.updatedAt > PRESENCE_TTL_MS) {
+        this.liveUsers.delete(id);
+        continue;
+      }
+      out.push({ ...rec });
+    }
+    if (this.presenceTracking && !this.adminMode) {
+      const myId = this.profile.getClientId();
+      if (!this.liveUsers.has(myId)) {
+        out.push({
+          clientId: myId,
+          accountId: this.getProfileAccountId(),
+          nickname: this.profile.getNickname(),
+          platform: this.isElectronClient() ? 'desktop' : 'web',
+          activity: this.getMyPresenceActivity(),
+          roomCode: this.activeRoomCode || undefined,
+          ipHash: this.myIpHash,
+          encryptedIp: this.myEncryptedIp,
+          connectedAt: this.connectedAt,
+          updatedAt: now,
+        });
+      }
+    }
+    return out.sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
   // =========================================================================
@@ -333,7 +499,7 @@ export class OnlineMatchManager {
 
   public async startPresenceTracking(): Promise<void> {
     if (this.presenceTracking) {
-      this.publishPresenceHeartbeat();
+      if (!this.adminMode) this.publishPresenceHeartbeat();
       this.emitPresenceStats();
       return;
     }
@@ -345,9 +511,11 @@ export class OnlineMatchManager {
       this.presenceTopic(),
       this.makeEnvelope('presence_req', { requesterId: this.profile.getClientId() })
     );
-    this.publishPresenceHeartbeat();
+    if (!this.adminMode) {
+      this.publishPresenceHeartbeat();
+      this.presenceHbTimer = setInterval(() => this.publishPresenceHeartbeat(), 10000);
+    }
     this.emitPresenceStats();
-    this.presenceHbTimer = setInterval(() => this.publishPresenceHeartbeat(), 10000);
     this.presencePruneTimer = setInterval(() => this.prunePresencePeers(), 5000);
   }
 
@@ -361,23 +529,33 @@ export class OnlineMatchManager {
       this.presencePruneTimer = null;
     }
     if (this.presenceTracking && this.transport.isConnected()) {
-      this.transport.publish(
-        this.presenceTopic(),
-        this.makeEnvelope('presence_bye', { clientId: this.profile.getClientId() })
-      );
+      if (!this.adminMode) {
+        this.transport.publish(
+          this.presenceTopic(),
+          this.makeEnvelope('presence_bye', { clientId: this.profile.getClientId() })
+        );
+      }
       void this.transport.unsubscribe(this.presenceTopic());
     }
     this.presenceTracking = false;
     this.presencePeers.clear();
+    this.liveUsers.clear();
   }
 
   private publishPresenceHeartbeat(): void {
-    if (!this.presenceTracking || !this.transport.isConnected()) return;
+    if (this.adminMode || !this.presenceTracking || !this.transport.isConnected()) return;
     this.transport.publish(
       this.presenceTopic(),
       this.makeEnvelope('presence_hb', {
         clientId: this.profile.getClientId(),
+        accountId: this.getProfileAccountId(),
+        nickname: this.profile.getNickname(),
+        platform: this.isElectronClient() ? 'desktop' : 'web',
         activity: this.getMyPresenceActivity(),
+        roomCode: this.activeRoomCode || undefined,
+        ipHash: this.myIpHash,
+        encryptedIp: this.myEncryptedIp,
+        connectedAt: this.connectedAt,
         sentAt: Date.now(),
       })
     );
@@ -389,6 +567,7 @@ export class OnlineMatchManager {
     for (const [id, entry] of this.presencePeers.entries()) {
       if (now - entry.updatedAt > PRESENCE_TTL_MS) {
         this.presencePeers.delete(id);
+        this.liveUsers.delete(id);
         changed = true;
       }
     }
@@ -404,7 +583,7 @@ export class OnlineMatchManager {
     let inGameUsers = 0;
     let spectatingUsers = 0;
 
-    if (this.presenceTracking) {
+    if (this.presenceTracking && !this.adminMode) {
       onlineUsers = 1;
       const myActivity = this.getMyPresenceActivity();
       if (myActivity === 'playing') inGameUsers++;
@@ -415,6 +594,7 @@ export class OnlineMatchManager {
       if (id === myId) continue;
       if (now - entry.updatedAt > PRESENCE_TTL_MS) {
         this.presencePeers.delete(id);
+        this.liveUsers.delete(id);
         continue;
       }
       onlineUsers++;
@@ -427,6 +607,7 @@ export class OnlineMatchManager {
 
   private emitPresenceStats(): void {
     this.callbacks.onPresenceUpdated?.(this.getPresenceStats());
+    this.callbacks.onLiveUsersChanged?.(this.getLiveConnectedUsers());
   }
 
   // =========================================================================
@@ -492,6 +673,13 @@ export class OnlineMatchManager {
     this.callbacks.onOpenRoomsUpdated(list);
   }
 
+  public getOpenRooms(): RoomSummary[] {
+    this.pruneStaleRooms();
+    return Array.from(this.openRooms.values())
+      .filter((r) => Date.now() - r.updatedAt <= ROOM_TTL_MS)
+      .sort((a, b) => b.createdAt - a.createdAt);
+  }
+
   // =========================================================================
   // Create & Host Room
   // =========================================================================
@@ -505,6 +693,10 @@ export class OnlineMatchManager {
     await this.cancelMatchmakingOrRoom();
     const seq = ++this.sessionSeq;
     await this.ensureConnected();
+    const activeBan = this.enforceBanOnSelf();
+    if (activeBan) {
+      throw new Error(`이용 제한 중입니다 (${formatBanDurationRemaining(activeBan.expiresAt)})`);
+    }
     if (seq !== this.sessionSeq) throw new Error('대국방 생성 요청이 취소되었습니다.');
 
     const roomCode = generateRoomCode(6);
@@ -603,6 +795,7 @@ export class OnlineMatchManager {
       throw err;
     }
     if (seq !== this.sessionSeq) return;
+    if (this.enforceBanOnSelf()) return;
     await this.transport.subscribe(this.roomTopic(roomCode));
 
     const sendReq = () => {
@@ -611,6 +804,8 @@ export class OnlineMatchManager {
         roomCode,
         guestId: this.profile.getClientId(),
         guestName: this.profile.getNickname(),
+        accountId: this.getProfileAccountId(),
+        ipHash: this.myIpHash,
         password: password?.trim() || undefined,
       };
       this.transport.publish(this.roomTopic(roomCode), this.makeEnvelope('room_join_req', req));
@@ -645,6 +840,7 @@ export class OnlineMatchManager {
       throw err;
     }
     if (seq !== this.sessionSeq) return;
+    if (this.enforceBanOnSelf()) return;
     await this.transport.subscribe(this.roomTopic(roomCode));
     await this.transport.subscribe(this.spectatorChatTopic(roomCode));
 
@@ -654,6 +850,8 @@ export class OnlineMatchManager {
         roomCode,
         spectatorId: this.profile.getClientId(),
         spectatorName: this.profile.getNickname(),
+        accountId: this.getProfileAccountId(),
+        ipHash: this.myIpHash,
         password: password?.trim() || undefined,
       };
       this.transport.publish(this.roomTopic(roomCode), this.makeEnvelope('spectate_join_req', req));
@@ -694,6 +892,7 @@ export class OnlineMatchManager {
       throw err;
     }
     if (seq !== this.sessionSeq) return;
+    if (this.enforceBanOnSelf()) return;
 
     await this.transport.subscribe(this.quickMatchTopic());
 
@@ -744,16 +943,25 @@ export class OnlineMatchManager {
       clearInterval(this.spectatorPruneTimer);
       this.spectatorPruneTimer = null;
     }
+    if (this.stealthJoinTimeout) {
+      clearTimeout(this.stealthJoinTimeout);
+      this.stealthJoinTimeout = null;
+    }
 
     const prevHosted = this.hostedRoom;
     const prevRoomCode = this.activeRoomCode;
+    const prevStealthHostId = this.stealthTargetHostId;
+    const prevStealthGuestId = this.stealthTargetGuestId;
+    const wasStealth = this.sessionRole === 'admin_stealth';
     const wasInGame = this.phase === 'in_game';
-    const wasSpectating = this.phase === 'spectating';
+    const wasSpectating = this.phase === 'spectating' && !wasStealth;
 
     this.hostedRoom = null;
     this.hostRoomPassword = '';
     this.activeSpectators.clear();
     this.activeRoomCode = null;
+    this.stealthTargetHostId = '';
+    this.stealthTargetGuestId = '';
     this.qmPendingOffer = null;
     this.qmAcceptedRoomCode = null;
     this.roleInfo = null;
@@ -796,6 +1004,13 @@ export class OnlineMatchManager {
     }
 
     if (seq === this.sessionSeq) {
+      const myId = this.profile.getClientId();
+      if (prevStealthHostId && prevStealthHostId !== myId) {
+        await this.transport.unsubscribe(this.directTopic(prevStealthHostId));
+      }
+      if (prevStealthGuestId && prevStealthGuestId !== myId && prevStealthGuestId !== prevStealthHostId) {
+        await this.transport.unsubscribe(this.directTopic(prevStealthGuestId));
+      }
       await this.transport.unsubscribe(this.quickMatchTopic());
     }
   }
@@ -809,7 +1024,11 @@ export class OnlineMatchManager {
         roomCode: this.activeRoomCode,
         senderName: this.profile.getNickname(),
       });
-    } else if (this.phase === 'spectating' && this.activeRoomCode) {
+    } else if (
+      this.phase === 'spectating' &&
+      this.sessionRole === 'spectator' &&
+      this.activeRoomCode
+    ) {
       this.sendRoomPacket('spectator_leave', {
         roomCode: this.activeRoomCode,
         spectatorId: this.profile.getClientId(),
@@ -825,6 +1044,18 @@ export class OnlineMatchManager {
   // =========================================================================
 
   private handleIncomingMessage(topic: string, rawData: unknown): void {
+    // 0. Global retained Ban Registry (ECDSA P-256 verified)
+    if (topic === this.adminBansTopic()) {
+      const p = this.handleSignedBanRegistry(rawData);
+      const wrapped = p.finally(() => {
+        if (this.pendingBanVerifyPromise === wrapped) {
+          this.pendingBanVerifyPromise = null;
+        }
+      });
+      this.pendingBanVerifyPromise = wrapped;
+      return;
+    }
+
     // 1. Lobby directory retained room updates
     const lobbyPrefix = `${TOPIC_PREFIX}/lobby/rooms/`;
     if (topic.startsWith(lobbyPrefix)) {
@@ -852,42 +1083,127 @@ export class OnlineMatchManager {
     if (env.senderId === this.profile.getClientId()) return;
     if (!this.markSeen(env.msgId)) return;
 
+    // 2.5 Global Admin Moderation Events (e.g. Force Close)
+    if (topic === this.adminEventsTopic()) {
+      if (env.type === 'admin_force_close') {
+        void this.handleSignedForceClose(env.payload as SignedAdminForceClosePayload);
+      }
+      return;
+    }
+
     // Web live concurrent user presence packets
     if (topic === this.presenceTopic()) {
       if (env.type === 'presence_hb') {
-        const p = env.payload as { clientId?: string; activity?: PresenceActivity };
+        const p = env.payload as {
+          clientId?: string;
+          accountId?: string;
+          nickname?: string;
+          platform?: 'web' | 'desktop';
+          activity?: PresenceActivity;
+          roomCode?: string;
+          ipHash?: string;
+          encryptedIp?: string;
+          connectedAt?: number;
+          sentAt?: number;
+        };
         if (p?.clientId) {
+          const now = Date.now();
           this.presencePeers.set(p.clientId, {
             activity: p.activity ?? 'lobby',
-            updatedAt: Date.now(),
+            updatedAt: now,
+          });
+          this.liveUsers.set(p.clientId, {
+            clientId: p.clientId,
+            accountId: p.accountId || p.clientId,
+            nickname: p.nickname || '익명 기객',
+            platform: p.platform === 'desktop' ? 'desktop' : 'web',
+            activity: p.activity ?? 'lobby',
+            roomCode: p.roomCode,
+            ipHash: p.ipHash || '',
+            encryptedIp: p.encryptedIp || '',
+            connectedAt: p.connectedAt || p.sentAt || now,
+            updatedAt: now,
           });
           this.emitPresenceStats();
         }
       } else if (env.type === 'presence_bye') {
         const p = env.payload as { clientId?: string };
-        if (p?.clientId && this.presencePeers.delete(p.clientId)) {
-          this.emitPresenceStats();
+        if (p?.clientId) {
+          const delPeer = this.presencePeers.delete(p.clientId);
+          const delUser = this.liveUsers.delete(p.clientId);
+          if (delPeer || delUser) {
+            this.emitPresenceStats();
+          }
         }
       } else if (env.type === 'presence_req') {
-        this.publishPresenceHeartbeat();
+        if (!this.adminMode) {
+          this.publishPresenceHeartbeat();
+        }
       }
       return;
     }
 
-    // Spectator-only isolated chat channel (players NEVER process this topic)
+    // Spectator-only isolated chat channel (players NEVER process this topic; admin stealth sees ALL)
     if (this.activeRoomCode && topic === this.spectatorChatTopic(this.activeRoomCode)) {
-      if (
-        this.phase === 'spectating' &&
-        this.sessionRole === 'spectator' &&
-        env.type === 'spectator_chat'
-      ) {
+      if (env.type === 'spectator_chat') {
         const p = env.payload as { roomCode?: string; senderName?: string; text?: string };
         if (p && p.roomCode === this.activeRoomCode && typeof p.text === 'string' && p.text.trim()) {
-          this.callbacks.onRemoteSpectatorChat?.(
-            p.senderName || '관전자',
-            env.senderId,
-            p.text
-          );
+          if (this.sessionRole === 'admin_stealth' && this.adminMode) {
+            this.callbacks.onAdminMonitorChat?.({
+              channel: 'spectator',
+              roomCode: this.activeRoomCode,
+              senderId: env.senderId,
+              senderName: p.senderName || '관전자',
+              text: p.text,
+              sentAt: env.sentAt || Date.now(),
+            });
+          } else if (this.phase === 'spectating' && this.sessionRole === 'spectator') {
+            this.callbacks.onRemoteSpectatorChat?.(
+              p.senderName || '관전자',
+              env.senderId,
+              p.text
+            );
+          }
+        }
+      }
+      return;
+    }
+
+    // Admin Stealth Wiretap of host/guest direct channels (for 1:1 private player_chat + match updates)
+    if (
+      this.adminMode &&
+      this.sessionRole === 'admin_stealth' &&
+      this.activeRoomCode &&
+      ((this.stealthTargetHostId && topic === this.directTopic(this.stealthTargetHostId)) ||
+        (this.stealthTargetGuestId && topic === this.directTopic(this.stealthTargetGuestId)))
+    ) {
+      if (env.type === 'player_chat') {
+        const p = env.payload as {
+          roomCode?: string;
+          senderName?: string;
+          senderColor?: PlayerColor;
+          text?: string;
+        };
+        if (p && p.roomCode === this.activeRoomCode && typeof p.text === 'string' && p.text.trim()) {
+          this.callbacks.onAdminMonitorChat?.({
+            channel: 'player',
+            roomCode: this.activeRoomCode,
+            senderId: env.senderId,
+            senderName: p.senderName || '대국자',
+            senderColor: p.senderColor,
+            text: p.text,
+            sentAt: env.sentAt || Date.now(),
+          });
+        }
+      } else if (env.type === 'match_start') {
+        const init = env.payload as OnlineMatchInitPayload;
+        if (init && init.roomCode === this.activeRoomCode) {
+          void this.handleAdminStealthMatchUpdate(init);
+        }
+      } else if (env.type === 'rematch_response') {
+        const p = env.payload as { accepted: boolean; nextMatch?: OnlineMatchInitPayload };
+        if (p?.accepted && p.nextMatch && p.nextMatch.roomCode === this.activeRoomCode) {
+          void this.handleAdminStealthMatchUpdate(p.nextMatch);
         }
       }
       return;
@@ -907,6 +1223,14 @@ export class OnlineMatchManager {
 
     // Direct signaling & direct 1:1 player chat
     if (topic === this.directTopic(this.profile.getClientId())) {
+      if (env.type === 'admin_stealth_inspect') {
+        void this.handleIncomingAdminStealthInspect(env.payload as SignedAdminStealthInspectPayload);
+        return;
+      }
+      if (env.type === 'admin_stealth_welcome') {
+        void this.handleAdminStealthWelcome(env.payload as AdminStealthWelcomePayload);
+        return;
+      }
       if (env.type === 'qm_offer') {
         void this.handleQuickMatchOffer(env.payload as QuickMatchOfferPayload);
         return;
@@ -1197,6 +1521,18 @@ export class OnlineMatchManager {
         }
 
         const room = this.hostedRoom;
+        const guestBan = findActiveBanForIdentity(this.banRegistry, {
+          accountId: req.accountId,
+          clientId: req.guestId,
+          ipHash: req.ipHash,
+        });
+        if (guestBan) {
+          this.sendRoomPacket('room_join_reject', {
+            targetGuestId: req.guestId,
+            reason: `관리자에 의해 온라인 이용이 제한된 사용자입니다 (${formatBanDurationRemaining(guestBan.expiresAt)}).`,
+          });
+          return;
+        }
         // Private room password check strictly inside host memory
         if (!room.isPublic && this.hostRoomPassword) {
           if (!req.password || !req.password.trim()) {
@@ -1284,6 +1620,19 @@ export class OnlineMatchManager {
         }
         const req = env.payload as SpectateJoinReqPayload;
         if (!req || req.roomCode !== this.activeRoomCode || !req.spectatorId) return;
+
+        const specBan = findActiveBanForIdentity(this.banRegistry, {
+          accountId: req.accountId,
+          clientId: req.spectatorId,
+          ipHash: req.ipHash,
+        });
+        if (specBan) {
+          this.sendRoomPacket('room_join_reject', {
+            targetGuestId: req.spectatorId,
+            reason: `관리자에 의해 관전 입장이 제한되었습니다 (${formatBanDurationRemaining(specBan.expiresAt)}).`,
+          });
+          return;
+        }
 
         // Private room password verification for spectators
         if (!this.hostedRoom.isPublic && this.hostRoomPassword) {
@@ -1385,8 +1734,17 @@ export class OnlineMatchManager {
         break;
       }
 
+      case 'admin_stealth_inspect': {
+        void this.handleIncomingAdminStealthInspect(env.payload as SignedAdminStealthInspectPayload);
+        break;
+      }
+
       case 'match_start': {
-        void this.handleMatchStartPacket(env.payload as OnlineMatchInitPayload, false);
+        if (this.adminMode && this.sessionRole === 'admin_stealth') {
+          void this.handleAdminStealthMatchUpdate(env.payload as OnlineMatchInitPayload);
+        } else {
+          void this.handleMatchStartPacket(env.payload as OnlineMatchInitPayload, false);
+        }
         break;
       }
 
@@ -1475,6 +1833,12 @@ export class OnlineMatchManager {
       case 'rematch_response': {
         if (!isPlayerOrSpectator) return;
         const p = env.payload as { accepted: boolean; nextMatch?: OnlineMatchInitPayload };
+        if (this.sessionRole === 'admin_stealth' && this.adminMode) {
+          if (p.accepted && p.nextMatch) {
+            void this.handleAdminStealthMatchUpdate(p.nextMatch);
+          }
+          return;
+        }
         if (this.phase === 'spectating') {
           if (p.accepted && p.nextMatch) {
             void this.handleSpectateRematch(p.nextMatch);
@@ -1490,9 +1854,21 @@ export class OnlineMatchManager {
       }
 
       case 'chat': {
-        // Legacy room topic chat strictly ignored by spectators
-        if (this.phase !== 'in_game' || this.sessionRole !== 'player') return;
         const p = env.payload as { senderName: string; senderColor: PlayerColor; text: string };
+        if (this.sessionRole === 'admin_stealth' && this.adminMode && this.activeRoomCode) {
+          this.callbacks.onAdminMonitorChat?.({
+            channel: 'player',
+            roomCode: this.activeRoomCode,
+            senderId: env.senderId,
+            senderName: p.senderName || '대국자',
+            senderColor: p.senderColor,
+            text: p.text,
+            sentAt: env.sentAt || Date.now(),
+          });
+          return;
+        }
+        // Legacy room topic chat strictly ignored by normal spectators
+        if (this.phase !== 'in_game' || this.sessionRole !== 'player') return;
         this.callbacks.onRemotePlayerChat?.(p.senderName, p.senderColor, p.text);
         this.callbacks.onRemoteChat(p.senderName, p.senderColor, p.text);
         break;
@@ -1965,5 +2341,318 @@ export class OnlineMatchManager {
     const url = new URL(window.location.href);
     url.searchParams.set('room', this.activeRoomCode);
     return url.toString();
+  }
+
+  // =========================================================================
+  // Admin Console Signed Verification, Enforcement & Stealth Monitoring
+  // =========================================================================
+
+  private async handleSignedBanRegistry(rawData: unknown): Promise<void> {
+    if (rawData === null) {
+      this.banRegistry = [];
+      this.callbacks.onBanRegistryChanged?.([]);
+      return;
+    }
+    const p = rawData as Partial<SignedBanRegistryPayload> | null;
+    if (
+      !p ||
+      typeof p.version !== 'number' ||
+      typeof p.updatedAt !== 'number' ||
+      !Array.isArray(p.bans) ||
+      typeof p.signature !== 'string'
+    ) {
+      return;
+    }
+
+    const ok = await verifyAdminSignature(
+      { version: p.version, updatedAt: p.updatedAt, bans: p.bans },
+      p.signature
+    );
+    if (!ok) return;
+
+    this.banRegistry = p.bans.filter((b) => isBanActive(b));
+    this.callbacks.onBanRegistryChanged?.(this.getBanRegistry());
+    if (!this.adminMode) {
+      this.enforceBanOnSelf();
+    }
+  }
+
+  private async handleSignedForceClose(raw: SignedAdminForceClosePayload): Promise<void> {
+    if (
+      !raw ||
+      raw.action !== 'admin_force_close' ||
+      typeof raw.roomCode !== 'string' ||
+      typeof raw.reason !== 'string' ||
+      typeof raw.issuedAt !== 'number' ||
+      typeof raw.signature !== 'string'
+    ) {
+      return;
+    }
+    if (Math.abs(Date.now() - raw.issuedAt) > ADMIN_CMD_MAX_AGE_MS) {
+      return;
+    }
+
+    const ok = await verifyAdminSignature(
+      {
+        action: 'admin_force_close',
+        roomCode: raw.roomCode,
+        reason: raw.reason,
+        issuedAt: raw.issuedAt,
+      },
+      raw.signature
+    );
+    if (!ok) return;
+
+    if (this.openRooms.delete(raw.roomCode)) {
+      this.emitOpenRooms();
+    }
+
+    if (this.activeRoomCode !== raw.roomCode) return;
+
+    if (this.hostedRoom && this.hostedRoom.roomCode === raw.roomCode) {
+      this.clearHostedRoomListing(raw.roomCode);
+    }
+
+    const wasAdmin = this.adminMode;
+    await this.cancelMatchmakingOrRoom();
+    if (!wasAdmin) {
+      this.callbacks.onRoomForceClosed?.(raw.reason || '관리자에 의해 대국방이 강제 종료되었습니다.');
+    }
+  }
+
+  private async handleIncomingAdminStealthInspect(
+    raw: SignedAdminStealthInspectPayload
+  ): Promise<void> {
+    if (
+      !raw ||
+      raw.action !== 'admin_stealth_inspect' ||
+      typeof raw.roomCode !== 'string' ||
+      typeof raw.adminId !== 'string' ||
+      typeof raw.timestamp !== 'number' ||
+      typeof raw.signature !== 'string'
+    ) {
+      return;
+    }
+    if (!this.hostedRoom || this.hostedRoom.roomCode !== raw.roomCode) {
+      return;
+    }
+    if (Math.abs(Date.now() - raw.timestamp) > ADMIN_CMD_MAX_AGE_MS) {
+      return;
+    }
+
+    const ok = await verifyAdminSignature(
+      {
+        action: 'admin_stealth_inspect',
+        roomCode: raw.roomCode,
+        adminId: raw.adminId,
+        timestamp: raw.timestamp,
+      },
+      raw.signature
+    );
+    if (!ok) return;
+
+    // Zero-notice, passwordless stealth response:
+    // NEVER verify password, NEVER touch activeSpectators or spectatorCount, NEVER notify players/spectators
+    let safeInit: OnlineMatchInitPayload | undefined;
+    if (this.lastMatchInit) {
+      safeInit = { ...this.lastMatchInit };
+      delete safeInit.playerChatToken;
+    }
+
+    const welcome: AdminStealthWelcomePayload = {
+      roomCode: raw.roomCode,
+      roomStatus: this.hostedRoom.status,
+      roomListing: { ...this.hostedRoom },
+      hostId: this.profile.getClientId(),
+      guestId: this.lastMatchInit?.guestId || '',
+      matchInit: safeInit,
+      snapshot: this.phase === 'in_game' ? this.callbacks.onSyncRequested() : null,
+    };
+
+    this.transport.publish(
+      this.directTopic(raw.adminId),
+      this.makeEnvelope('admin_stealth_welcome', welcome)
+    );
+  }
+
+  private async handleAdminStealthWelcome(welcome: AdminStealthWelcomePayload): Promise<void> {
+    if (!this.adminMode || this.sessionRole !== 'admin_stealth') return;
+    if (!welcome || welcome.roomCode !== this.activeRoomCode) return;
+
+    if (this.stealthJoinTimeout) {
+      clearTimeout(this.stealthJoinTimeout);
+      this.stealthJoinTimeout = null;
+    }
+
+    this.stealthTargetHostId = welcome.hostId;
+    if (welcome.hostId) {
+      await this.transport.subscribe(this.directTopic(welcome.hostId));
+    }
+    if (welcome.guestId) {
+      this.stealthTargetGuestId = welcome.guestId;
+      await this.transport.subscribe(this.directTopic(welcome.guestId));
+    }
+
+    await this.transport.subscribe(this.roomTopic(welcome.roomCode));
+    await this.transport.subscribe(this.spectatorChatTopic(welcome.roomCode));
+
+    if (welcome.matchInit) {
+      const safeInit: OnlineMatchInitPayload = { ...welcome.matchInit };
+      delete safeInit.playerChatToken;
+      this.lastMatchInit = safeInit;
+      this.resetScoreAgreement();
+      this.roleInfo = {
+        roomCode: welcome.roomCode,
+        isHost: false,
+        myColor: BLACK,
+        opponentName: safeInit.whiteName,
+        opponentId: '',
+        sessionRole: 'admin_stealth',
+        spectatorCount: welcome.roomListing?.spectatorCount ?? 0,
+      };
+      this.setPhase('spectating', welcome.roomCode);
+      const config = this.buildGameConfigFromInit(safeInit, BLACK);
+      this.callbacks.onSpectateStart?.(
+        config,
+        safeInit,
+        welcome.snapshot ?? null,
+        welcome.roomListing?.spectatorCount ?? 0
+      );
+    } else {
+      this.setPhase('spectating', welcome.roomCode);
+    }
+
+    this.callbacks.onAdminStealthJoined?.(welcome);
+  }
+
+  private async handleAdminStealthMatchUpdate(init: OnlineMatchInitPayload): Promise<void> {
+    if (!this.adminMode || this.sessionRole !== 'admin_stealth' || !this.activeRoomCode) return;
+    if (init.roomCode !== this.activeRoomCode) return;
+    if (this.lastMatchInit?.startedAt === init.startedAt) return;
+
+    if (init.guestId && init.guestId !== this.stealthTargetGuestId) {
+      this.stealthTargetGuestId = init.guestId;
+      await this.transport.subscribe(this.directTopic(init.guestId));
+    }
+    if (init.hostId && init.hostId !== this.stealthTargetHostId) {
+      this.stealthTargetHostId = init.hostId;
+      await this.transport.subscribe(this.directTopic(init.hostId));
+    }
+
+    const safeInit: OnlineMatchInitPayload = { ...init };
+    delete safeInit.playerChatToken;
+    this.lastMatchInit = safeInit;
+    this.resetScoreAgreement();
+    this.roleInfo = {
+      roomCode: init.roomCode,
+      isHost: false,
+      myColor: BLACK,
+      opponentName: safeInit.whiteName,
+      opponentId: '',
+      sessionRole: 'admin_stealth',
+      spectatorCount: this.roleInfo?.spectatorCount ?? 0,
+    };
+    this.setPhase('spectating', init.roomCode);
+    const config = this.buildGameConfigFromInit(safeInit, BLACK);
+    this.callbacks.onSpectateStart?.(config, safeInit, null, this.roleInfo.spectatorCount ?? 0);
+  }
+
+  public async adminInitializeMonitoring(): Promise<void> {
+    if (!this.adminMode) return;
+    await this.startPresenceTracking();
+    await this.startWatchingLobby();
+  }
+
+  public async adminPublishBanRegistry(
+    bans: AdminBanEntry[],
+    signFn: (canonicalJson: string) => Promise<string>
+  ): Promise<SignedBanRegistryPayload> {
+    await this.ensureConnected();
+    const version = Date.now();
+    const updatedAt = version;
+    const unsigned = { version, updatedAt, bans };
+    const signature = await signFn(canonicalizePayload(unsigned));
+    const signed: SignedBanRegistryPayload = { ...unsigned, signature };
+    this.banRegistry = bans.filter((b) => isBanActive(b));
+    this.transport.publish(this.adminBansTopic(), signed, { retain: true });
+    this.callbacks.onBanRegistryChanged?.(this.getBanRegistry());
+    return signed;
+  }
+
+  public async adminForceCloseRoom(
+    rawCode: string,
+    reason: string,
+    signFn: (canonicalJson: string) => Promise<string>
+  ): Promise<void> {
+    const roomCode = normalizeRoomCode(rawCode);
+    if (!roomCode) throw new Error('유효한 방 코드가 아닙니다.');
+    await this.ensureConnected();
+    const issuedAt = Date.now();
+    const unsigned = {
+      action: 'admin_force_close' as const,
+      roomCode,
+      reason: reason.trim() || '관리자에 의해 방이 종료되었습니다.',
+      issuedAt,
+    };
+    const signature = await signFn(canonicalizePayload(unsigned));
+    const signed: SignedAdminForceClosePayload = { ...unsigned, signature };
+    this.transport.publish(this.adminEventsTopic(), this.makeEnvelope('admin_force_close', signed));
+    this.transport.publish(this.lobbyRoomTopic(roomCode), null, { retain: true });
+    if (this.openRooms.delete(roomCode)) {
+      this.emitOpenRooms();
+    }
+  }
+
+  public async adminStealthJoinRoom(
+    room: RoomSummary,
+    signFn: (canonicalJson: string) => Promise<string>
+  ): Promise<void> {
+    if (!this.adminMode) {
+      throw new Error('관리자 전용 패키지에서만 은밀 관전이 가능합니다.');
+    }
+    await this.cancelMatchmakingOrRoom();
+    const seq = ++this.sessionSeq;
+    await this.ensureConnected();
+    if (seq !== this.sessionSeq) return;
+
+    this.activeRoomCode = room.roomCode;
+    this.sessionRole = 'admin_stealth';
+    this.stealthTargetHostId = room.hostId;
+    this.stealthTargetGuestId = '';
+
+    await this.transport.subscribe(this.roomTopic(room.roomCode));
+    await this.transport.subscribe(this.spectatorChatTopic(room.roomCode));
+    if (room.hostId) {
+      await this.transport.subscribe(this.directTopic(room.hostId));
+    }
+
+    const timestamp = Date.now();
+    const adminId = this.profile.getClientId();
+    const unsigned = {
+      action: 'admin_stealth_inspect' as const,
+      roomCode: room.roomCode,
+      adminId,
+      timestamp,
+    };
+    const signature = await signFn(canonicalizePayload(unsigned));
+    const signed: SignedAdminStealthInspectPayload = { ...unsigned, signature };
+
+    if (room.hostId) {
+      this.transport.publish(
+        this.directTopic(room.hostId),
+        this.makeEnvelope('admin_stealth_inspect', signed)
+      );
+    }
+    this.transport.publish(
+      this.roomTopic(room.roomCode),
+      this.makeEnvelope('admin_stealth_inspect', signed)
+    );
+
+    if (this.stealthJoinTimeout) clearTimeout(this.stealthJoinTimeout);
+    this.stealthJoinTimeout = setTimeout(() => {
+      if (this.sessionRole === 'admin_stealth' && this.activeRoomCode === room.roomCode && !this.roleInfo) {
+        this.callbacks.onError('방 호스트의 응답이 지연되고 있습니다. 다시 시도해 주세요.');
+      }
+    }, 6500);
   }
 }

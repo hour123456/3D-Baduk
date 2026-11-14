@@ -118,9 +118,14 @@ declare global {
   interface Window {
     electronAPI?: {
       isElectron: boolean;
+      isAdmin?: boolean;
       saveSgf: (content: string, defaultName?: string) => Promise<{ canceled: boolean; filePath?: string }>;
       openSgf: () => Promise<{ canceled: boolean; content?: string; fileName?: string }>;
       toggleFullscreen: () => Promise<boolean>;
+      adminSignPayload?: (canonicalJson: string) => Promise<string>;
+      adminDecryptIp?: (encryptedB64: string) => Promise<string>;
+      adminLoadBanRegistry?: () => Promise<unknown>;
+      adminSaveBanRegistry?: (data: unknown) => Promise<boolean>;
     };
   }
 }
