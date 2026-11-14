@@ -46,6 +46,22 @@ export interface AdminBanEntry {
   expiresAt: number | null; // null = permanent ban
 }
 
+export interface AdminClosedRoomEntry {
+  roomCode: string;
+  hostId?: string;
+  title?: string;
+  reason: string;
+  closedAt: number;
+  expiresAt: number;
+}
+
+export interface SignedClosedRoomsPayload {
+  version: number;
+  updatedAt: number;
+  closedRooms: AdminClosedRoomEntry[];
+  signature: string;
+}
+
 export interface SignedBanRegistryPayload {
   version: number;
   updatedAt: number;
@@ -117,6 +133,7 @@ export interface RoomSummary {
   roomCode: string;
   title: string;
   hostId: string;
+  accountId?: string;
   hostName: string;
   isPublic: boolean;
   hasPassword: boolean;

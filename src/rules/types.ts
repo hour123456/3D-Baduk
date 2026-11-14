@@ -126,6 +126,8 @@ declare global {
       adminDecryptIp?: (encryptedB64: string) => Promise<string>;
       adminLoadBanRegistry?: () => Promise<unknown>;
       adminSaveBanRegistry?: (data: unknown) => Promise<boolean>;
+      adminLoadClosedRooms?: () => Promise<unknown>;
+      adminSaveClosedRooms?: (data: unknown) => Promise<boolean>;
     };
   }
 }

@@ -199,6 +199,9 @@ export class BadukApp {
           if (snapshot) {
             this.applySyncSnapshot(snapshot, true);
           }
+          if (role === 'admin_stealth' && !init.guestId && init.whiteName === '도전자 대기 중') {
+            this.clock.stop();
+          }
           this.ui.showToast(
             role === 'admin_stealth'
               ? `🛡 은밀 관전 연결됨: ${cfg.blackName || '흑'} vs ${cfg.whiteName || '백'}`
@@ -233,6 +236,7 @@ export class BadukApp {
         },
         onLiveUsersChanged: options.adminCallbacks?.onLiveUsersChanged,
         onBanRegistryChanged: options.adminCallbacks?.onBanRegistryChanged,
+        onClosedRoomsChanged: options.adminCallbacks?.onClosedRoomsChanged,
         onAdminMonitorChat: options.adminCallbacks?.onAdminMonitorChat,
         onAdminStealthJoined: options.adminCallbacks?.onAdminStealthJoined,
       onRemoteMove: (payload) => {
@@ -540,6 +544,16 @@ export class BadukApp {
         });
       },
       onGetInviteUrl: () => this.online.getInviteUrl(),
+      isOwnRoom: (room) => this.online.isOwnRoom(room),
+      onCloseOwnRoom: (roomCode) => {
+        void Promise.resolve(this.online.closeOwnOrLingeringRoom(roomCode))
+          .then(() => {
+            this.ui.showToast(`방 ${roomCode}을(를) 닫았습니다.`);
+          })
+          .catch((err: Error) => {
+            this.ui.showToast(err.message || '방 닫기에 실패했습니다.', true);
+          });
+      },
       onLeaveOnlineMatch: () => {
         const wasStealth = this.online.getSessionRole() === 'admin_stealth';
         const wasSpectator = this.isSpectating();
@@ -623,6 +637,8 @@ export class BadukApp {
       // Start live presence reporting for both web and desktop clients so Admin sees connected players.
       // (#web-live-users-badge remains hidden on Electron desktop clients.)
       void this.online.startPresenceTracking().catch(() => {});
+    } else {
+      this.ui.closeSetupModal();
     }
   }
 

@@ -24,10 +24,12 @@ import {
   AdminInterceptedChatMessage,
   AdminStealthWelcomePayload,
   LiveConnectedUserRecord,
+  OnlineEnvelope,
   OnlineTransport,
   OnlineTransportStatus,
   PresenceStats,
   RoomSummary,
+  SyncSnapshotPayload,
 } from '../types';
 
 class InMemoryBrokerHub {
@@ -387,7 +389,7 @@ describe('v4 Features: Settings, Clock 10s Alert, Directional Physics, Tutorial,
     };
 
     const payload = { action: 'admin_force_close', roomCode: 'ABCD12', reason: 'test', issuedAt: 123456789 };
-    // Sign via helper (simulating Node webcrypto.subtle)
+    // Sign via helper (simulating Node main-admin webcrypto.subtle)
     const canonical = canonicalizePayload(payload);
     const nodeSignKey = await webcrypto.subtle.importKey(
       'jwk',
@@ -619,5 +621,348 @@ describe('v4 Features: Settings, Clock 10s Alert, Directional Physics, Tutorial,
     await spectator.cancelMatchmakingOrRoom();
     await admin.cancelMatchmakingOrRoom();
     await altSameIp.cancelMatchmakingOrRoom();
+  });
+
+  it('supports instant stealth join into waiting rooms and legacy/unresponsive in_game private rooms with sync_request fallback', async () => {
+    const keysFile = path.resolve(process.cwd(), 'electron/admin-keys.local.json');
+    if (!fs.existsSync(keysFile)) return;
+    const keysJson = JSON.parse(fs.readFileSync(keysFile, 'utf8')) as {
+      signPrivateJwk: JsonWebKey;
+    };
+    const signFn = (canonicalJson: string) =>
+      signPayloadWithPrivateJwk(JSON.parse(canonicalJson), keysJson.signPrivateJwk);
+
+    const hub = new InMemoryBrokerHub();
+    let waitingSpecNotified = false;
+    let hostWaitingRoom: RoomSummary | null = null;
+    let adminSpectateStarts = 0;
+    let adminSyncedMoves = -1;
+    let adminStealthWelcome: AdminStealthWelcomePayload | null = null;
+    const adminChats: AdminInterceptedChatMessage[] = [];
+
+    const host = new OnlineMatchManager(
+      makeFakeProfile('sd_wait_host', 'acc_wait_host', '대기방장'),
+      new MockTransport(hub),
+      makeCallbacks({
+        onWaitingRoomReady: (r) => {
+          hostWaitingRoom = r;
+        },
+        onSpectatorCountUpdated: () => {
+          waitingSpecNotified = true;
+        },
+      }),
+      { simulatedPublicIp: '203.0.113.10' }
+    );
+
+    const admin = new OnlineMatchManager(
+      makeFakeProfile('sd_admin_stealth', 'acc_admin_root', '수담관리자'),
+      new MockTransport(hub),
+      makeCallbacks({
+        onAdminStealthJoined: (w) => {
+          adminStealthWelcome = w;
+        },
+        onSpectateStart: (_cfg, _init, snap) => {
+          adminSpectateStarts += 1;
+          if (snap) adminSyncedMoves = snap.moves.length;
+        },
+        onSyncSnapshotReceived: (snap) => {
+          adminSyncedMoves = snap.moves.length;
+        },
+        onAdminMonitorChat: (m) => {
+          adminChats.push(m);
+        },
+      }),
+      { adminMode: true }
+    );
+
+    await admin.adminInitializeMonitoring();
+    await host.createRoom({
+      title: '비밀 대기방',
+      isPublic: false,
+      password: 'pw123',
+      gameType: 'baduk',
+      boardSize: 19,
+      ruleset: 'korean',
+      handicap: 0,
+      komi: 6.5,
+      mainTimeSeconds: 600,
+      byoyomiSeconds: 30,
+      byoyomiPeriods: 3,
+      hostColorPref: 'black',
+    });
+    expect(hostWaitingRoom).not.toBeNull();
+
+    // Waiting private room: instant 0ms transition to board + stealth HUD without waiting for guest
+    await admin.adminStealthJoinRoom(hostWaitingRoom!, signFn);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(adminSpectateStarts).toBe(1);
+    expect((adminStealthWelcome as AdminStealthWelcomePayload | null)?.roomStatus).toBe('waiting');
+    expect(waitingSpecNotified).toBe(false);
+    expect(host.getRoleInfo()?.spectatorCount ?? 0).toBe(0);
+
+    admin.leaveCurrentSession(false);
+
+    // Legacy / unresponsive private in_game room: ignores admin_stealth_inspect, answers sync_request
+    const legacyTransport = new MockTransport(hub);
+    await legacyTransport.connect();
+    await legacyTransport.subscribe('sudam-3d-baduk-v1/room/LEGACY9');
+
+    const legacySummary: RoomSummary = {
+      roomCode: 'LEGACY9',
+      title: '구버전 비밀 대국실',
+      hostId: 'legacy_host_1',
+      hostName: '구버전흑',
+      isPublic: false,
+      hasPassword: true,
+      status: 'in_game',
+      blackName: '구버전흑',
+      whiteName: '구버전백',
+      moveCount: 2,
+      spectatorCount: 0,
+      gameType: 'baduk',
+      boardSize: 19,
+      ruleset: 'korean',
+      handicap: 0,
+      komi: 6.5,
+      mainTimeSeconds: 600,
+      byoyomiSeconds: 30,
+      byoyomiPeriods: 3,
+      hostColorPref: 'black',
+      createdAt: Date.now() - 5000,
+      updatedAt: Date.now(),
+    };
+    legacyTransport.publish('sudam-3d-baduk-v1/lobby/rooms/LEGACY9', legacySummary, { retain: true });
+
+    let legacySawSyncReq = false;
+    legacyTransport.onMessage((topic, raw) => {
+      if (topic !== 'sudam-3d-baduk-v1/room/LEGACY9') return;
+      const env = raw as OnlineEnvelope<unknown>;
+      if (env?.type === 'sync_request') {
+        legacySawSyncReq = true;
+        const snap: SyncSnapshotPayload = {
+          roomCode: 'LEGACY9',
+          moves: [
+            { color: BLACK, coord: { x: 15, y: 3 } },
+            { color: WHITE, coord: { x: 3, y: 15 } },
+          ],
+          phase: 'playing',
+          deadIndices: [],
+          scoreAgreement: { blackAgreed: false, whiteAgreed: false },
+          clock: {
+            black: { mainTimeLeft: 590, byoyomiPeriodsLeft: 3, byoyomiTimeLeft: 30, inByoyomi: false },
+            white: { mainTimeLeft: 595, byoyomiPeriodsLeft: 3, byoyomiTimeLeft: 30, inByoyomi: false },
+          },
+          result: null,
+        };
+        legacyTransport.publish('sudam-3d-baduk-v1/room/LEGACY9', {
+          msgId: 'legacy_sync_1',
+          senderId: 'legacy_host_1',
+          sentAt: Date.now(),
+          type: 'sync_snapshot',
+          payload: snap,
+        });
+      }
+    });
+
+    await new Promise((r) => setTimeout(r, 30));
+    // Stealth join using raw room code string (instant onSpectateStart, then 900ms sync_request fallback)
+    await admin.adminStealthJoinRoom('LEGACY9', signFn);
+    expect(adminSpectateStarts).toBe(2);
+    expect((adminStealthWelcome as AdminStealthWelcomePayload | null)?.roomCode).toBe('LEGACY9');
+
+    await new Promise((r) => setTimeout(r, 1050));
+    expect(legacySawSyncReq).toBe(true);
+    expect(adminSyncedMoves).toBe(2);
+
+    // Intercept legacy room-topic player chat ('chat') AND spectator_chat topic
+    legacyTransport.publish('sudam-3d-baduk-v1/room/LEGACY9', {
+      msgId: 'legacy_pc_1',
+      senderId: 'legacy_host_1',
+      sentAt: Date.now(),
+      type: 'chat',
+      payload: {
+        senderName: '구버전흑',
+        senderColor: BLACK,
+        text: '구버전 대국자 채팅',
+      },
+    });
+    legacyTransport.publish('sudam-3d-baduk-v1/room/LEGACY9/spectator_chat', {
+      msgId: 'legacy_sc_1',
+      senderId: 'legacy_spec_1',
+      sentAt: Date.now(),
+      type: 'spectator_chat',
+      payload: {
+        roomCode: 'LEGACY9',
+        senderId: 'legacy_spec_1',
+        senderName: '구버전관전',
+        text: '구버전 관전자 채팅',
+        sentAt: Date.now(),
+      },
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(adminChats.some((c) => c.channel === 'player' && c.text === '구버전 대국자 채팅')).toBe(true);
+    expect(adminChats.some((c) => c.channel === 'spectator' && c.text === '구버전 관전자 채팅')).toBe(true);
+
+    legacyTransport.disconnect();
+    await host.cancelMatchmakingOrRoom();
+    await admin.cancelMatchmakingOrRoom();
+  });
+
+  it('permanently closes zombie rooms via signed closed_rooms registry, blocks re-publishing across fresh clients, and supports reopen', async () => {
+    const keysFile = path.resolve(process.cwd(), 'electron/admin-keys.local.json');
+    if (!fs.existsSync(keysFile)) return;
+    const keysJson = JSON.parse(fs.readFileSync(keysFile, 'utf8')) as {
+      signPrivateJwk: JsonWebKey;
+    };
+    const signFn = (canonicalJson: string) =>
+      signPayloadWithPrivateJwk(JSON.parse(canonicalJson), keysJson.signPrivateJwk);
+
+    const hub = new InMemoryBrokerHub();
+    const zombieTransport = new MockTransport(hub);
+    await zombieTransport.connect();
+
+    const zombieRoom: RoomSummary = {
+      roomCode: 'ZOMB99',
+      title: '좀비 잔존 대국실',
+      hostId: 'sd_zombie_host',
+      hostName: '좀비방장',
+      isPublic: false,
+      hasPassword: true,
+      status: 'in_game',
+      blackName: '좀비방장',
+      whiteName: '좀비손님',
+      moveCount: 1,
+      spectatorCount: 0,
+      gameType: 'baduk',
+      boardSize: 19,
+      ruleset: 'korean',
+      handicap: 0,
+      komi: 6.5,
+      mainTimeSeconds: 600,
+      byoyomiSeconds: 30,
+      byoyomiPeriods: 3,
+      hostColorPref: 'black',
+      createdAt: Date.now() - 10_000,
+      updatedAt: Date.now(),
+    };
+    zombieTransport.publish('sudam-3d-baduk-v1/lobby/rooms/ZOMB99', zombieRoom, { retain: true });
+
+    const viewer = new OnlineMatchManager(
+      makeFakeProfile('sd_viewer', 'acc_viewer', '대기유저'),
+      new MockTransport(hub),
+      makeCallbacks(),
+      { simulatedPublicIp: '203.0.113.20' }
+    );
+    const admin = new OnlineMatchManager(
+      makeFakeProfile('sd_admin_kill', 'acc_admin_root', '수담관리자'),
+      new MockTransport(hub),
+      makeCallbacks(),
+      { adminMode: true }
+    );
+
+    await admin.adminInitializeMonitoring();
+    await viewer.startPresenceTracking();
+    await viewer.startWatchingLobby();
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(viewer.getOpenRooms().some((r) => r.roomCode === 'ZOMB99')).toBe(true);
+    expect(admin.getOpenRooms().some((r) => r.roomCode === 'ZOMB99')).toBe(true);
+
+    // Admin force closes ZOMB99 -> retained listing purged & signed closed_rooms updated
+    await admin.adminForceCloseRoom('ZOMB99', '좀비 방 영구 정리', signFn);
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(hub.retained.has('sudam-3d-baduk-v1/lobby/rooms/ZOMB99')).toBe(false);
+    expect(viewer.getOpenRooms().some((r) => r.roomCode === 'ZOMB99')).toBe(false);
+    expect(admin.getOpenRooms().some((r) => r.roomCode === 'ZOMB99')).toBe(false);
+    expect(admin.getClosedRooms().some((c) => c.roomCode === 'ZOMB99')).toBe(true);
+
+    // Pre-v4 zombie heartbeat re-publishes retained ZOMB99 -> blocked for viewer, admin, and brand-new clients!
+    zombieTransport.publish(
+      'sudam-3d-baduk-v1/lobby/rooms/ZOMB99',
+      { ...zombieRoom, updatedAt: Date.now() },
+      { retain: true }
+    );
+    await new Promise((r) => setTimeout(r, 30));
+    expect(viewer.getOpenRooms().some((r) => r.roomCode === 'ZOMB99')).toBe(false);
+    expect(admin.getOpenRooms().some((r) => r.roomCode === 'ZOMB99')).toBe(false);
+
+    const freshClient = new OnlineMatchManager(
+      makeFakeProfile('sd_fresh', 'acc_fresh', '신규유저'),
+      new MockTransport(hub),
+      makeCallbacks(),
+      { simulatedPublicIp: '203.0.113.30' }
+    );
+    await freshClient.startPresenceTracking();
+    await freshClient.startWatchingLobby();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(freshClient.getOpenRooms().some((r) => r.roomCode === 'ZOMB99')).toBe(false);
+
+    // Admin reopens ZOMB99 -> fresh publish becomes visible again
+    await admin.adminReopenClosedRoom('ZOMB99', signFn);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(admin.getClosedRooms().some((c) => c.roomCode === 'ZOMB99')).toBe(false);
+
+    zombieTransport.publish(
+      'sudam-3d-baduk-v1/lobby/rooms/ZOMB99',
+      { ...zombieRoom, updatedAt: Date.now() },
+      { retain: true }
+    );
+    await new Promise((r) => setTimeout(r, 30));
+    expect(viewer.getOpenRooms().some((r) => r.roomCode === 'ZOMB99')).toBe(true);
+
+    await viewer.stopWatchingLobby();
+    await freshClient.stopWatchingLobby();
+    viewer.stopPresenceTracking();
+    freshClient.stopPresenceTracking();
+    zombieTransport.disconnect();
+    await viewer.cancelMatchmakingOrRoom();
+    await freshClient.cancelMatchmakingOrRoom();
+    await admin.cancelMatchmakingOrRoom();
+  });
+
+  it('clears host retained room listing immediately when opponent sends leave', async () => {
+    const hub = new InMemoryBrokerHub();
+    let createdRoom: RoomSummary | null = null;
+    const host = new OnlineMatchManager(
+      makeFakeProfile('sd_h_leave', 'acc_h_leave', '방장A'),
+      new MockTransport(hub),
+      makeCallbacks({
+        onWaitingRoomReady: (r) => {
+          createdRoom = r;
+        },
+      }),
+      { simulatedPublicIp: '203.0.113.40' }
+    );
+    const guest = new OnlineMatchManager(
+      makeFakeProfile('sd_g_leave', 'acc_g_leave', '상대B'),
+      new MockTransport(hub),
+      makeCallbacks(),
+      { simulatedPublicIp: '203.0.113.41' }
+    );
+
+    await host.createRoom({
+      title: '나가기 테스트 방',
+      isPublic: true,
+      gameType: 'baduk',
+      boardSize: 19,
+      ruleset: 'korean',
+      handicap: 0,
+      komi: 6.5,
+      mainTimeSeconds: 600,
+      byoyomiSeconds: 30,
+      byoyomiPeriods: 3,
+      hostColorPref: 'black',
+    });
+    const code = createdRoom!.roomCode;
+    await guest.joinRoom(code);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(hub.retained.has(`sudam-3d-baduk-v1/lobby/rooms/${code}`)).toBe(true);
+
+    await guest.cancelMatchmakingOrRoom();
+    await new Promise((r) => setTimeout(r, 40));
+    expect(hub.retained.has(`sudam-3d-baduk-v1/lobby/rooms/${code}`)).toBe(false);
+
+    await host.cancelMatchmakingOrRoom();
   });
 });

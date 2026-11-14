@@ -81,6 +81,8 @@ export interface UIActions {
   onJoinOnlineRoom: (roomCode: string, password?: string) => void;
   onSpectateOnlineRoom: (roomCode: string, password?: string) => void;
   onGetInviteUrl: () => string;
+  isOwnRoom?: (room: RoomSummary) => boolean;
+  onCloseOwnRoom?: (roomCode: string) => void;
   onLeaveOnlineMatch: () => void;
   onSendOnlineChat: (text: string) => void;
   onRequestOnlineRematch: () => void;
@@ -684,7 +686,7 @@ export class UIManager {
             <h2>대국 설정 — 수담(手談)</h2>
             <div class="modal-header-actions">
               <button class="btn btn-sm btn-tutorial-nav" id="btn-setup-open-tutorial">📖 초보자 입문·학습</button>
-              <button class="btn btn-sm hidden" id="btn-close-setup">닫기</button>
+              <button class="btn btn-sm" id="btn-close-setup">닫기</button>
             </div>
           </div>
 
@@ -1001,7 +1003,7 @@ export class UIManager {
                 </div>
                 <div class="waiting-room-meta" id="waiting-room-meta"></div>
                 <div class="waiting-pulse-msg">상대 대국자 입장 대기 중... 입장 시 즉시 대국이 시작됩니다.</div>
-                <button class="btn btn-danger" id="btn-cancel-room">대국방 닫기</button>
+                <button class="btn btn-danger" id="btn-cancel-room">대기방 닫기</button>
               </div>
             </div>
 
@@ -2120,6 +2122,25 @@ export class UIManager {
     bindCheckbox('#opt-show-forbidden', 'showForbiddenPoints');
     bindCheckbox('#opt-show-coords', 'showCoordinates');
 
+    window.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      if (!this.passwordModalEl.classList.contains('hidden')) {
+        this.passwordModalEl.classList.add('hidden');
+        return;
+      }
+      if (!this.optionsModalEl.classList.contains('hidden')) {
+        this.optionsModalEl.classList.add('hidden');
+        return;
+      }
+      if (!this.tutorialModalEl.classList.contains('hidden')) {
+        this.tutorialModalEl.classList.add('hidden');
+        return;
+      }
+      if (!this.setupModalEl.classList.contains('hidden')) {
+        this.closeSetupModal();
+      }
+    });
+
     this.syncOptionsDOM(this.settings);
   }
 
@@ -2223,7 +2244,6 @@ export class UIManager {
   }
 
   public closeSetupModal(): void {
-    if (!this.hasStartedOnce) return;
     this.setupModalEl.classList.add('hidden');
   }
 
@@ -2408,13 +2428,20 @@ export class UIManager {
               isPrivate ? '1' : '0'
             }" data-title="${escapeHtml(r.title)}">${isPrivate ? '🔒 ' : ''}입장하기</button>`;
 
+        const ownCloseBtn = this.actions.isOwnRoom?.(r)
+          ? `<button class="btn btn-sm btn-danger" data-close-own-room="${escapeHtml(r.roomCode)}">내 방 닫기</button>`
+          : '';
+
         return `
           <div class="room-item-card${isLive ? ' live-room' : ''}">
             <div style="min-width: 0;">
               <div class="room-item-title">${gameBadge}${visBadge}${statusBadge} ${escapeHtml(r.title)}</div>
               <div class="room-item-sub">${subLine}</div>
             </div>
-            ${actionBtn}
+            <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center; justify-content:flex-end;">
+              ${actionBtn}
+              ${ownCloseBtn}
+            </div>
           </div>
         `;
       })
@@ -2443,6 +2470,14 @@ export class UIManager {
         }
         this.syncSetupNicknameSilently();
         this.actions.onSpectateOnlineRoom(code);
+      });
+    });
+
+    this.openRoomsListEl.querySelectorAll<HTMLButtonElement>('[data-close-own-room]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const code = btn.dataset.closeOwnRoom;
+        if (!code) return;
+        this.actions.onCloseOwnRoom?.(code);
       });
     });
   }
