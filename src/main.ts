@@ -1193,7 +1193,7 @@ export class BadukApp {
     const turnColor = this.engine.currentTurn;
     const lastRecord =
       this.engine.history.length > 0 ? this.engine.history[this.engine.history.length - 1] : null;
-    const hintDifficulty = Math.max(3, this.engine.config.aiDifficulty) as AIDifficulty;
+    const hintDifficulty = Math.max(4, this.engine.config.aiDifficulty) as AIDifficulty;
 
     const searchRes = await this.ai.requestMove({
       board: new Uint8Array(this.engine.board),

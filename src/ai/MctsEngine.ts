@@ -13,7 +13,7 @@ import {
 } from '../rules/types';
 import { calculateScore, estimateDeadStones } from '../rules/scoring';
 import { FastBoard } from './FastBoard';
-import { computeCandidateMovesAndPriors } from './GoHeuristics';
+import { HeuristicLevel, computeCandidateMovesAndPriors } from './GoHeuristics';
 
 export interface AISearchRequest {
   gameType?: GameType;
@@ -53,60 +53,108 @@ interface DifficultyProfile {
   cPuct: number;
   raveEquiv: number; // 0 disables RAVE
   temperature: number;
-  advancedTactics: boolean;
+  minRatio: number; // Minimum visit ratio relative to maxVisits for softmax move sampling
+  heuristicLevel: HeuristicLevel;
+  useLgrf: boolean;
+  rolloutTacticsProb: number; // Probability [0..1] of applying tactical capture/atari checks in playouts
+  rolloutDepthFactor: number; // Playout max steps = board.total * rolloutDepthFactor
+  casualErrorProb: number; // Probability [0..1] of picking a sub-optimal casual candidate (!includeHints only)
+  casualErrorBand: number; // Rank band [1..casualErrorBand] sampled when casualErrorProb triggers
+  maxChildren9: number;
+  maxChildren13: number;
   maxChildren19: number;
 }
 
 const DIFFICULTY_PROFILES: Record<AIDifficulty, DifficultyProfile> = {
   1: {
-    // 입문: 빠르고 부드러운 수읽기, 입문자도 충분히 이길 수 있는 빈틈 허용
-    maxSimulations: 140,
-    timeBudgetMs: 260,
-    cPuct: 1.75,
+    // 입문: 가벼운 탐색과 넓은 후보 분포, 초보자도 편하게 대국·승리할 수 있는 수준
+    maxSimulations: 42,
+    timeBudgetMs: 160,
+    cPuct: 2.6,
     raveEquiv: 0,
-    temperature: 1.15,
-    advancedTactics: false,
-    maxChildren19: 30,
-  },
-  2: {
-    // 초급: 기본 단수와 포석을 갖추지만 깊은 수읽기는 생략
-    maxSimulations: 520,
-    timeBudgetMs: 480,
-    cPuct: 1.48,
-    raveEquiv: 300,
-    temperature: 0.52,
-    advancedTactics: false,
-    maxChildren19: 38,
-  },
-  3: {
-    // 중급: RAVE + LGRF + 행마 패턴 활성화, 자연스러운 포석과 중반 전투
-    maxSimulations: 1850,
-    timeBudgetMs: 920,
-    cPuct: 1.32,
-    raveEquiv: 800,
-    temperature: 0.16,
-    advancedTactics: false,
+    temperature: 2.1,
+    minRatio: 0.02,
+    heuristicLevel: 'novice',
+    useLgrf: false,
+    rolloutTacticsProb: 0.18,
+    rolloutDepthFactor: 0.5,
+    casualErrorProb: 0.35,
+    casualErrorBand: 14,
+    maxChildren9: 42,
+    maxChildren13: 50,
     maxChildren19: 48,
   },
+  2: {
+    // 초급: 기본 인접 돌과 단순 단수는 인식하지만 깊은 전술/정석은 배제
+    maxSimulations: 95,
+    timeBudgetMs: 250,
+    cPuct: 2.0,
+    raveEquiv: 0,
+    temperature: 1.25,
+    minRatio: 0.08,
+    heuristicLevel: 'elementary',
+    useLgrf: false,
+    rolloutTacticsProb: 0.4,
+    rolloutDepthFactor: 0.72,
+    casualErrorProb: 0.22,
+    casualErrorBand: 7,
+    maxChildren9: 40,
+    maxChildren13: 46,
+    maxChildren19: 44,
+  },
+  3: {
+    // 중급 (기본값): 자연스러운 착수와 기본 활로 감각을 갖추되 일반인도 50%+ 승률이 가능한 균형형
+    maxSimulations: 145,
+    timeBudgetMs: 360,
+    cPuct: 1.68,
+    raveEquiv: 80,
+    temperature: 0.85,
+    minRatio: 0.12,
+    heuristicLevel: 'casual',
+    useLgrf: false,
+    rolloutTacticsProb: 0.65,
+    rolloutDepthFactor: 0.88,
+    casualErrorProb: 0.18,
+    casualErrorBand: 5,
+    maxChildren9: 38,
+    maxChildren13: 44,
+    maxChildren19: 44,
+  },
   4: {
-    // 고급: 축·환격·양단수 전술 판독기 + 정밀 수읽기
-    maxSimulations: 4800,
-    timeBudgetMs: 1650,
-    cPuct: 1.24,
-    raveEquiv: 1350,
-    temperature: 0.04,
-    advancedTactics: true,
-    maxChildren19: 64,
+    // 고급: 축·환격·양단수·치중 전술 판독기 + LGRF + 날카로운 수읽기
+    maxSimulations: 4200,
+    timeBudgetMs: 1450,
+    cPuct: 1.22,
+    raveEquiv: 1250,
+    temperature: 0.02,
+    minRatio: 0.6,
+    heuristicLevel: 'full',
+    useLgrf: true,
+    rolloutTacticsProb: 0.96,
+    rolloutDepthFactor: 1.18,
+    casualErrorProb: 0.0,
+    casualErrorBand: 0,
+    maxChildren9: 36,
+    maxChildren13: 48,
+    maxChildren19: 60,
   },
   5: {
-    // 마스터: 최대 시뮬레이션 예산 + LGRF-1 + 전술/끝내기 정밀도 극대화
-    maxSimulations: 10500,
-    timeBudgetMs: 2400,
-    cPuct: 1.16,
-    raveEquiv: 1800,
+    // 마스터: 최대 시뮬레이션 예산 + LGRF-1 + 연결·축·전술/끝내기 정밀도 극대화
+    maxSimulations: 9500,
+    timeBudgetMs: 2350,
+    cPuct: 1.12,
+    raveEquiv: 1750,
     temperature: 0.0,
-    advancedTactics: true,
-    maxChildren19: 84,
+    minRatio: 1.0,
+    heuristicLevel: 'master',
+    useLgrf: true,
+    rolloutTacticsProb: 1.0,
+    rolloutDepthFactor: 1.28,
+    casualErrorProb: 0.0,
+    casualErrorBand: 0,
+    maxChildren9: 42,
+    maxChildren13: 56,
+    maxChildren19: 76,
   },
 };
 
@@ -128,6 +176,8 @@ class MctsNode {
 }
 
 export class MctsEngine {
+  private rngState = 0x9e3779b9;
+
   /**
    * Checks whether `idx` sits strictly inside `color`'s already completely enclosed alive territory
    * with zero opponent stones nearby — playing there is pointless or loses a point in Korean rules.
@@ -163,7 +213,22 @@ export class MctsEngine {
 
   public chooseMove(req: AISearchRequest): AISearchResult {
     const startTime = performance.now();
-    const profile = DIFFICULTY_PROFILES[req.difficulty];
+    // CRITICAL HINT CONTRACT: when includeHints is true, always use sharp 'full'+ search & tactics
+    const baseProfile = req.includeHints
+      ? DIFFICULTY_PROFILES[Math.max(4, req.difficulty) as AIDifficulty]
+      : DIFFICULTY_PROFILES[req.difficulty];
+    const profile: DifficultyProfile = req.includeHints
+      ? {
+          ...baseProfile,
+          temperature: 0.0,
+          minRatio: 1.0,
+          useLgrf: true,
+          rolloutTacticsProb: 1.0,
+          casualErrorProb: 0.0,
+          casualErrorBand: 0,
+        }
+      : baseProfile;
+
     const size = req.size;
     const total = size * size;
     const aiColor = req.color;
@@ -193,7 +258,7 @@ export class MctsEngine {
       lastMoveIdx,
       moveCount: req.moveCount,
       forbiddenHashes,
-      enableAdvancedTactics: profile.advancedTactics,
+      heuristicLevel: profile.heuristicLevel,
     });
 
     // Filter out redundant moves inside completely settled own territory
@@ -241,9 +306,10 @@ export class MctsEngine {
       }
     }
 
-    // Sort root candidates by prior descending and cap width on large boards
+    // Sort root candidates by prior descending and cap width per board size and difficulty
     filteredMoves.sort((a, b) => b.prior - a.prior);
-    const maxWidth = size === 19 ? profile.maxChildren19 : size === 13 ? 52 : 81;
+    const maxWidth =
+      size === 19 ? profile.maxChildren19 : size === 13 ? profile.maxChildren13 : profile.maxChildren9;
     const pruned = filteredMoves.slice(0, maxWidth);
     let priorSum = 0;
     for (const p of pruned) priorSum += p.prior;
@@ -264,15 +330,16 @@ export class MctsEngine {
     const playedWhiteMask = new Uint8Array(total);
     const lgrBlack = new Int16Array(total).fill(-1);
     const lgrWhite = new Int16Array(total).fill(-1);
-    const rolloutMoveLog = new Int16Array(Math.floor(total * 1.4) + 8);
-    const rolloutColorLog = new Uint8Array(Math.floor(total * 1.4) + 8);
+    const maxRolloutLog = Math.max(16, Math.ceil(total * profile.rolloutDepthFactor) + 8);
+    const rolloutMoveLog = new Int16Array(maxRolloutLog);
+    const rolloutColorLog = new Uint8Array(maxRolloutLog);
     const pathNodes: MctsNode[] = [];
 
     let sims = 0;
     const deadline = startTime + profile.timeBudgetMs;
 
     while (sims < profile.maxSimulations) {
-      if ((sims & 31) === 0 && sims > 0 && performance.now() >= deadline) {
+      if ((sims & 15) === 0 && sims > 0 && performance.now() >= deadline) {
         break;
       }
 
@@ -319,7 +386,7 @@ export class MctsEngine {
         }
       }
 
-      // 2. Playout (Light-tactical simulation with LGRF-1 & zero-alloc scratch board)
+      // 2. Playout (Graduated tactical simulation with optional LGRF-1 & zero-alloc scratch board)
       const blackUtility = this.runTacticalPlayout(
         simBoard,
         rolloutScratch,
@@ -333,7 +400,8 @@ export class MctsEngine {
         lgrBlack,
         lgrWhite,
         rolloutMoveLog,
-        rolloutColorLog
+        rolloutColorLog,
+        profile
       );
 
       // 3. Backpropagation + RAVE (AMAF) update
@@ -360,14 +428,31 @@ export class MctsEngine {
       sims++;
     }
 
-    // Select final move according to difficulty temperature
+    // Select final move according to difficulty temperature, minRatio, and casual oversight variance
     const children = root.children!;
     let chosen: MctsNode = children[0];
 
-    if (profile.temperature <= 0.02) {
+    if (
+      !req.includeHints &&
+      profile.casualErrorProb > 0 &&
+      children.length >= 3 &&
+      Math.random() < profile.casualErrorProb
+    ) {
+      const sorted = children
+        .slice()
+        .sort((a, b) => {
+          const sa = a.visits + (a.visits > 0 ? (a.valueSum / a.visits) * 3.0 : a.prior * 2.0);
+          const sb = b.visits + (b.visits > 0 ? (b.valueSum / b.visits) * 3.0 : b.prior * 2.0);
+          return sb - sa;
+        });
+      const maxBand = Math.min(sorted.length - 1, Math.max(1, profile.casualErrorBand));
+      const pickIdx = 1 + Math.floor(Math.random() * maxBand);
+      chosen = sorted[pickIdx];
+    } else if (profile.temperature <= 0.02) {
       let bestScore = -1;
       for (const ch of children) {
-        const q = ch.visits > 0 ? ch.valueSum / ch.visits : 0.5;
+        if (ch.visits === 0) continue;
+        const q = ch.valueSum / ch.visits;
         const score = ch.visits + q * 4.0;
         if (score > bestScore) {
           bestScore = score;
@@ -379,14 +464,14 @@ export class MctsEngine {
       let maxVisits = 1;
       for (const ch of children) if (ch.visits > maxVisits) maxVisits = ch.visits;
 
-      const minRatio = req.difficulty === 1 ? 0.08 : 0.25;
+      const minRatio = profile.minRatio;
       const weights: number[] = [];
       const pool: MctsNode[] = [];
       let wSum = 0;
 
       for (const ch of children) {
-        if (ch.visits >= maxVisits * minRatio) {
-          const w = Math.pow(Math.max(1, ch.visits) / maxVisits, invT);
+        if (ch.visits >= maxVisits * minRatio && ch.visits > 0) {
+          const w = Math.pow(ch.visits / maxVisits, invT);
           pool.push(ch);
           weights.push(w);
           wSum += w;
@@ -450,12 +535,16 @@ export class MctsEngine {
   private selectChild(parent: MctsNode, profile: DifficultyProfile): MctsNode {
     const children = parent.children!;
     const sqrtParent = Math.sqrt(Math.max(1, parent.visits));
+    const isAdvanced = profile.heuristicLevel === 'full' || profile.heuristicLevel === 'master';
+    const parentTurnQ = parent.visits > 0 ? 1.0 - parent.valueSum / parent.visits : 0.5;
+    const fpu = isAdvanced ? Math.max(0.05, parentTurnQ - 0.25) : 0.48;
+
     let best = children[0];
     let bestScore = -1e9;
 
     for (let i = 0; i < children.length; i++) {
       const ch = children[i];
-      const q = ch.visits > 0 ? ch.valueSum / ch.visits : 0.48;
+      const q = ch.visits > 0 ? ch.valueSum / ch.visits : fpu;
 
       let blendedQ = q;
       if (profile.raveEquiv > 0 && ch.amafVisits > 0) {
@@ -466,7 +555,8 @@ export class MctsEngine {
       }
 
       const u = profile.cPuct * ch.prior * (sqrtParent / (1 + ch.visits));
-      const score = blendedQ + u;
+      const progBias = isAdvanced ? (ch.prior * 4.2) / (1 + ch.visits * 0.015) : 0;
+      const score = blendedQ + u + progBias;
       if (score > bestScore) {
         bestScore = score;
         best = ch;
@@ -489,7 +579,8 @@ export class MctsEngine {
       color: turn,
       lastMoveIdx: lastIdx,
       moveCount,
-      enableAdvancedTactics: false,
+      heuristicLevel: profile.heuristicLevel,
+      skipLadder: true,
     });
 
     if (count === 0) {
@@ -503,7 +594,7 @@ export class MctsEngine {
     }
     items.sort((a, b) => b.prior - a.prior);
 
-    const cap = board.size === 19 ? Math.min(32, profile.maxChildren19) : 28;
+    const cap = board.size === 19 ? Math.min(30, profile.maxChildren19) : board.size === 13 ? 26 : 24;
     const sliced = items.slice(0, cap);
     let sum = 0;
     for (const s of sliced) sum += s.prior;
@@ -512,7 +603,7 @@ export class MctsEngine {
   }
 
   /**
-   * Light-tactical Monte Carlo rollout returning utility in [0, 1] for BLACK.
+   * Graduated Monte Carlo rollout returning utility in [0, 1] for BLACK.
    */
   private runTacticalPlayout(
     board: FastBoard,
@@ -527,10 +618,11 @@ export class MctsEngine {
     lgrBlack: Int16Array,
     lgrWhite: Int16Array,
     rolloutMoveLog: Int16Array,
-    rolloutColorLog: Uint8Array
+    rolloutColorLog: Uint8Array,
+    profile: DifficultyProfile
   ): number {
     const total = board.total;
-    const maxSteps = Math.floor(total * 1.35);
+    const maxSteps = Math.max(8, Math.floor(total * profile.rolloutDepthFactor));
     let turn = startTurn;
     let lastIdx = initialLastIdx;
     let passes = initialPasses;
@@ -544,18 +636,24 @@ export class MctsEngine {
       }
     }
 
-    let rng = ((Date.now() ^ (emptyCount * 2654435761)) >>> 0) || 1234567;
+    // Persistent per-engine PRNG state avoids identical Date.now() seeds within the same millisecond
+    this.rngState = (this.rngState * 1664525 + 1013904223) >>> 0;
+    let rng = (this.rngState ^ (emptyCount * 2654435761)) >>> 0 || 1234567;
     const nextRand = (bound: number) => {
       rng = (rng * 1664525 + 1013904223) >>> 0;
       return rng % bound;
     };
 
+    const tacticsThreshold = Math.round(profile.rolloutTacticsProb * 1000);
+    const scanGlobalAtariOnEntry = profile.rolloutTacticsProb >= 0.9;
+
     for (let step = 0; step < maxSteps && passes < 2; step++) {
       let chosenMove = -1;
       const opp = opponentColor(turn);
+      const doTactic = tacticsThreshold >= 1000 || nextRand(1000) < tacticsThreshold;
 
-      // A) Local tactical check around opponent's last move
-      if (lastIdx !== null && lastIdx >= 0 && board.grid[lastIdx] === opp) {
+      // A) Local tactical check around opponent's last move (gated by rolloutTacticsProb)
+      if (doTactic && lastIdx !== null && lastIdx >= 0 && board.grid[lastIdx] === opp) {
         const nbrs = board.getNeighborsOffset(lastIdx);
         for (let i = 0; i < 4; i++) {
           const n = nbrs[i];
@@ -579,8 +677,8 @@ export class MctsEngine {
           }
         }
 
-        // B) LGRF-1 Last Good Reply lookup
-        if (chosenMove < 0) {
+        // B) LGRF-1 Last Good Reply lookup (only when profile.useLgrf is enabled)
+        if (chosenMove < 0 && profile.useLgrf) {
           const lgrCandidate = turn === BLACK ? lgrBlack[lastIdx] : lgrWhite[lastIdx];
           if (
             lgrCandidate >= 0 &&
@@ -598,7 +696,54 @@ export class MctsEngine {
         }
       }
 
-      // C) Randomized scan of empty intersections avoiding eyes and blatant self-atari
+      // A2) On entry to high-precision rollouts (Lv.4/Lv.5/Hints), catch any neglected 1-liberty atari on board
+      if (chosenMove < 0 && step === 0 && scanGlobalAtariOnEntry) {
+        let bestOppCapMove = -1;
+        let bestOppCapStones = 0;
+        let bestOwnSaveMove = -1;
+        let bestOwnSaveStones = 0;
+
+        for (let i = 0; i < total; i++) {
+          const stone = board.grid[i];
+          if (stone === EMPTY) continue;
+          const nbrs = board.getNeighborsOffset(i);
+          let emptyNbrs = 0;
+          for (let j = 0; j < 4; j++) {
+            const n = nbrs[j];
+            if (n < 0) break;
+            if (board.grid[n] === EMPTY) emptyNbrs++;
+          }
+          if (emptyNbrs >= 2) continue;
+
+          const ch = board.analyzeChain(i, 2);
+          if (ch.libertyCount !== 1 || ch.lib0 < 0) continue;
+
+          if (stone === opp) {
+            if (ch.stoneCount > bestOppCapStones && ch.lib0 !== board.koIdx && board.isLegal(ch.lib0, turn)) {
+              bestOppCapStones = ch.stoneCount;
+              bestOppCapMove = ch.lib0;
+            }
+          } else if (stone === turn) {
+            if (ch.stoneCount > bestOwnSaveStones && !board.isTrueEye(ch.lib0, turn)) {
+              scratch.copyFrom(board);
+              if (scratch.play(ch.lib0, turn) >= 0 && scratch.analyzeChain(ch.lib0, 2).libertyCount >= 2) {
+                bestOwnSaveStones = ch.stoneCount;
+                bestOwnSaveMove = ch.lib0;
+              }
+            }
+          }
+        }
+
+        if (bestOppCapMove >= 0 && bestOppCapStones >= bestOwnSaveStones) {
+          chosenMove = bestOppCapMove;
+        } else if (bestOwnSaveMove >= 0) {
+          chosenMove = bestOwnSaveMove;
+        } else if (bestOppCapMove >= 0) {
+          chosenMove = bestOppCapMove;
+        }
+      }
+
+      // C) Randomized scan of empty intersections avoiding own true eyes (and self-atari when doTactic)
       if (chosenMove < 0 && emptyCount > 0) {
         const startOffset = nextRand(emptyCount);
         for (let k = 0; k < emptyCount; k++) {
@@ -628,7 +773,7 @@ export class MctsEngine {
           } else {
             scratch.copyFrom(board);
             const cap = scratch.play(cell, turn);
-            if (cap >= 0 && (cap > 0 || scratch.analyzeChain(cell, 2).libertyCount >= 2)) {
+            if (cap >= 0 && (!doTactic || cap > 0 || scratch.analyzeChain(cell, 2).libertyCount >= 2)) {
               chosenMove = cell;
               break;
             }
@@ -673,18 +818,20 @@ export class MctsEngine {
     const winFlag = diff > 0 ? 1.0 : diff < 0 ? 0.0 : 0.5;
     const marginBonus = 0.5 + 0.5 * Math.tanh(diff / 14.0);
 
-    // LGRF-1 table update
-    for (let i = 1; i < logLen; i++) {
-      const prevMove = rolloutMoveLog[i - 1];
-      const replyMove = rolloutMoveLog[i];
-      const replyColor = rolloutColorLog[i];
-      if (prevMove >= 0 && replyMove >= 0) {
-        if (replyColor === BLACK) {
-          if (blackWon) lgrBlack[prevMove] = replyMove;
-          else if (lgrBlack[prevMove] === replyMove) lgrBlack[prevMove] = -1;
-        } else {
-          if (!blackWon && diff < 0) lgrWhite[prevMove] = replyMove;
-          else if (lgrWhite[prevMove] === replyMove) lgrWhite[prevMove] = -1;
+    // LGRF-1 table update (only when useLgrf is enabled)
+    if (profile.useLgrf) {
+      for (let i = 1; i < logLen; i++) {
+        const prevMove = rolloutMoveLog[i - 1];
+        const replyMove = rolloutMoveLog[i];
+        const replyColor = rolloutColorLog[i];
+        if (prevMove >= 0 && replyMove >= 0) {
+          if (replyColor === BLACK) {
+            if (blackWon) lgrBlack[prevMove] = replyMove;
+            else if (lgrBlack[prevMove] === replyMove) lgrBlack[prevMove] = -1;
+          } else {
+            if (!blackWon && diff < 0) lgrWhite[prevMove] = replyMove;
+            else if (lgrWhite[prevMove] === replyMove) lgrWhite[prevMove] = -1;
+          }
         }
       }
     }

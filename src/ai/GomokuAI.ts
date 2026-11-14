@@ -20,50 +20,132 @@ interface GomokuProfile {
   enableVcf: boolean;
   vcfDepth: number;
   noiseRange: number;
+  useOpenFourShortcut: boolean;
+  immediateWinProb: number;
+  urgentBlockProb: number;
+  open3DefenseMult: number;
+  forkWeightMult: number;
+  useSplitPatterns: boolean;
+  useOpponentVcfDefense: boolean;
+  casualLapseProb: number;
+}
+
+interface EvalTuning {
+  open3DefenseMult: number;
+  forkWeightMult: number;
+  useSplitPatterns: boolean;
 }
 
 const GOMOKU_PROFILES: Record<AIDifficulty, GomokuProfile> = {
   1: {
-    maxDepth: 1,
-    timeBudgetMs: 90,
-    maxCandidates: 10,
-    enableVcf: false,
-    vcfDepth: 0,
-    noiseRange: 1400,
-  },
-  2: {
-    maxDepth: 2,
-    timeBudgetMs: 180,
+    // 입문: 규칙 익히기 수준 — 단발성 수읽기, 즉승/즉패도 가끔 놓치며 큰 노이즈 허용
+    maxDepth: 0,
+    timeBudgetMs: 80,
     maxCandidates: 14,
     enableVcf: false,
     vcfDepth: 0,
-    noiseRange: 260,
+    noiseRange: 26_000,
+    useOpenFourShortcut: false,
+    immediateWinProb: 0.65,
+    urgentBlockProb: 0.3,
+    open3DefenseMult: 0.35,
+    forkWeightMult: 0.2,
+    useSplitPatterns: false,
+    useOpponentVcfDefense: false,
+    casualLapseProb: 0,
   },
-  3: {
-    maxDepth: 4,
-    timeBudgetMs: 420,
-    maxCandidates: 18,
+  2: {
+    // 초급: 1수 앞 형세만 보며 3 방어가 헐겁고 실수를 섞어 일반인도 쉽게 승리 가능
+    maxDepth: 1,
+    timeBudgetMs: 160,
+    maxCandidates: 11,
     enableVcf: false,
     vcfDepth: 0,
-    noiseRange: 40,
+    noiseRange: 5_200,
+    useOpenFourShortcut: false,
+    immediateWinProb: 1.0,
+    urgentBlockProb: 1.0,
+    open3DefenseMult: 0.52,
+    forkWeightMult: 0.25,
+    useSplitPatterns: false,
+    useOpponentVcfDefense: false,
+    casualLapseProb: 0,
+  },
+  3: {
+    // 중급: 2수 얕은 수읽기와 제한된 후보수로 기본 응수는 하되 복수 위협/빈틈은 허용
+    maxDepth: 2,
+    timeBudgetMs: 320,
+    maxCandidates: 9,
+    enableVcf: false,
+    vcfDepth: 0,
+    noiseRange: 2_600,
+    useOpenFourShortcut: false,
+    immediateWinProb: 1.0,
+    urgentBlockProb: 1.0,
+    open3DefenseMult: 0.65,
+    forkWeightMult: 0.35,
+    useSplitPatterns: false,
+    useOpponentVcfDefense: false,
+    casualLapseProb: 0.78,
   },
   4: {
-    maxDepth: 6,
-    timeBudgetMs: 850,
-    maxCandidates: 20,
+    // 고급: 5수 정밀 탐색 + 사삼/삼삼 전술 + 10수 VCF 공격
+    maxDepth: 5,
+    timeBudgetMs: 820,
+    maxCandidates: 18,
     enableVcf: true,
     vcfDepth: 10,
     noiseRange: 0,
+    useOpenFourShortcut: true,
+    immediateWinProb: 1.0,
+    urgentBlockProb: 1.0,
+    open3DefenseMult: 1.0,
+    forkWeightMult: 1.0,
+    useSplitPatterns: false,
+    useOpponentVcfDefense: false,
+    casualLapseProb: 0,
   },
   5: {
+    // 마스터: 8수 심층 탐색 + 18수 VCF + 상대 VCF 선방어 + 뜀사/뜀삼 정밀 평가
     maxDepth: 8,
-    timeBudgetMs: 1450,
-    maxCandidates: 22,
+    timeBudgetMs: 1400,
+    maxCandidates: 20,
     enableVcf: true,
-    vcfDepth: 16,
+    vcfDepth: 18,
     noiseRange: 0,
+    useOpenFourShortcut: true,
+    immediateWinProb: 1.0,
+    urgentBlockProb: 1.0,
+    open3DefenseMult: 1.0,
+    forkWeightMult: 1.0,
+    useSplitPatterns: true,
+    useOpponentVcfDefense: true,
+    casualLapseProb: 0,
   },
 };
+
+function resolveEffectiveProfile(req: AISearchRequest): GomokuProfile {
+  const base = GOMOKU_PROFILES[req.difficulty];
+  if (!req.includeHints) {
+    return base;
+  }
+  return {
+    maxDepth: Math.max(4, base.maxDepth),
+    timeBudgetMs: req.difficulty <= 3 ? 220 : base.timeBudgetMs,
+    maxCandidates: Math.max(16, base.maxCandidates),
+    enableVcf: true,
+    vcfDepth: Math.max(10, base.vcfDepth),
+    noiseRange: 0,
+    useOpenFourShortcut: true,
+    immediateWinProb: 1.0,
+    urgentBlockProb: 1.0,
+    open3DefenseMult: 1.0,
+    forkWeightMult: 1.0,
+    useSplitPatterns: true,
+    useOpponentVcfDefense: req.difficulty >= 5,
+    casualLapseProb: 0,
+  };
+}
 
 const AXES: ReadonlyArray<readonly [number, number]> = [
   [1, 0],
@@ -84,8 +166,58 @@ interface TTEntry {
   bestMove: number;
 }
 
+interface CandidateMove {
+  idx: number;
+  x: number;
+  y: number;
+  heuristic: number;
+}
+
 function inBounds(size: number, x: number, y: number): boolean {
   return x >= 0 && x < size && y >= 0 && y < size;
+}
+
+/**
+ * Checks whether placing Black at (x, y) can possibly form any Renju forbidden pattern
+ * (overline, double-four, or double-three). Any such pattern requires at least 2 existing
+ * Black stones within 4 intersections along the 4 axes.
+ */
+function hasEnoughNearbyBlackForForbidden(
+  board: Uint8Array,
+  size: number,
+  x: number,
+  y: number
+): boolean {
+  let nearBlack = 0;
+  for (const [dx, dy] of AXES) {
+    for (const sign of [-1, 1]) {
+      for (let step = 1; step <= 4; step++) {
+        const nx = x + dx * sign * step;
+        const ny = y + dy * sign * step;
+        if (!inBounds(size, nx, ny)) break;
+        if (board[ny * size + nx] === BLACK) {
+          nearBlack++;
+          if (nearBlack >= 2) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function isLegalOmokCell(
+  board: Uint8Array,
+  size: number,
+  x: number,
+  y: number,
+  color: PlayerColor,
+  ruleset: OmokRulesetType
+): boolean {
+  if (board[y * size + x] !== EMPTY) return false;
+  if (color === BLACK && ruleset === 'renju' && hasEnoughNearbyBlackForForbidden(board, size, x, y)) {
+    return !checkRenjuForbidden(board, size, x, y).forbidden;
+  }
+  return true;
 }
 
 /**
@@ -190,7 +322,8 @@ function scoreLocalPlacement(
   y: number,
   color: PlayerColor,
   opp: PlayerColor,
-  ruleset: OmokRulesetType
+  ruleset: OmokRulesetType,
+  tuning: EvalTuning
 ): number {
   let attack = 0;
   let defense = 0;
@@ -199,6 +332,8 @@ function scoreLocalPlacement(
 
   let ownThrees = 0;
   let ownFours = 0;
+  let oppThrees = 0;
+  let oppFours = 0;
 
   for (const [dx, dy] of AXES) {
     const atk = scorePointOnAxis(board, size, x, y, dx, dy, color);
@@ -208,13 +343,27 @@ function scoreLocalPlacement(
 
     // Evaluate how blocking here disrupts opponent's potential line
     const def = scorePointOnAxis(board, size, x, y, dx, dy, opp);
-    // In Renju, White ignores points that would merely complete an illegal Black 3-3/overline unless exact 5
-    defense += classifyPatternWeight(def.count, def.openEnds, def.gapCount > 0) * 0.92;
+    if (def.count === 3 && def.openEnds === 2) oppThrees++;
+    if (def.count === 4 && (def.openEnds >= 1 || def.gapCount > 0)) oppFours++;
+
+    let defPts = classifyPatternWeight(def.count, def.openEnds, def.gapCount > 0) * 0.92;
+    if (def.count === 3 && def.openEnds === 2) {
+      defPts *= tuning.open3DefenseMult;
+    }
+    defense += defPts;
   }
 
-  if (ownFours >= 1 && ownThrees >= 1) attack += 22_000; // 4-3 winning fork!
-  if (ownFours >= 2 && !(color === BLACK && ruleset === 'renju')) attack += 24_000;
-  if (ownThrees >= 2 && !(color === BLACK && ruleset === 'renju')) attack += 14_000;
+  let forkBonus = 0;
+  if (ownFours >= 1 && ownThrees >= 1) forkBonus += 22_000; // 4-3 winning fork!
+  if (ownFours >= 2 && !(color === BLACK && ruleset === 'renju')) forkBonus += 24_000;
+  if (ownThrees >= 2 && !(color === BLACK && ruleset === 'renju')) forkBonus += 14_000;
+  attack += forkBonus * tuning.forkWeightMult;
+
+  // Competitive levels (Lv.4/Lv.5/hints) also recognize blocking opponent's 4-3 / 3-3 fork points
+  if (tuning.forkWeightMult >= 0.9) {
+    if (oppFours >= 1 && oppThrees >= 1) defense += 14_000;
+    else if (oppThrees >= 2 && !(opp === BLACK && ruleset === 'renju')) defense += 7_500;
+  }
 
   return attack + defense + centerBonus;
 }
@@ -227,13 +376,18 @@ function evaluateBoard(
   size: number,
   perspective: PlayerColor,
   turnToMove: PlayerColor,
-  ruleset: OmokRulesetType
+  ruleset: OmokRulesetType,
+  tuning: EvalTuning
 ): number {
   let myScore = 0;
   let oppScore = 0;
-  const opp = opponentColor(perspective);
 
-  const scoreLine = (color: PlayerColor, runLen: number, openBefore: boolean, openAfter: boolean): number => {
+  const scoreLine = (
+    color: PlayerColor,
+    runLen: number,
+    openBefore: boolean,
+    openAfter: boolean
+  ): number => {
     if (runLen <= 0) return 0;
     const isExactFive = runLen === 5;
     const isOverline = runLen >= 6;
@@ -251,7 +405,11 @@ function evaluateBoard(
       return (openEnds === 2 ? 65_000 : 12_000) * turnBoost;
     }
     if (runLen === 3) {
-      return (openEnds === 2 ? 7_200 : 850) * turnBoost;
+      let pts = (openEnds === 2 ? 7_200 : 850) * turnBoost;
+      if (openEnds === 2 && color !== perspective) {
+        pts *= tuning.open3DefenseMult;
+      }
+      return pts;
     }
     if (runLen === 2) {
       return (openEnds === 2 ? 320 : 52) * turnBoost;
@@ -263,9 +421,15 @@ function evaluateBoard(
   const seenDirections = (dx: number, dy: number, startX: number, startY: number) => {
     let x = startX;
     let y = startY;
+    let prevColor: PlayerColor | 0 = EMPTY;
+    let prevRunLen = 0;
+    let prevOpenBefore = false;
+    let emptySincePrev = 0;
+
     while (inBounds(size, x, y)) {
       const cell = board[y * size + x];
       if (cell === EMPTY) {
+        emptySincePrev++;
         x += dx;
         y += dy;
         continue;
@@ -283,9 +447,41 @@ function evaluateBoard(
       }
       const openAfter = inBounds(size, x, y) && board[y * size + x] === EMPTY;
 
-      const pts = scoreLine(color, runLen, openBefore, openAfter);
+      let pts = scoreLine(color, runLen, openBefore, openAfter);
+
+      // Single-gap split pattern awareness (split-4, split-3, split-2) for Master/hints
+      if (tuning.useSplitPatterns && prevColor === color && emptySincePrev === 1) {
+        const combined = prevRunLen + runLen;
+        const turnBoost = color === turnToMove ? 1.45 : 1.0;
+        if (combined === 4) {
+          // B _ B B B, B B _ B B, B B B _ B: filling the gap makes an exact 5
+          pts += 11_200 * turnBoost;
+        } else if (combined >= 5) {
+          if (color === WHITE || ruleset === 'freestyle') {
+            pts += 11_200 * turnBoost;
+          }
+        } else if (combined === 3) {
+          if (prevOpenBefore && openAfter) {
+            // Split Open-3 (e.g. _ B _ B B _): filling the gap creates a Straight Open-4
+            let splitThreePts = 5_600 * turnBoost;
+            if (color !== perspective) splitThreePts *= tuning.open3DefenseMult;
+            pts += splitThreePts;
+          } else if (prevOpenBefore || openAfter) {
+            // Split Half-Open-3: filling the gap creates a closed-4
+            pts += 450 * turnBoost;
+          }
+        } else if (combined === 2 && prevOpenBefore && openAfter) {
+          pts += 160 * turnBoost;
+        }
+      }
+
       if (color === perspective) myScore += pts;
       else oppScore += pts;
+
+      prevColor = color;
+      prevRunLen = runLen;
+      prevOpenBefore = openBefore;
+      emptySincePrev = 0;
     }
   };
 
@@ -314,7 +510,12 @@ export class GomokuAI {
     const ruleset: OmokRulesetType = req.omokRuleset ?? 'renju';
     const aiColor = req.color;
     const oppColor = opponentColor(aiColor);
-    const profile = GOMOKU_PROFILES[req.difficulty];
+    const profile = resolveEffectiveProfile(req);
+    const tuning: EvalTuning = {
+      open3DefenseMult: profile.open3DefenseMult,
+      forkWeightMult: profile.forkWeightMult,
+      useSplitPatterns: profile.useSplitPatterns,
+    };
 
     const board = new Uint8Array(req.board);
     const center = Math.floor(size / 2);
@@ -335,50 +536,72 @@ export class GomokuAI {
       };
     }
 
-    const candidates = this.generateCandidates(board, size, aiColor, ruleset, 40);
+    const candidates = this.generateCandidates(board, size, aiColor, ruleset, 40, tuning);
     if (candidates.length === 0) {
-      return {
-        coord: null,
-        winrate: 0.5,
-        simulations: 0,
-        elapsedMs: performance.now() - startTime,
-      };
+      const fallback = this.findAnyLegalCandidate(board, size, aiColor, ruleset);
+      if (!fallback) {
+        return {
+          coord: null,
+          winrate: 0.5,
+          simulations: 0,
+          elapsedMs: performance.now() - startTime,
+        };
+      }
+      candidates.push(fallback);
     }
 
     // 2. Check immediate winning 5 moves for AI
+    const immediateWins: CandidateMove[] = [];
     for (const c of candidates) {
       if (checkWinAt(board, size, c.x, c.y, aiColor, ruleset).won) {
+        immediateWins.push(c);
+      }
+    }
+    let suppressedWinIdxs: Set<number> | null = null;
+    if (immediateWins.length > 0) {
+      if (profile.immediateWinProb >= 1 || Math.random() < profile.immediateWinProb) {
+        const winMove = immediateWins[0];
         return {
-          coord: { x: c.x, y: c.y },
+          coord: { x: winMove.x, y: winMove.y },
           winrate: 0.995,
           simulations: 1,
           elapsedMs: performance.now() - startTime,
-          topSuggestions: [{ coord: { x: c.x, y: c.y }, winrate: 0.995, visits: 1 }],
+          topSuggestions: [{ coord: { x: winMove.x, y: winMove.y }, winrate: 0.995, visits: 1 }],
         };
       }
+      // Beginner oversight: suppress immediate win squares so heuristic 240,000 doesn't force picking them
+      suppressedWinIdxs = new Set(immediateWins.map((w) => w.idx));
     }
 
     // 3. Check urgent opponent immediate winning 5 moves
     const urgentBlocks = this.findImmediateWins(board, size, oppColor, ruleset);
+    let overlookUrgentBlocks = false;
     if (urgentBlocks.length === 1) {
       const bIdx = urgentBlocks[0];
       const bx = bIdx % size;
       const by = (bIdx - bx) / size;
-      // Only block if it is legal for AI (e.g. if Renju Black can't play a forbidden square to block, pick fallback)
-      const isForbiddenBlock = aiColor === BLACK && ruleset === 'renju' && checkRenjuForbidden(board, size, bx, by).forbidden;
+      const isForbiddenBlock =
+        aiColor === BLACK && ruleset === 'renju' && checkRenjuForbidden(board, size, bx, by).forbidden;
       if (!isForbiddenBlock) {
-        return {
-          coord: { x: bx, y: by },
-          winrate: 0.42,
-          simulations: 2,
-          elapsedMs: performance.now() - startTime,
-          topSuggestions: [{ coord: { x: bx, y: by }, winrate: 0.42, visits: 2 }],
-        };
+        if (profile.urgentBlockProb >= 1 || Math.random() < profile.urgentBlockProb) {
+          return {
+            coord: { x: bx, y: by },
+            winrate: 0.42,
+            simulations: 2,
+            elapsedMs: performance.now() - startTime,
+            topSuggestions: [{ coord: { x: bx, y: by }, winrate: 0.42, visits: 2 }],
+          };
+        }
+        overlookUrgentBlocks = true;
+      }
+    } else if (urgentBlocks.length > 1 && profile.urgentBlockProb < 1) {
+      if (Math.random() >= profile.urgentBlockProb) {
+        overlookUrgentBlocks = true;
       }
     }
 
-    // 4. Straight Open Four attack for AI (instant win unless opponent had an ignored immediate 5)
-    if (urgentBlocks.length === 0) {
+    // 4. Straight Open Four attack for AI (enabled for Lv.4+, or whenever includeHints is true)
+    if (profile.useOpenFourShortcut && urgentBlocks.length === 0) {
       for (const c of candidates) {
         if (this.createsStraightOpenFour(board, size, c.x, c.y, aiColor, ruleset)) {
           return {
@@ -392,11 +615,12 @@ export class GomokuAI {
       }
     }
 
-    // 5. VCF (Victory by Continuous Fours) for Lv.4 and Lv.5
+    // 5. VCF (Victory by Continuous Fours) for Lv.4, Lv.5, and hints
     let nodesVisited = 0;
     const deadline = startTime + profile.timeBudgetMs;
     if (profile.enableVcf && urgentBlocks.length === 0) {
-      const vcfMove = this.searchVcf(board, size, aiColor, ruleset, profile.vcfDepth, deadline);
+      const vcfDeadline = Math.min(deadline, startTime + Math.min(240, profile.timeBudgetMs * 0.35));
+      const vcfMove = this.searchVcf(board, size, aiColor, ruleset, profile.vcfDepth, vcfDeadline);
       if (vcfMove >= 0) {
         const vx = vcfMove % size;
         const vy = (vcfMove - vx) / size;
@@ -410,16 +634,56 @@ export class GomokuAI {
       }
     }
 
-    // Filter root candidates if urgent opponent 5-threats exist
-    const searchPool =
-      urgentBlocks.length > 1
-        ? candidates.filter((c) => urgentBlocks.includes(c.idx))
-        : candidates.slice(0, profile.maxCandidates);
-    const activeCandidates = searchPool.length > 0 ? searchPool : candidates.slice(0, profile.maxCandidates);
+    // Filter candidates when beginner overlooked win/block or when urgent multi-threats exist
+    let searchPool: CandidateMove[];
+    if (urgentBlocks.length > 1 && !overlookUrgentBlocks) {
+      searchPool = candidates.filter((c) => urgentBlocks.includes(c.idx));
+    } else {
+      let filtered = candidates;
+      if (suppressedWinIdxs || overlookUrgentBlocks) {
+        const urgentSet = overlookUrgentBlocks ? new Set(urgentBlocks) : null;
+        const reduced = candidates.filter(
+          (c) => (!suppressedWinIdxs || !suppressedWinIdxs.has(c.idx)) && (!urgentSet || !urgentSet.has(c.idx))
+        );
+        if (reduced.length > 0) {
+          filtered = reduced;
+        }
+      }
+      searchPool = filtered.slice(0, profile.maxCandidates);
+    }
+    let activeCandidates = searchPool.length > 0 ? searchPool : candidates.slice(0, profile.maxCandidates);
 
-    // 6. Lv.1 noisy novice choice (with basic win/block awareness already handled!)
-    if (req.difficulty === 1) {
-      const topK = activeCandidates.slice(0, Math.min(5, activeCandidates.length));
+    // 5b. Lv.5 Opponent-VCF Counter-Defense awareness
+    if (profile.useOpponentVcfDefense && urgentBlocks.length === 0 && activeCandidates.length > 1) {
+      const oppVcfDefenses = this.findOpponentVcfDefenses(
+        board,
+        size,
+        aiColor,
+        oppColor,
+        ruleset,
+        candidates,
+        activeCandidates,
+        profile.vcfDepth,
+        deadline
+      );
+      if (oppVcfDefenses && oppVcfDefenses.length > 0) {
+        if (oppVcfDefenses.length === 1) {
+          const only = oppVcfDefenses[0];
+          return {
+            coord: { x: only.x, y: only.y },
+            winrate: 0.45,
+            simulations: 32,
+            elapsedMs: performance.now() - startTime,
+            topSuggestions: [{ coord: { x: only.x, y: only.y }, winrate: 0.45, visits: 32 }],
+          };
+        }
+        activeCandidates = oppVcfDefenses;
+      }
+    }
+
+    // 6. Lv.1 noisy novice choice (maxDepth === 0, !includeHints)
+    if (profile.maxDepth <= 0) {
+      const topK = activeCandidates.slice(0, Math.min(10, activeCandidates.length));
       let bestMove = topK[0];
       let bestNoisy = -Infinity;
       const scoredSuggestions: AISuggestion[] = topK.slice(0, 3).map((m) => ({
@@ -429,15 +693,16 @@ export class GomokuAI {
       }));
 
       for (const m of topK) {
-        const val = m.heuristic + (Math.random() - 0.5) * profile.noiseRange * 2;
+        const val = m.heuristic + (Math.random() - 0.5) * 2 * profile.noiseRange;
         if (val > bestNoisy) {
           bestNoisy = val;
           bestMove = m;
         }
       }
+      const safeMove = this.ensureLegalRootMove(board, size, bestMove, activeCandidates, aiColor, ruleset);
       return {
-        coord: { x: bestMove.x, y: bestMove.y },
-        winrate: this.scoreToWinrate(bestMove.heuristic * 0.2),
+        coord: { x: safeMove.x, y: safeMove.y },
+        winrate: this.scoreToWinrate(safeMove.heuristic * 0.2),
         simulations: topK.length,
         elapsedMs: performance.now() - startTime,
         topSuggestions: scoredSuggestions,
@@ -445,14 +710,25 @@ export class GomokuAI {
     }
 
     // 7. Iterative Deepening Alpha-Beta with Transposition Table
+    const hasCasualLapse = profile.casualLapseProb > 0 && Math.random() < profile.casualLapseProb;
+    const effectiveMaxDepth = hasCasualLapse ? 1 : profile.maxDepth;
+    const effectiveNoiseRange = hasCasualLapse ? Math.max(profile.noiseRange, 5_600) : profile.noiseRange;
+
     let hash = computeBoardHash(board, size);
     const moveScores = new Map<number, number>();
-    for (const c of activeCandidates) moveScores.set(c.idx, c.heuristic);
+    const completedScores = new Map<number, number>();
+    for (const c of activeCandidates) {
+      moveScores.set(c.idx, c.heuristic);
+      completedScores.set(c.idx, c.heuristic);
+    }
 
     let bestCoord: Coord = { x: activeCandidates[0].x, y: activeCandidates[0].y };
     let bestRootScore = -Infinity;
+    let hasCompletedIter = false;
+    const internalMaxCandidates =
+      effectiveMaxDepth >= 5 ? Math.min(profile.maxCandidates, 14) : profile.maxCandidates;
 
-    for (let depth = 1; depth <= profile.maxDepth; depth++) {
+    for (let depth = 1; depth <= effectiveMaxDepth; depth++) {
       if (performance.now() >= deadline && depth > 2) break;
 
       // Order root candidates by previous iteration's scores
@@ -482,13 +758,15 @@ export class GomokuAI {
             size,
             hash,
             depth - 1,
+            1,
             alpha,
             beta,
             false,
             aiColor,
             oppColor,
             ruleset,
-            profile.maxCandidates,
+            internalMaxCandidates,
+            tuning,
             deadline,
             () => {
               nodesVisited++;
@@ -512,35 +790,56 @@ export class GomokuAI {
           iterBestIdx = c.idx;
         }
         if (score > alpha) alpha = score;
+        if (score >= WIN_SCORE - 50) {
+          bestRootScore = iterBestScore;
+          bestCoord = { x: iterBestIdx % size, y: (iterBestIdx - (iterBestIdx % size)) / size };
+          completedScores.set(c.idx, score);
+          hasCompletedIter = true;
+          aborted = true;
+          break;
+        }
       }
 
       if (!aborted) {
+        hasCompletedIter = true;
+        for (const c of activeCandidates) {
+          completedScores.set(c.idx, moveScores.get(c.idx) ?? c.heuristic);
+        }
         bestRootScore = iterBestScore;
         bestCoord = { x: iterBestIdx % size, y: (iterBestIdx - (iterBestIdx % size)) / size };
-        if (bestRootScore >= WIN_SCORE - 50) break;
       }
+      if (bestRootScore >= WIN_SCORE - 50) break;
     }
 
-    // Small organic variety for Lv.2
-    if (profile.noiseRange > 0 && activeCandidates.length > 1 && bestRootScore < WIN_SCORE * 0.3) {
-      const noisySorted = activeCandidates
-        .slice(0, 4)
+    const finalScoreMap = hasCompletedIter ? completedScores : moveScores;
+    const rankedFinal = activeCandidates
+      .slice()
+      .sort((a, b) => (finalScoreMap.get(b.idx) ?? 0) - (finalScoreMap.get(a.idx) ?? 0));
+
+    bestCoord = { x: rankedFinal[0].x, y: rankedFinal[0].y };
+
+    // Organic human-like variety for Lv.2 and Lv.3 (!includeHints only)
+    if (effectiveNoiseRange > 0 && rankedFinal.length > 1 && bestRootScore < WIN_SCORE * 0.3) {
+      const poolSize = req.difficulty <= 2 || hasCasualLapse ? 5 : 4;
+      const noisySorted = rankedFinal
+        .slice(0, poolSize)
         .map((c) => ({
           c,
-          v: (moveScores.get(c.idx) ?? 0) + (Math.random() - 0.5) * profile.noiseRange,
+          v: (finalScoreMap.get(c.idx) ?? 0) + (Math.random() - 0.5) * 2 * effectiveNoiseRange,
         }))
         .sort((a, b) => b.v - a.v);
       bestCoord = { x: noisySorted[0].c.x, y: noisySorted[0].c.y };
     }
 
-    const sortedFinal = activeCandidates
-      .slice()
-      .sort((a, b) => (moveScores.get(b.idx) ?? 0) - (moveScores.get(a.idx) ?? 0))
-      .slice(0, 3);
+    // Belt-and-suspenders Renju check before returning
+    if (!isLegalOmokCell(board, size, bestCoord.x, bestCoord.y, aiColor, ruleset)) {
+      const safeMove = this.ensureLegalRootMove(board, size, rankedFinal[0], rankedFinal, aiColor, ruleset);
+      bestCoord = { x: safeMove.x, y: safeMove.y };
+    }
 
-    const topSuggestions: AISuggestion[] = sortedFinal.map((c, i) => ({
+    const topSuggestions: AISuggestion[] = rankedFinal.slice(0, 3).map((c, i) => ({
       coord: { x: c.x, y: c.y },
-      winrate: this.scoreToWinrate(moveScores.get(c.idx) ?? 0),
+      winrate: this.scoreToWinrate(finalScoreMap.get(c.idx) ?? 0),
       visits: Math.max(10, Math.round(nodesVisited / (i + 1.5))),
     }));
 
@@ -551,6 +850,41 @@ export class GomokuAI {
       elapsedMs: performance.now() - startTime,
       topSuggestions,
     };
+  }
+
+  private ensureLegalRootMove(
+    board: Uint8Array,
+    size: BoardSize,
+    preferred: CandidateMove,
+    pool: CandidateMove[],
+    color: PlayerColor,
+    ruleset: OmokRulesetType
+  ): CandidateMove {
+    if (isLegalOmokCell(board, size, preferred.x, preferred.y, color, ruleset)) {
+      return preferred;
+    }
+    for (const c of pool) {
+      if (isLegalOmokCell(board, size, c.x, c.y, color, ruleset)) return c;
+    }
+    return this.findAnyLegalCandidate(board, size, color, ruleset) ?? preferred;
+  }
+
+  private findAnyLegalCandidate(
+    board: Uint8Array,
+    size: BoardSize,
+    color: PlayerColor,
+    ruleset: OmokRulesetType
+  ): CandidateMove | null {
+    const total = size * size;
+    for (let idx = 0; idx < total; idx++) {
+      if (board[idx] !== EMPTY) continue;
+      const x = idx % size;
+      const y = (idx - x) / size;
+      if (isLegalOmokCell(board, size, x, y, color, ruleset)) {
+        return { idx, x, y, heuristic: 0 };
+      }
+    }
+    return null;
   }
 
   private scoreToWinrate(score: number): number {
@@ -565,8 +899,9 @@ export class GomokuAI {
     size: BoardSize,
     color: PlayerColor,
     ruleset: OmokRulesetType,
-    limit: number
-  ): Array<{ idx: number; x: number; y: number; heuristic: number }> {
+    limit: number,
+    tuning: EvalTuning
+  ): CandidateMove[] {
     const opp = opponentColor(color);
     const total = size * size;
     const nearMask = new Uint8Array(total);
@@ -587,17 +922,22 @@ export class GomokuAI {
       }
     }
 
-    const candidates: Array<{ idx: number; x: number; y: number; heuristic: number }> = [];
+    const candidates: CandidateMove[] = [];
     for (let idx = 0; idx < total; idx++) {
       if (!nearMask[idx]) continue;
       const x = idx % size;
       const y = (idx - x) / size;
 
-      if (color === BLACK && ruleset === 'renju' && checkRenjuForbidden(board, size, x, y).forbidden) {
+      if (
+        color === BLACK &&
+        ruleset === 'renju' &&
+        hasEnoughNearbyBlackForForbidden(board, size, x, y) &&
+        checkRenjuForbidden(board, size, x, y).forbidden
+      ) {
         continue;
       }
 
-      const heuristic = scoreLocalPlacement(board, size, x, y, color, opp, ruleset);
+      const heuristic = scoreLocalPlacement(board, size, x, y, color, opp, ruleset, tuning);
       candidates.push({ idx, x, y, heuristic });
     }
 
@@ -619,15 +959,65 @@ export class GomokuAI {
       const y = (idx - x) / size;
       if (!this.hasAdjacentSameColorWithin4(board, size, x, y, color)) continue;
       if (checkWinAt(board, size, x, y, color, ruleset).won) {
-        if (color === BLACK && ruleset === 'renju') {
-          // Exact 5 is already verified by checkWinAt returning won: true
-          wins.push(idx);
-        } else {
-          wins.push(idx);
+        wins.push(idx);
+      }
+    }
+    return wins;
+  }
+
+  /**
+   * Scans only the 4 axes within distance 4 of (cx, cy) to find new immediate 5-wins
+   * created by placing `color` at (cx, cy).
+   */
+  private findImmediateWinsNear(
+    board: Uint8Array,
+    size: BoardSize,
+    cx: number,
+    cy: number,
+    color: PlayerColor,
+    ruleset: OmokRulesetType
+  ): number[] {
+    const wins: number[] = [];
+    for (const [dx, dy] of AXES) {
+      for (let k = -4; k <= 4; k++) {
+        if (k === 0) continue;
+        const tx = cx + dx * k;
+        const ty = cy + dy * k;
+        if (!inBounds(size, tx, ty)) continue;
+        const tIdx = ty * size + tx;
+        if (board[tIdx] !== EMPTY) continue;
+        if (checkWinAt(board, size, tx, ty, color, ruleset).won) {
+          wins.push(tIdx);
         }
       }
     }
     return wins;
+  }
+
+  /**
+   * Returns true if empty cell (x, y) has at least 3 stones of `color` within [-4..+4]
+   * on at least one axis — a necessary condition to create a Four threat.
+   */
+  private canPossiblyFormFour(
+    board: Uint8Array,
+    size: number,
+    x: number,
+    y: number,
+    color: PlayerColor
+  ): boolean {
+    for (const [dx, dy] of AXES) {
+      let count = 0;
+      for (let k = -4; k <= 4; k++) {
+        if (k === 0) continue;
+        const nx = x + dx * k;
+        const ny = y + dy * k;
+        if (inBounds(size, nx, ny) && board[ny * size + nx] === color) {
+          count++;
+          if (count >= 3) return true;
+        }
+      }
+    }
+    return false;
   }
 
   private hasAdjacentSameColorWithin4(
@@ -710,9 +1100,18 @@ export class GomokuAI {
     attacker: PlayerColor,
     ruleset: OmokRulesetType,
     depth: number,
-    deadline: number
+    deadline: number,
+    pathOut?: number[],
+    vcfVisited: Map<bigint, number> = new Map(),
+    boardHash?: bigint
   ): number {
     if (depth <= 0 || performance.now() >= deadline) return -1;
+
+    const hash = boardHash ?? computeBoardHash(board, size);
+    const failedDepth = vcfVisited.get(hash);
+    if (failedDepth !== undefined && failedDepth >= depth) {
+      return -1;
+    }
 
     const defender = opponentColor(attacker);
     const total = size * size;
@@ -724,52 +1123,187 @@ export class GomokuAI {
       const y = (idx - x) / size;
       if (!this.hasAdjacentSameColorWithin4(board, size, x, y, attacker)) continue;
       if (checkWinAt(board, size, x, y, attacker, ruleset).won) {
+        if (pathOut) pathOut.push(idx);
         return idx;
       }
     }
 
-    // 2. Find all empty squares where attacker creates a Four (forcing defender to block the exact-5 square)
-    const candidates = this.generateCandidates(board, size, attacker, ruleset, 24);
-    for (const c of candidates) {
-      board[c.idx] = attacker;
-
-      // Check how many immediate 5 wins `attacker` now threatens
-      const replyWins = this.findImmediateWins(board, size, attacker, ruleset);
-      if (replyWins.length >= 2) {
-        // Double threat -> Unstoppable VCF!
-        board[c.idx] = EMPTY;
-        return c.idx;
+    // 2. Collect only empty squares that have >= 3 attacker stones within 4 cells on an axis
+    const fourMoves: Array<{ idx: number; x: number; y: number; replyWins: number[] }> = [];
+    for (let idx = 0; idx < total; idx++) {
+      if (board[idx] !== EMPTY) continue;
+      const x = idx % size;
+      const y = (idx - x) / size;
+      if (!this.canPossiblyFormFour(board, size, x, y, attacker)) continue;
+      if (
+        attacker === BLACK &&
+        ruleset === 'renju' &&
+        hasEnoughNearbyBlackForForbidden(board, size, x, y) &&
+        checkRenjuForbidden(board, size, x, y).forbidden
+      ) {
+        continue;
       }
 
+      board[idx] = attacker;
+      const replyWins = this.findImmediateWinsNear(board, size, x, y, attacker, ruleset);
+      board[idx] = EMPTY;
+
+      if (replyWins.length >= 2) {
+        if (pathOut) pathOut.push(idx);
+        return idx;
+      }
       if (replyWins.length === 1) {
-        const blockIdx = replyWins[0];
-        const bx = blockIdx % size;
-        const by = (blockIdx - bx) / size;
+        fourMoves.push({ idx, x, y, replyWins });
+      }
+    }
 
-        // If Renju rules forbid Defender (BLACK) from playing the block square, Attacker wins immediately!
-        if (defender === BLACK && ruleset === 'renju' && checkRenjuForbidden(board, size, bx, by).forbidden) {
-          board[c.idx] = EMPTY;
-          return c.idx;
-        }
+    for (const fm of fourMoves) {
+      if (performance.now() >= deadline) break;
 
-        // Check defender counter-5 before continuing VCF
-        board[blockIdx] = defender;
-        const defenderWonByBlocking = checkWinAt(board, size, bx, by, defender, ruleset).won;
-        if (!defenderWonByBlocking) {
-          const next = this.searchVcf(board, size, attacker, ruleset, depth - 1, deadline);
-          if (next >= 0) {
-            board[blockIdx] = EMPTY;
-            board[c.idx] = EMPTY;
-            return c.idx;
+      const blockIdx = fm.replyWins[0];
+      const bx = blockIdx % size;
+      const by = (blockIdx - bx) / size;
+
+      board[fm.idx] = attacker;
+
+      // If Renju rules forbid Defender (BLACK) from playing the block square, Attacker wins immediately!
+      if (defender === BLACK && ruleset === 'renju' && checkRenjuForbidden(board, size, bx, by).forbidden) {
+        board[fm.idx] = EMPTY;
+        if (pathOut) pathOut.push(fm.idx);
+        return fm.idx;
+      }
+
+      // Check defender counter-5 before continuing VCF
+      board[blockIdx] = defender;
+      const defenderWonByBlocking = checkWinAt(board, size, bx, by, defender, ruleset).won;
+      if (!defenderWonByBlocking) {
+        const nextHash = hash ^ stoneZobristKey(fm.idx, attacker) ^ stoneZobristKey(blockIdx, defender);
+        const next = this.searchVcf(
+          board,
+          size,
+          attacker,
+          ruleset,
+          depth - 1,
+          deadline,
+          pathOut,
+          vcfVisited,
+          nextHash
+        );
+        if (next >= 0) {
+          board[blockIdx] = EMPTY;
+          board[fm.idx] = EMPTY;
+          if (pathOut) {
+            pathOut.push(blockIdx);
+            pathOut.push(fm.idx);
           }
+          return fm.idx;
         }
-        board[blockIdx] = EMPTY;
+      }
+
+      board[blockIdx] = EMPTY;
+      board[fm.idx] = EMPTY;
+    }
+
+    if (vcfVisited.size > 25_000) vcfVisited.clear();
+    vcfVisited.set(hash, depth);
+    return -1;
+  }
+
+  /**
+   * Lv.5 Opponent-VCF Counter-Defense: checks if opponent currently holds a winning VCF;
+   * if so, filters/prioritizes legal AI moves (including counter-Four interruptions) that break it.
+   */
+  private findOpponentVcfDefenses(
+    board: Uint8Array,
+    size: BoardSize,
+    aiColor: PlayerColor,
+    oppColor: PlayerColor,
+    ruleset: OmokRulesetType,
+    allCandidates: CandidateMove[],
+    activeCandidates: CandidateMove[],
+    vcfDepth: number,
+    searchDeadline: number
+  ): CandidateMove[] | null {
+    const now = performance.now();
+    const detectDeadline = Math.min(searchDeadline - 350, now + 160);
+    if (detectDeadline <= now) return null;
+
+    const oppVcfPath: number[] = [];
+    const oppDepth = Math.min(12, vcfDepth);
+    const oppVcfMove = this.searchVcf(board, size, oppColor, ruleset, oppDepth, detectDeadline, oppVcfPath);
+    if (oppVcfMove < 0) return null;
+
+    // Build ordered suspect list: VCF line intersections first, then active candidates
+    const seenIdx = new Set<number>();
+    const suspects: CandidateMove[] = [];
+    const candidateByIdx = new Map<number, CandidateMove>();
+    for (const c of allCandidates) candidateByIdx.set(c.idx, c);
+
+    for (let i = oppVcfPath.length - 1; i >= 0; i--) {
+      const idx = oppVcfPath[i];
+      if (seenIdx.has(idx) || board[idx] !== EMPTY) continue;
+      const x = idx % size;
+      const y = (idx - x) / size;
+      if (!isLegalOmokCell(board, size, x, y, aiColor, ruleset)) continue;
+      seenIdx.add(idx);
+      const existing = candidateByIdx.get(idx);
+      suspects.push(existing ?? { idx, x, y, heuristic: 18_000 });
+    }
+    for (const c of activeCandidates) {
+      if (seenIdx.has(c.idx)) continue;
+      seenIdx.add(c.idx);
+      suspects.push(c);
+    }
+
+    const defenseDeadline = Math.min(searchDeadline - 280, performance.now() + 260);
+    const survivingDefenses: CandidateMove[] = [];
+    const maxCheck = Math.min(16, suspects.length);
+
+    for (let i = 0; i < maxCheck; i++) {
+      if (performance.now() >= defenseDeadline) break;
+      const c = suspects[i];
+
+      board[c.idx] = aiColor;
+      const aiImmediateReplies = this.findImmediateWinsNear(board, size, c.x, c.y, aiColor, ruleset);
+
+      let stopsVcf = false;
+      if (aiImmediateReplies.length >= 2) {
+        stopsVcf = true;
+      } else if (aiImmediateReplies.length === 1) {
+        const oppForcedIdx = aiImmediateReplies[0];
+        const fx = oppForcedIdx % size;
+        const fy = (oppForcedIdx - fx) / size;
+        const oppForbidden =
+          oppColor === BLACK && ruleset === 'renju' && checkRenjuForbidden(board, size, fx, fy).forbidden;
+        if (oppForbidden) {
+          stopsVcf = true;
+        } else {
+          board[oppForcedIdx] = oppColor;
+          const oppWonByBlocking = checkWinAt(board, size, fx, fy, oppColor, ruleset).won;
+          if (!oppWonByBlocking) {
+            stopsVcf =
+              this.searchVcf(board, size, oppColor, ruleset, Math.min(10, oppDepth), defenseDeadline) < 0;
+          }
+          board[oppForcedIdx] = EMPTY;
+        }
+      } else {
+        stopsVcf =
+          this.searchVcf(board, size, oppColor, ruleset, Math.min(10, oppDepth), defenseDeadline) < 0;
       }
 
       board[c.idx] = EMPTY;
+
+      if (stopsVcf) {
+        survivingDefenses.push(c);
+      }
     }
 
-    return -1;
+    if (survivingDefenses.length > 0) {
+      return survivingDefenses;
+    }
+
+    // If no single move fully stops all VCFs (or sub-budget ended), still keep VCF origin prioritized
+    return suspects.slice(0, activeCandidates.length);
   }
 
   private alphaBeta(
@@ -777,6 +1311,7 @@ export class GomokuAI {
     size: BoardSize,
     hash: bigint,
     depth: number,
+    ply: number,
     alpha: number,
     beta: number,
     maximizing: boolean,
@@ -784,6 +1319,7 @@ export class GomokuAI {
     oppColor: PlayerColor,
     ruleset: OmokRulesetType,
     maxCandidates: number,
+    tuning: EvalTuning,
     deadline: number,
     onNode: () => void
   ): { score: number; aborted: boolean } {
@@ -804,12 +1340,13 @@ export class GomokuAI {
     const turnColor = maximizing ? aiColor : oppColor;
     if (depth <= 0) {
       return {
-        score: evaluateBoard(board, size, aiColor, turnColor, ruleset),
+        score: evaluateBoard(board, size, aiColor, turnColor, ruleset, tuning),
         aborted: false,
       };
     }
 
-    const candidates = this.generateCandidates(board, size, turnColor, ruleset, maxCandidates);
+    const plyLimit = ply >= 3 ? Math.max(10, maxCandidates - 4) : maxCandidates;
+    const candidates = this.generateCandidates(board, size, turnColor, ruleset, plyLimit, tuning);
     if (candidates.length === 0) {
       return { score: 0, aborted: false };
     }
@@ -836,11 +1373,18 @@ export class GomokuAI {
 
       board[c.idx] = turnColor;
       const nextHash = hash ^ stoneZobristKey(c.idx, turnColor);
-      const childRes = this.alphaBeta(
+
+      // Late Move Reduction (LMR) for deep quiet moves in competitive search
+      let nextDepth = depth - 1;
+      const canReduce = depth >= 4 && i >= 6 && c.heuristic < 3_500;
+      if (canReduce) nextDepth = depth - 2;
+
+      let childRes = this.alphaBeta(
         board,
         size,
         nextHash,
-        depth - 1,
+        nextDepth,
+        ply + 1,
         alpha,
         beta,
         !maximizing,
@@ -848,9 +1392,35 @@ export class GomokuAI {
         oppColor,
         ruleset,
         maxCandidates,
+        tuning,
         deadline,
         onNode
       );
+
+      // Re-search at full depth if reduced move looks promising
+      if (!childRes.aborted && canReduce) {
+        const interesting = maximizing ? childRes.score > alpha : childRes.score < beta;
+        if (interesting) {
+          childRes = this.alphaBeta(
+            board,
+            size,
+            nextHash,
+            depth - 1,
+            ply + 1,
+            alpha,
+            beta,
+            !maximizing,
+            aiColor,
+            oppColor,
+            ruleset,
+            maxCandidates,
+            tuning,
+            deadline,
+            onNode
+          );
+        }
+      }
+
       board[c.idx] = EMPTY;
 
       if (childRes.aborted) {
