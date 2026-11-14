@@ -40,6 +40,7 @@ describe('GomokuAI (Omok 5-Level Engine)', () => {
     });
 
     expect(res.coord).toEqual({ x: 9, y: 7 });
+    expect(res.engineBackend).toBe('katago-omok-puct');
   });
 
   it('immediately blocks opponent straight four threat across competitive levels', () => {

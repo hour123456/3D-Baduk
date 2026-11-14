@@ -1,6 +1,13 @@
 const { app, BrowserWindow, ipcMain, dialog, Menu } = require('electron');
 const path = require('path');
 const fs = require('fs/promises');
+const {
+  getKataGoStatus,
+  analyzeBadukMove,
+  cancelActiveAnalysis,
+  readBundledWebWeights,
+  shutdownKataGo,
+} = require('./katago-bridge.cjs');
 
 let mainWindow = null;
 
@@ -103,12 +110,24 @@ ipcMain.handle('window:toggleFullscreen', () => {
   return next;
 });
 
+ipcMain.handle('katago:analyze', (_event, payload) => analyzeBadukMove(payload));
+ipcMain.handle('katago:cancel', () => {
+  cancelActiveAnalysis();
+  return true;
+});
+ipcMain.handle('katago:status', () => getKataGoStatus());
+ipcMain.handle('katago:readWebWeights', () => readBundledWebWeights());
+
 app.whenReady().then(() => {
   createWindow();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
+});
+
+app.on('before-quit', () => {
+  shutdownKataGo();
 });
 
 app.on('window-all-closed', () => {

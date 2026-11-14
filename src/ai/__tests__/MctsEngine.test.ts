@@ -56,6 +56,8 @@ describe('MctsEngine & Tactical Heuristics', () => {
 
     expect(res.coord).toEqual({ x: 4, y: 5 });
     expect(res.simulations).toBeGreaterThan(50);
+    expect(res.engineBackend).toBe('katago-neural');
+    expect(Number.isFinite(res.scoreLead)).toBe(true);
   });
 
   it('detects classic Ladder (축) capture and Ladder Breaker (축머리) accurately', () => {

@@ -97,19 +97,19 @@ export interface UIActions {
 }
 
 const AI_LEVEL_DESCRIPTIONS: Record<AIDifficulty, string> = {
-  1: 'Lv.1 입문 — 바둑 규칙과 착수·따내기를 부담 없이 익히는 완전 입문용 난이도입니다.',
-  2: 'Lv.2 초급 — 단수·활로 등 기초 감각 중심으로 두어 초심자도 쉽게 즐길 수 있는 대국입니다.',
-  3: 'Lv.3 중급 — 기본 포석과 형세 감각을 갖춘 표준 난이도로, 일반인도 편하게 즐기고 승리할 수 있습니다.',
-  4: 'Lv.4 고급 — 축·환격·양단수·맥점을 동원한 치열한 수읽기와 공격적인 포석·전투를 펼칩니다.',
-  5: 'Lv.5 마스터 — 최고 수준의 정밀 MCTS 수읽기와 냉철한 수비·전투 판단으로 빈틈없는 승부를 구사합니다.',
+  1: 'Lv.1 입문 — KataGo 신경망·PUCT 기반이지만 아주 쉽게 두어 바둑 규칙과 따내기를 부담 없이 익힐 수 있습니다.',
+  2: 'Lv.2 초급 — KataGo 신경망 감각을 가볍게 완화해 단수·활로 등 기초 수읽기 연습에 알맞은 쉬운 대국입니다.',
+  3: 'Lv.3 중급 — KataGo 신경망·PUCT 기반의 자연스러운 착수를 구사하되, 일반인도 편하게 즐기고 승리할 수 있는 표준 난이도입니다.',
+  4: 'Lv.4 고급 — KataGo 신경망·PUCT 정밀 탐색과 축·환격·맥점을 결합해 치열한 포석·전투를 펼칩니다.',
+  5: 'Lv.5 마스터 — KataGo 풀 신경망·PUCT 수읽기와 형세 판단으로 최고 수준의 빈틈없는 승부를 구사합니다.',
 };
 
 const OMOK_AI_LEVEL_DESCRIPTIONS: Record<AIDifficulty, string> = {
-  1: 'Lv.1 입문 — 오목 규칙과 5목 만들기를 부담 없이 익히는 완전 입문용 난이도입니다.',
-  2: 'Lv.2 초급 — 기본적인 3·4 방어 등 기초 감각 중심의 쉽고 가벼운 연습 대국입니다.',
-  3: 'Lv.3 중급 — 기본 공방 감각을 갖춘 표준 난이도로, 일반인도 편하게 즐기고 승리할 수 있습니다.',
-  4: 'Lv.4 고급 — 날카로운 수읽기와 VCF(연속 4수 필승) 기반의 공격적인 포석·전투를 구사합니다.',
-  5: 'Lv.5 마스터 — 최고 수준의 정밀 수읽기와 공수 VCF 완급 조절로 냉철한 최상급 승부를 펼칩니다.',
+  1: 'Lv.1 입문 — KataGo PUCT·VCF 기반이지만 아주 쉽게 두어 오목 규칙과 5목 만들기를 부담 없이 익힐 수 있습니다.',
+  2: 'Lv.2 초급 — KataGo PUCT 감각을 가볍게 완화해 기본적인 3·4 방어와 연습 대국을 쉽게 즐길 수 있습니다.',
+  3: 'Lv.3 중급 — KataGo PUCT·VCF 기반의 자연스러운 공방 감각을 갖추되, 일반인도 편하게 즐기고 승리할 수 있는 표준 난이도입니다.',
+  4: 'Lv.4 고급 — KataGo PUCT 탐색과 VCF(연속 4수 필승)를 결합해 날카롭고 공격적인 포석·전투를 구사합니다.',
+  5: 'Lv.5 마스터 — KataGo PUCT·딥 VCF와 공수 완급 조절로 최고 수준의 정밀 수읽기와 냉철한 승부를 펼칩니다.',
 };
 
 export const AI_LEVEL_NAMES: Record<AIDifficulty, string> = {
@@ -735,6 +735,10 @@ export class UIManager {
                   <button class="seg-btn" data-val="5">마스터</button>
                 </div>
                 <div class="ai-desc-hint" id="ai-desc-hint">${AI_LEVEL_DESCRIPTIONS[3]}</div>
+                <div id="ai-engine-badge" style="margin-top: 6px; font-size: 11px; color: #b8aa96; display: flex; align-items: center; gap: 6px;">
+                  <span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#6fd89c;"></span>
+                  <span id="ai-engine-badge-text">엔진: KataGo (b6c96 Neural · PUCT)</span>
+                </div>
               </div>
 
               <div class="form-section">
@@ -1746,6 +1750,30 @@ export class UIManager {
       }
     });
 
+    let nativeKataGoActive = false;
+    const refreshEngineBadge = () => {
+      const badgeText = this.root.querySelector('#ai-engine-badge-text');
+      if (!badgeText) return;
+      if (this.draftGameType === 'omok') {
+        badgeText.textContent = '엔진: KataGo · KataGomo (PUCT · VCF 하이브리드)';
+      } else if (nativeKataGoActive) {
+        badgeText.textContent = '엔진: KataGo v1.18 Native Eigen · PUCT';
+      } else {
+        badgeText.textContent = '엔진: KataGo (b6c96 Neural · PUCT)';
+      }
+    };
+    if (window.electronAPI?.katagoStatus) {
+      void window.electronAPI
+        .katagoStatus()
+        .then((status) => {
+          nativeKataGoActive = Boolean(status?.nativeAvailable);
+          refreshEngineBadge();
+        })
+        .catch(() => {
+          nativeKataGoActive = false;
+        });
+    }
+
     const syncOfflineGameTypeUI = () => {
       const isOmok = this.draftGameType === 'omok';
       this.root.querySelector('#offline-baduk-rules-sec')!.classList.toggle('hidden', isOmok);
@@ -1768,6 +1796,7 @@ export class UIManager {
 
       const descMap = isOmok ? OMOK_AI_LEVEL_DESCRIPTIONS : AI_LEVEL_DESCRIPTIONS;
       this.root.querySelector('#ai-desc-hint')!.textContent = descMap[this.draftDifficulty];
+      refreshEngineBadge();
     };
 
     this.bindSegmented('#seg-game-type', (val) => {

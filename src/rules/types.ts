@@ -128,6 +128,12 @@ declare global {
       adminSaveBanRegistry?: (data: unknown) => Promise<boolean>;
       adminLoadClosedRooms?: () => Promise<unknown>;
       adminSaveClosedRooms?: (data: unknown) => Promise<boolean>;
+      katagoAnalyze?: (
+        payload: import('../ai/MctsEngine').AISearchRequest
+      ) => Promise<{ available: boolean; result?: import('../ai/MctsEngine').AISearchResult }>;
+      katagoCancel?: () => Promise<boolean>;
+      katagoStatus?: () => Promise<{ nativeAvailable: boolean; modelName: string }>;
+      readKataGoWeights?: () => Promise<Uint8Array | null>;
     };
   }
 }

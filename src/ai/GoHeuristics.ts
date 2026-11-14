@@ -105,7 +105,13 @@ export function computeCandidateMovesAndPriors(params: {
   enableAdvancedTactics?: boolean;
   heuristicLevel?: HeuristicLevel;
   skipLadder?: boolean;
-}): { moves: Int16Array; priors: Float32Array; count: number } {
+}): {
+  moves: Int16Array;
+  priors: Float32Array;
+  urgentScores: Float32Array;
+  legalMask: Uint8Array;
+  count: number;
+} {
   const {
     board,
     color,
@@ -131,6 +137,8 @@ export function computeCandidateMovesAndPriors(params: {
 
   const moves = new Int16Array(total);
   const weights = new Float32Array(total);
+  const urgentBuf = new Float32Array(total);
+  const legalMask = new Uint8Array(total);
   let count = 0;
 
   const isOpening = moveCount < Math.floor(total * 0.16);
@@ -148,7 +156,9 @@ export function computeCandidateMovesAndPriors(params: {
     const captured = sim.play(idx, color, forbiddenHashes);
     if (captured < 0) continue;
 
+    legalMask[idx] = 1;
     let score = 1.0;
+    let urgent = 0.0;
     const x = idx % size;
     const y = (idx - x) / size;
     const distEdgeX = Math.min(x, size - 1 - x);
@@ -164,8 +174,13 @@ export function computeCandidateMovesAndPriors(params: {
       if (isNovice) score += 1.2 + captured * 0.8;
       else if (isElementary) score += 2.6 + captured * 1.6;
       else if (isCasual) score += 4.0 + captured * 2.4;
-      else if (isFull) score += 9.5 + captured * 4.8;
-      else score += 11.5 + captured * 5.5;
+      else if (isFull) {
+        score += 9.5 + captured * 4.8;
+        urgent += 0.38 + Math.min(0.62, captured * 0.16);
+      } else {
+        score += 11.5 + captured * 5.5;
+        urgent += 0.42 + Math.min(0.68, captured * 0.18);
+      }
     }
 
     // 2. Check resulting liberty state & Snapback (환격)
@@ -191,6 +206,7 @@ export function computeCandidateMovesAndPriors(params: {
 
     if (isSnapbackThrowIn) {
       score += isMaster ? 10.5 : 8.5;
+      urgent += isMaster ? 0.95 : 0.85;
     } else if (afterOwn.libertyCount === 1) {
       if (captured === 0 && afterOwn.stoneCount >= 2) {
         if (isNovice) score *= 0.45;
@@ -245,8 +261,10 @@ export function computeCandidateMovesAndPriors(params: {
               score += isMaster ? -0.8 : -0.5;
             } else if (isMaster) {
               score += 7.0 + beforeChain.stoneCount * 3.4;
+              urgent += 0.36 + Math.min(0.64, beforeChain.stoneCount * 0.16);
             } else {
               score += 5.8 + beforeChain.stoneCount * 2.8;
+              urgent += 0.32 + Math.min(0.58, beforeChain.stoneCount * 0.14);
             }
           }
         }
@@ -271,6 +289,7 @@ export function computeCandidateMovesAndPriors(params: {
               const ladderDepth = isMaster ? 26 : 22;
               if (allowLadder && isCapturedInLadder(sim, n, opp, 0, ladderDepth)) {
                 score += (isMaster ? 9.0 : 7.6) + oppAfter.stoneCount * (isMaster ? 3.5 : 3.0);
+                urgent += 0.35 + Math.min(0.45, oppAfter.stoneCount * 0.12);
               } else {
                 score += (isMaster ? 2.6 : 2.1) + oppAfter.stoneCount * (isMaster ? 0.9 : 0.75);
               }
@@ -290,6 +309,7 @@ export function computeCandidateMovesAndPriors(params: {
 
     if (allowAdvancedTactics && atariOppChains >= 2) {
       score += isMaster ? 14.0 : 11.5; // Double Atari (양단수)!
+      urgent += isMaster ? 1.0 : 0.90;
     }
 
     // Nakade vital point (치중) when surrounded by opponent stones inside eye space
@@ -464,6 +484,7 @@ export function computeCandidateMovesAndPriors(params: {
 
     moves[count] = idx;
     weights[count] = finalWeight;
+    urgentBuf[count] = urgent;
     count++;
   }
 
@@ -475,5 +496,11 @@ export function computeCandidateMovesAndPriors(params: {
     for (let i = 0; i < count; i++) priors[i] = weights[i] / sum;
   }
 
-  return { moves: moves.subarray(0, count), priors, count };
+  return {
+    moves: moves.subarray(0, count),
+    priors,
+    urgentScores: urgentBuf.subarray(0, count),
+    legalMask,
+    count,
+  };
 }

@@ -7,11 +7,13 @@
   "scripts": {
     "dev": "vite --port 5173",
     "build": "tsc --noEmit && vite build",
+    "build:admin": "tsc -p tsconfig.admin.json --noEmit && vite build --config vite.admin.config.ts",
     "preview": "vite preview --port 4173",
     "test": "vitest run",
     "electron:dev": "concurrently -k \"vite --port 5173\" \"wait-on tcp:5173 && electron . --dev-server\"",
     "electron:start": "npm run build && electron .",
-    "electron:pack": "npm run build && electron-builder --dir"
+    "electron:pack": "npm run build && electron-builder --dir",
+    "electron:pack:admin": "npm run build:admin && electron-builder --config electron-builder.admin.json --dir"
   },
   "build": {
     "appId": "com.antigravity.baduk3d",
@@ -23,7 +25,14 @@
     "files": [
       "dist/**/*",
       "electron/main.cjs",
-      "electron/preload.cjs"
+      "electron/preload.cjs",
+      "electron/katago-bridge.cjs"
+    ],
+    "extraResources": [
+      {
+        "from": "vendor/katago",
+        "to": "katago"
+      }
     ],
     "win": {
       "target": [

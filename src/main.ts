@@ -25,6 +25,7 @@ import { ClockSnapshot, GameClock } from './rules/clock';
 import { AcousticStoneAudioEngine } from './audio/AcousticStoneAudioEngine';
 import { CameraPreset, SceneManager } from './scene/SceneManager';
 import { AIController } from './ai/AIController';
+import type { AISearchRequest } from './ai/MctsEngine';
 import { UIManager } from './ui/UIManager';
 import {
   SettingsManager,
@@ -1104,6 +1105,29 @@ export class BadukApp {
     }
   }
 
+  private buildBadukHistoryContext(): Pick<AISearchRequest, 'moveHistory' | 'initialStones'> {
+    if (this.engine.config.gameType === 'omok') {
+      return {};
+    }
+    const moveHistory = this.engine.history.map((r) => ({
+      color: r.color,
+      coord: r.coord ? { ...r.coord } : null,
+    }));
+    const initialBoard =
+      this.engine.history.length > 0 ? this.engine.history[0].boardBefore : this.engine.board;
+    const initialStones: Array<{ color: PlayerColor; coord: Coord }> = [];
+    const size = this.engine.size;
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const stone = initialBoard[y * size + x];
+        if (stone === BLACK || stone === WHITE) {
+          initialStones.push({ color: stone, coord: { x, y } });
+        }
+      }
+    }
+    return { moveHistory, initialStones };
+  }
+
   private async maybeTriggerAITurn(): Promise<void> {
     if (this.engine.phase !== 'playing') return;
     if (this.engine.config.mode !== 'ai') return;
@@ -1116,6 +1140,7 @@ export class BadukApp {
     const lastRecord =
       this.engine.history.length > 0 ? this.engine.history[this.engine.history.length - 1] : null;
     const opponentPassed = lastRecord !== null && lastRecord.coord === null;
+    const historyCtx = this.buildBadukHistoryContext();
 
     const minVisualDelay = new Promise((r) => window.setTimeout(r, 340));
 
@@ -1138,6 +1163,7 @@ export class BadukApp {
         difficulty: this.engine.config.aiDifficulty,
         gameType: this.engine.config.gameType ?? 'baduk',
         omokRuleset: this.engine.config.omokRuleset ?? 'renju',
+        ...historyCtx,
       }),
       minVisualDelay,
     ]);
@@ -1194,6 +1220,7 @@ export class BadukApp {
     const lastRecord =
       this.engine.history.length > 0 ? this.engine.history[this.engine.history.length - 1] : null;
     const hintDifficulty = Math.max(4, this.engine.config.aiDifficulty) as AIDifficulty;
+    const historyCtx = this.buildBadukHistoryContext();
 
     const searchRes = await this.ai.requestMove({
       board: new Uint8Array(this.engine.board),
@@ -1214,6 +1241,7 @@ export class BadukApp {
       gameType: this.engine.config.gameType ?? 'baduk',
       omokRuleset: this.engine.config.omokRuleset ?? 'renju',
       includeHints: true,
+      ...historyCtx,
     });
 
     this.hintThinking = false;
