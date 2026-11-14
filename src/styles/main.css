@@ -1521,3 +1521,248 @@ textarea,
   }
 }
 
+/* =========================================================================
+   v3: Ultra Craftsmanship Theme, Web Presence, Spectator HUD & Isolated Chat
+   ========================================================================= */
+
+body[data-visual-quality='ultra'] .top-bar,
+body[data-visual-quality='ultra'] .bottom-dock,
+body[data-visual-quality='ultra'] .player-card,
+body[data-visual-quality='ultra'] .modal-card {
+  border-color: rgba(235, 194, 114, 0.34);
+  box-shadow:
+    0 12px 32px rgba(0, 0, 0, 0.56),
+    inset 0 1px 0 rgba(255, 232, 180, 0.14);
+}
+
+body[data-visual-quality='ultra'] .player-card.active-turn {
+  box-shadow:
+    0 0 22px rgba(230, 184, 92, 0.36),
+    inset 0 1px 0 rgba(255, 235, 186, 0.28);
+}
+
+/* Web-Only Live Concurrent Users Corner Badge */
+.web-live-users-badge {
+  position: fixed;
+  left: 14px;
+  bottom: 14px;
+  z-index: 35;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: rgba(16, 12, 9, 0.84);
+  border: 1px solid rgba(230, 184, 92, 0.34);
+  backdrop-filter: blur(10px);
+  color: #f3e8d5;
+  font-size: 12px;
+  font-weight: 500;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.42);
+  pointer-events: auto;
+}
+
+.web-live-users-badge strong {
+  color: #f3ca78;
+  font-weight: 700;
+}
+
+.presence-pulse-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #4ce38e;
+  box-shadow: 0 0 8px rgba(76, 227, 142, 0.85);
+  animation: pulsePresence 2s infinite ease-in-out;
+}
+
+.presence-detail {
+  color: rgba(243, 232, 213, 0.72);
+  font-size: 11px;
+}
+
+@keyframes pulsePresence {
+  0%, 100% { transform: scale(1); opacity: 0.95; }
+  50% { transform: scale(1.22); opacity: 0.65; }
+}
+
+/* Unified Room Filter & Badges (Public, Private, Waiting, Live In-Game) */
+.room-filter-bar {
+  margin: 8px 0 10px;
+}
+
+.room-badge.public {
+  background: rgba(88, 175, 240, 0.16);
+  color: #8fd2ff;
+  border: 1px solid rgba(88, 175, 240, 0.32);
+}
+
+.room-badge.private {
+  background: rgba(230, 166, 76, 0.18);
+  color: #f6ca78;
+  border: 1px solid rgba(230, 166, 76, 0.36);
+}
+
+.room-badge.waiting {
+  background: rgba(102, 212, 138, 0.16);
+  color: #83eba6;
+  border: 1px solid rgba(102, 212, 138, 0.3);
+}
+
+.room-badge.live {
+  background: rgba(235, 86, 86, 0.2);
+  color: #ff9898;
+  border: 1px solid rgba(235, 86, 86, 0.4);
+}
+
+.room-item-card.live-room {
+  border-color: rgba(235, 118, 86, 0.35);
+  background: rgba(34, 22, 18, 0.72);
+}
+
+.btn-spectate {
+  background: linear-gradient(135deg, #2d5e7a, #1d4158);
+  border-color: rgba(124, 200, 245, 0.45);
+  color: #ecf8ff;
+}
+
+.btn-spectate:hover {
+  background: linear-gradient(135deg, #367294, #24516e);
+}
+
+/* Private Room Password Modal */
+.pw-modal-desc {
+  font-size: 13px;
+  color: rgba(243, 232, 213, 0.85);
+  margin: 0 0 12px;
+  line-height: 1.5;
+}
+
+.pw-modal-error {
+  margin-top: 8px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgba(220, 72, 72, 0.18);
+  border: 1px solid rgba(220, 72, 72, 0.4);
+  color: #ffb2b2;
+  font-size: 12px;
+}
+
+/* Spectator Role Mode Locking */
+.spectator-mode #btn-pass,
+.spectator-mode #btn-undo,
+.spectator-mode #btn-resign,
+.spectator-mode #btn-ai-hint {
+  display: none !important;
+}
+
+.spectator-mode #btn-confirm-score,
+.spectator-mode #btn-resume-play {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+/* Role-Isolated Persistent Chat Popover */
+.chat-popover {
+  width: min(370px, calc(100vw - 24px));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-popover-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.chat-role-banner {
+  font-size: 11px;
+  font-weight: 600;
+  color: #f4cf83;
+}
+
+.chat-role-banner.spectator-banner {
+  color: #8dd6ff;
+}
+
+.chat-messages-list {
+  max-height: 185px;
+  min-height: 92px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  background: rgba(8, 6, 5, 0.56);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.chat-empty-hint {
+  margin: auto;
+  font-size: 12px;
+  color: rgba(243, 232, 213, 0.48);
+  text-align: center;
+}
+
+.chat-msg-item {
+  align-self: flex-start;
+  max-width: 88%;
+  padding: 5px 9px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.09);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.chat-msg-item.self {
+  align-self: flex-end;
+  background: rgba(212, 166, 76, 0.24);
+  border: 1px solid rgba(230, 184, 92, 0.32);
+}
+
+.chat-msg-sender {
+  font-size: 10px;
+  color: rgba(243, 232, 213, 0.72);
+  margin-bottom: 1px;
+}
+
+.chat-sender-tag {
+  color: #f3ca78;
+  font-weight: 700;
+}
+
+.chat-msg-text {
+  color: #f7efe2;
+  word-break: break-word;
+}
+
+.chat-unread-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  margin-left: 4px;
+  border-radius: 999px;
+  background: #e54d4d;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+@media (max-width: 768px) {
+  .web-live-users-badge {
+    left: 10px;
+    bottom: 66px;
+    padding: 4px 9px;
+    font-size: 11px;
+  }
+}
+
+

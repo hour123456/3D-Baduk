@@ -16,7 +16,9 @@ import {
   CreateRoomOptions,
   OnlineScoreAgreementState,
   OnlineSessionPhase,
+  OnlineSessionRole,
   OnlineTransportStatus,
+  PresenceStats,
   QuickMatchSizePref,
   RoomSummary,
 } from '../online/types';
@@ -26,6 +28,7 @@ import {
   PlacementInputMode,
   StoneMotionStyle,
   UserSettings,
+  VisualQuality,
 } from '../settings/SettingsManager';
 import { CameraPreset } from '../scene/SceneManager';
 
@@ -67,7 +70,8 @@ export interface UIActions {
   ) => void;
   onCancelOnlineWait: () => void;
   onCreateOnlineRoom: (options: CreateRoomOptions) => void;
-  onJoinOnlineRoom: (roomCode: string) => void;
+  onJoinOnlineRoom: (roomCode: string, password?: string) => void;
+  onSpectateOnlineRoom: (roomCode: string, password?: string) => void;
   onGetInviteUrl: () => string;
   onLeaveOnlineMatch: () => void;
   onSendOnlineChat: (text: string) => void;
@@ -104,6 +108,14 @@ const QUICK_EMOTES: string[] = [
   '잠시 장고하겠습니다.',
   '아차, 실수했네요!',
   '수고하셨습니다. 좋은 대국이었습니다!',
+];
+
+const SPECTATOR_QUICK_EMOTES: string[] = [
+  '명국 기대됩니다!',
+  '좋은 수네요!',
+  '형세가 팽팽합니다.',
+  '멋진 맥점입니다!',
+  '긴장감 넘치네요!',
 ];
 
 export function parseTimePreset(preset: string): {
@@ -167,6 +179,16 @@ export class UIManager {
   private roomKomi = 6.5;
   private roomTimePreset = '10m_30s';
   private roomHostColor: 'black' | 'white' | 'random' = 'random';
+  private roomFilter: 'all' | 'waiting' | 'in_game' = 'all';
+  private cachedOpenRooms: RoomSummary[] = [];
+
+  private onlineSessionRole: OnlineSessionRole = 'none';
+  private currentOnlineRoomCode = '';
+  private currentOnlineMyColor?: PlayerColor;
+  private currentOnlinePingMs?: number;
+  private currentSpectatorCount = 0;
+  private chatUnreadCount = 0;
+  private pendingPasswordPrompt: { action: 'join' | 'spectate'; roomCode: string } | null = null;
 
   private qmElapsedTimer: number | null = null;
   private qmStartTs = 0;
@@ -218,6 +240,10 @@ export class UIManager {
   private chatPopoverEl!: HTMLElement;
   private chatToggleBtn!: HTMLButtonElement;
   private chatInputEl!: HTMLInputElement;
+  private chatRoleBannerEl!: HTMLElement;
+  private chatMessagesListEl!: HTMLElement;
+  private chatUnreadBadgeEl!: HTMLElement;
+  private quickEmotesGridEl!: HTMLElement;
 
   private passBtn!: HTMLButtonElement;
   private undoBtn!: HTMLButtonElement;
@@ -227,12 +253,22 @@ export class UIManager {
   private moveNumBtn!: HTMLButtonElement;
   private coordsBtn!: HTMLButtonElement;
   private showResultBtn!: HTMLButtonElement;
+  private resumeScoreBtn!: HTMLButtonElement;
   private camPresetBtns: HTMLButtonElement[] = [];
 
   private setupModalEl!: HTMLElement;
   private setupNickInputEl!: HTMLInputElement;
   private nickModalEl!: HTMLElement;
   private nickModalInputEl!: HTMLInputElement;
+  private passwordModalEl!: HTMLElement;
+  private passwordModalTitleEl!: HTMLElement;
+  private passwordModalDescEl!: HTMLElement;
+  private passwordModalErrorEl!: HTMLElement;
+  private passwordModalInputEl!: HTMLInputElement;
+
+  private webPresenceBadgeEl!: HTMLElement;
+  private webPresenceCountEl!: HTMLElement;
+  private webPresenceDetailEl!: HTMLElement;
 
   private onlineStatusDotEl!: HTMLElement;
   private onlineStatusTextEl!: HTMLElement;
@@ -240,6 +276,8 @@ export class UIManager {
   private qmSearchingBoxEl!: HTMLElement;
   private qmTimerTextEl!: HTMLElement;
   private createFormBoxEl!: HTMLElement;
+  private roomPasswordWrapEl!: HTMLElement;
+  private roomPasswordInputEl!: HTMLInputElement;
   private waitingRoomBoxEl!: HTMLElement;
   private waitingRoomCodeEl!: HTMLElement;
   private waitingRoomMetaEl!: HTMLElement;
@@ -268,11 +306,19 @@ export class UIManager {
   }
 
   private buildDOM(): void {
+    const isElectronApp = typeof window !== 'undefined' && Boolean(window.electronAPI?.isElectron);
     const emoteButtonsHtml = QUICK_EMOTES.map(
       (txt) => `<button class="emote-chip" data-emote="${escapeHtml(txt)}">${escapeHtml(txt)}</button>`
     ).join('');
 
     this.root.innerHTML = `
+      <!-- Web-Only Live Concurrent User Presence Badge -->
+      <div class="web-live-users-badge interactive${isElectronApp ? ' hidden' : ''}" id="web-live-users-badge" title="웹 실시간 접속자 수">
+        <span class="presence-pulse-dot"></span>
+        <span class="presence-main">실시간 접속 <strong id="web-presence-count">1</strong>명</span>
+        <span class="presence-detail hidden" id="web-presence-detail"></span>
+      </div>
+
       <!-- Top Header -->
       <div>
         <div class="top-bar">
@@ -373,14 +419,21 @@ export class UIManager {
 
       <!-- Bottom Chat Popover, Review Scrubber & Control Dock -->
       <div class="bottom-area">
-        <div class="chat-popover hidden" id="chat-popover">
-          <div class="quick-emotes-grid">${emoteButtonsHtml}</div>
+        <div class="chat-popover interactive hidden" id="chat-popover">
+          <div class="chat-popover-header">
+            <span class="chat-role-banner" id="chat-role-banner">🔒 대국자 전용 채팅 (관전자 비공개)</span>
+            <button class="btn btn-sm" id="btn-close-chat">닫기</button>
+          </div>
+          <div class="chat-messages-list" id="chat-messages-list">
+            <div class="chat-empty-hint">대화 내용이 여기에 표시됩니다.</div>
+          </div>
+          <div class="quick-emotes-grid" id="quick-emotes-grid">${emoteButtonsHtml}</div>
           <div class="chat-input-row">
             <input
               type="text"
               class="text-input"
               id="inp-online-chat"
-              maxlength="60"
+              maxlength="120"
               placeholder="수담 메시지 입력 (Enter 전송)"
             />
             <button class="btn btn-gold" id="btn-send-chat">전송</button>
@@ -422,7 +475,10 @@ export class UIManager {
           <button class="btn" id="btn-undo">무르기</button>
           <button class="btn btn-danger" id="btn-resign">기권</button>
           <div class="divider-v"></div>
-          <button class="btn hidden" id="btn-chat-toggle">수담 인사·채팅</button>
+          <button class="btn hidden" id="btn-chat-toggle">
+            <span id="chat-toggle-label">수담 인사·채팅</span>
+            <span class="chat-unread-badge hidden" id="chat-unread-badge">0</span>
+          </button>
           <button class="btn btn-ai-hint" id="btn-ai-hint" title="AI가 분석한 최선 추천수 Top 3 보기">AI 추천수</button>
           <button class="btn" id="btn-territory-hint">형세·집 보기</button>
           <button class="btn" id="btn-move-nums">수순 번호</button>
@@ -651,9 +707,20 @@ export class UIManager {
                     <span class="form-label">공개 설정</span>
                     <div class="seg-group" id="seg-room-vis">
                       <button class="seg-btn selected" data-val="public">공개방</button>
-                      <button class="seg-btn" data-val="private">비공개 코드방</button>
+                      <button class="seg-btn" data-val="private">비공개 비밀번호방</button>
                     </div>
                   </div>
+                </div>
+
+                <div class="form-section hidden" id="room-password-wrap">
+                  <label class="form-label" for="inp-room-password">비공개방 비밀번호 (방 목록에는 표시되지만 비밀번호 입력 시에만 입장/관전 가능)</label>
+                  <input
+                    type="password"
+                    class="text-input"
+                    id="inp-room-password"
+                    maxlength="24"
+                    placeholder="대국 입장 및 관전용 비밀번호를 입력하세요"
+                  />
                 </div>
 
                 <div class="form-section">
@@ -769,15 +836,46 @@ export class UIManager {
               </div>
 
               <div class="open-rooms-header">
-                <span class="form-label" style="margin-bottom: 0;">실시간 공개 대기방 목록</span>
+                <span class="form-label" style="margin-bottom: 0;">실시간 대국방 목록 (공개 · 비공개 · 실시간 관전)</span>
                 <button class="btn btn-sm" id="btn-refresh-rooms">목록 새로고침</button>
+              </div>
+              <div class="seg-group room-filter-bar" id="seg-room-filter">
+                <button class="seg-btn selected" data-val="all">전체 보기</button>
+                <button class="seg-btn" data-val="waiting">대기 중</button>
+                <button class="seg-btn" data-val="in_game">대국 중 (관전 가능)</button>
               </div>
               <div class="open-rooms-list" id="open-rooms-list">
                 <div class="empty-rooms-msg">
-                  현재 대기 중인 공개방이 없습니다. 직접 방을 만들거나 빠른 매칭을 시작해 보세요!
+                  현재 열린 대국방이 없습니다. 직접 방을 만들거나 빠른 매칭을 시작해 보세요!
                 </div>
               </div>
             </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Private Room Password Prompt Modal -->
+      <div class="modal-backdrop hidden" id="modal-room-password">
+        <div class="modal-card modal-compact">
+          <div class="modal-header">
+            <h2 id="pw-modal-title">비공개 대국실 입장</h2>
+            <button class="btn btn-sm" id="btn-close-room-pw">닫기</button>
+          </div>
+          <p class="pw-modal-desc" id="pw-modal-desc">이 대국실은 비밀번호로 보호되어 있습니다.</p>
+          <div class="form-section">
+            <label class="form-label" for="inp-modal-room-password">비밀번호 입력</label>
+            <input
+              type="password"
+              class="text-input"
+              id="inp-modal-room-password"
+              maxlength="24"
+              placeholder="비밀번호를 입력하세요"
+            />
+            <div class="pw-modal-error hidden" id="pw-modal-error"></div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn" id="btn-cancel-room-pw">취소</button>
+            <button class="btn btn-gold" id="btn-submit-room-pw">확인</button>
           </div>
         </div>
       </div>
@@ -832,6 +930,31 @@ export class UIManager {
           <div class="modal-header">
             <h2>대국 환경 · 모션 · 시점 옵션</h2>
             <button class="btn btn-sm" id="btn-close-options">닫기</button>
+          </div>
+
+          <div class="options-section">
+            <div class="options-section-title">그래픽 마감 및 퀄리티 (Visual Quality &amp; Finish)</div>
+            <div class="seg-group" id="seg-opt-quality">
+              <button class="seg-btn" data-val="ultra">극상 장인 마감 (Ultra)</button>
+              <button class="seg-btn" data-val="high">고급 마감 (High)</button>
+              <button class="seg-btn" data-val="standard">표준 성능 (Standard)</button>
+            </div>
+            <div class="toggle-list" style="margin-top: 8px;">
+              <label class="toggle-row">
+                <div class="toggle-row-text">
+                  <span class="toggle-row-title">HDR 블룸 및 부드러운 안티에일리어싱 (Bloom · SMAA)</span>
+                  <span class="toggle-row-desc">따뜻한 호롱불 잔광과 바둑돌·황동 장식의 고급 광택 및 계단 현상 억제를 적용합니다.</span>
+                </div>
+                <input type="checkbox" id="opt-bloom" />
+              </label>
+              <label class="toggle-row">
+                <div class="toggle-row-text">
+                  <span class="toggle-row-title">화려한 전통 나전칠기 · 비단 방석 · 한옥 등불 마감</span>
+                  <span class="toggle-row-desc">반상 옆 다탁의 자개 문양, 청홍 비단 방석, 황동 장식과 공기 중 부유 먼지를 표현합니다.</span>
+                </div>
+                <input type="checkbox" id="opt-ornate-finish" />
+              </label>
+            </div>
           </div>
 
           <div class="options-section">
@@ -970,6 +1093,7 @@ export class UIManager {
     this.scoringBannerEl = this.root.querySelector('#scoring-banner')!;
     this.scoringTallyEl = this.root.querySelector('#scoring-live-tally')!;
     this.confirmScoreBtn = this.root.querySelector('#btn-confirm-score') as HTMLButtonElement;
+    this.resumeScoreBtn = this.root.querySelector('#btn-resume-play') as HTMLButtonElement;
     this.scoringDescEl = this.root.querySelector('#scoring-desc-text')!;
 
     this.onlinePromptBannerEl = this.root.querySelector('#online-prompt-banner')!;
@@ -987,6 +1111,10 @@ export class UIManager {
     this.chatPopoverEl = this.root.querySelector('#chat-popover')!;
     this.chatToggleBtn = this.root.querySelector('#btn-chat-toggle') as HTMLButtonElement;
     this.chatInputEl = this.root.querySelector('#inp-online-chat') as HTMLInputElement;
+    this.chatRoleBannerEl = this.root.querySelector('#chat-role-banner')!;
+    this.chatMessagesListEl = this.root.querySelector('#chat-messages-list')!;
+    this.chatUnreadBadgeEl = this.root.querySelector('#chat-unread-badge')!;
+    this.quickEmotesGridEl = this.root.querySelector('#quick-emotes-grid')!;
 
     this.passBtn = this.root.querySelector('#btn-pass') as HTMLButtonElement;
     this.undoBtn = this.root.querySelector('#btn-undo') as HTMLButtonElement;
@@ -1001,6 +1129,15 @@ export class UIManager {
     this.setupNickInputEl = this.root.querySelector('#inp-setup-nick') as HTMLInputElement;
     this.nickModalEl = this.root.querySelector('#modal-nickname')!;
     this.nickModalInputEl = this.root.querySelector('#inp-modal-nick') as HTMLInputElement;
+    this.passwordModalEl = this.root.querySelector('#modal-room-password')!;
+    this.passwordModalTitleEl = this.root.querySelector('#pw-modal-title')!;
+    this.passwordModalDescEl = this.root.querySelector('#pw-modal-desc')!;
+    this.passwordModalErrorEl = this.root.querySelector('#pw-modal-error')!;
+    this.passwordModalInputEl = this.root.querySelector('#inp-modal-room-password') as HTMLInputElement;
+
+    this.webPresenceBadgeEl = this.root.querySelector('#web-live-users-badge')!;
+    this.webPresenceCountEl = this.root.querySelector('#web-presence-count')!;
+    this.webPresenceDetailEl = this.root.querySelector('#web-presence-detail')!;
 
     this.onlineStatusDotEl = this.root.querySelector('#online-status-dot')!;
     this.onlineStatusTextEl = this.root.querySelector('#online-status-text')!;
@@ -1008,6 +1145,8 @@ export class UIManager {
     this.qmSearchingBoxEl = this.root.querySelector('#qm-searching-box')!;
     this.qmTimerTextEl = this.root.querySelector('#qm-timer-text')!;
     this.createFormBoxEl = this.root.querySelector('#create-form-box')!;
+    this.roomPasswordWrapEl = this.root.querySelector('#room-password-wrap')!;
+    this.roomPasswordInputEl = this.root.querySelector('#inp-room-password') as HTMLInputElement;
     this.waitingRoomBoxEl = this.root.querySelector('#waiting-room-box')!;
     this.waitingRoomCodeEl = this.root.querySelector('#waiting-room-code')!;
     this.waitingRoomMetaEl = this.root.querySelector('#waiting-room-meta')!;
@@ -1096,29 +1235,34 @@ export class UIManager {
     this.undoBtn.addEventListener('click', () => this.actions.onUndo());
     this.resignBtn.addEventListener('click', () => this.actions.onResign());
 
-    // Online Chat / Emotes
+    // Online Chat / Emotes (Role-isolated persistent panel)
     this.chatToggleBtn.addEventListener('click', () => {
       const hidden = this.chatPopoverEl.classList.toggle('hidden');
       this.chatToggleBtn.classList.toggle('btn-active', !hidden);
-      if (!hidden) this.chatInputEl.focus();
+      if (!hidden) {
+        this.chatUnreadCount = 0;
+        this.syncChatUnreadBadge();
+        this.chatInputEl.focus();
+      }
     });
-    this.root.querySelectorAll<HTMLButtonElement>('[data-emote]').forEach((chip) => {
-      chip.addEventListener('click', () => {
-        const text = chip.dataset.emote || '';
-        if (text) {
-          this.actions.onSendOnlineChat(text);
-          this.chatPopoverEl.classList.add('hidden');
-          this.chatToggleBtn.classList.remove('btn-active');
-        }
-      });
+    this.root.querySelector('#btn-close-chat')!.addEventListener('click', () => {
+      this.chatPopoverEl.classList.add('hidden');
+      this.chatToggleBtn.classList.remove('btn-active');
+    });
+    this.quickEmotesGridEl.addEventListener('click', (e) => {
+      const chip = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-emote]');
+      if (!chip) return;
+      const text = chip.dataset.emote || '';
+      if (text) {
+        this.actions.onSendOnlineChat(text);
+      }
     });
     const sendChatInput = () => {
       const val = this.chatInputEl.value.trim();
       if (!val) return;
       this.actions.onSendOnlineChat(val);
       this.chatInputEl.value = '';
-      this.chatPopoverEl.classList.add('hidden');
-      this.chatToggleBtn.classList.remove('btn-active');
+      this.chatInputEl.focus();
     };
     this.root.querySelector('#btn-send-chat')!.addEventListener('click', sendChatInput);
     this.chatInputEl.addEventListener('keydown', (e) => {
@@ -1328,6 +1472,10 @@ export class UIManager {
     // Online Create Room controls
     this.bindSegmented('#seg-room-vis', (val) => {
       this.roomVis = val as 'public' | 'private';
+      this.roomPasswordWrapEl.classList.toggle('hidden', this.roomVis !== 'private');
+      if (this.roomVis === 'private') {
+        this.roomPasswordInputEl.focus();
+      }
     });
 
     const syncRoomGameTypeUI = () => {
@@ -1394,10 +1542,17 @@ export class UIManager {
     this.root.querySelector('#btn-create-room')!.addEventListener('click', () => {
       this.syncSetupNicknameSilently();
       const titleInput = this.root.querySelector('#inp-room-title') as HTMLInputElement;
+      const password = this.roomPasswordInputEl.value.trim();
+      if (this.roomVis === 'private' && !password) {
+        this.showToast('비공개 대국실 비밀번호를 입력해 주세요.', true);
+        this.roomPasswordInputEl.focus();
+        return;
+      }
       const t = parseTimePreset(this.roomTimePreset);
       this.actions.onCreateOnlineRoom({
         title: titleInput.value.trim(),
         isPublic: this.roomVis === 'public',
+        password: this.roomVis === 'private' ? password : undefined,
         boardSize: this.roomSize,
         ruleset: this.roomRuleset,
         gameType: this.roomGameType,
@@ -1441,6 +1596,36 @@ export class UIManager {
     this.root.querySelector('#btn-refresh-rooms')!.addEventListener('click', () => {
       this.actions.onRefreshOpenRooms();
     });
+    this.bindSegmented('#seg-room-filter', (val) => {
+      this.roomFilter = val as 'all' | 'waiting' | 'in_game';
+      this.renderOpenRooms(this.cachedOpenRooms);
+    });
+
+    // Private Room Password Modal controls
+    this.root.querySelector('#btn-close-room-pw')!.addEventListener('click', () => this.closeRoomPasswordModal());
+    this.root.querySelector('#btn-cancel-room-pw')!.addEventListener('click', () => this.closeRoomPasswordModal());
+    const submitRoomPw = () => {
+      if (!this.pendingPasswordPrompt) return;
+      const pw = this.passwordModalInputEl.value.trim();
+      if (!pw) {
+        this.passwordModalErrorEl.textContent = '비밀번호를 입력해 주세요.';
+        this.passwordModalErrorEl.classList.remove('hidden');
+        this.passwordModalInputEl.focus();
+        return;
+      }
+      const { action, roomCode } = this.pendingPasswordPrompt;
+      this.closeRoomPasswordModal();
+      this.syncSetupNicknameSilently();
+      if (action === 'spectate') {
+        this.actions.onSpectateOnlineRoom(roomCode, pw);
+      } else {
+        this.actions.onJoinOnlineRoom(roomCode, pw);
+      }
+    };
+    this.root.querySelector('#btn-submit-room-pw')!.addEventListener('click', submitRoomPw);
+    this.passwordModalInputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submitRoomPw();
+    });
 
     // Result modal buttons
     this.root.querySelector('#btn-close-result')!.addEventListener('click', () => {
@@ -1470,6 +1655,16 @@ export class UIManager {
       this.showToast('옵션이 기본값으로 복원되었습니다.');
     });
 
+    this.bindSegmented('#seg-opt-quality', (val) => {
+      const q = val as VisualQuality;
+      const presetDefaults =
+        q === 'standard'
+          ? { bloomEnabled: false, ornateFinishEnabled: false }
+          : { bloomEnabled: true, ornateFinishEnabled: true };
+      this.syncOptionsDOM(
+        this.actions.onUpdateSettings({ visualQuality: q, ...presetDefaults })
+      );
+    });
     this.bindSegmented('#seg-opt-motion', (val) => {
       this.syncOptionsDOM(this.actions.onUpdateSettings({ stoneMotionStyle: val as StoneMotionStyle }));
     });
@@ -1489,6 +1684,8 @@ export class UIManager {
         this.syncOptionsDOM(this.actions.onUpdateSettings({ [key]: el.checked } as Partial<UserSettings>));
       });
     };
+    bindCheckbox('#opt-bloom', 'bloomEnabled');
+    bindCheckbox('#opt-ornate-finish', 'ornateFinishEnabled');
     bindCheckbox('#opt-true-vertical', 'trueVerticalView');
     bindCheckbox('#opt-auto-mobile-vertical', 'autoMobileVerticalView');
     bindCheckbox('#opt-lock-vertical-rot', 'lockVerticalRotation');
@@ -1675,22 +1872,83 @@ export class UIManager {
     }
   }
 
+  public updateLivePresence(stats: PresenceStats): void {
+    if (!this.webPresenceBadgeEl) return;
+    this.webPresenceCountEl.textContent = String(Math.max(1, stats.onlineUsers));
+    const parts: string[] = [];
+    if (stats.inGameUsers > 0) parts.push(`대국 ${stats.inGameUsers}`);
+    if (stats.spectatingUsers > 0) parts.push(`관전 ${stats.spectatingUsers}`);
+    if (parts.length > 0) {
+      this.webPresenceDetailEl.textContent = `(${parts.join(' · ')})`;
+      this.webPresenceDetailEl.classList.remove('hidden');
+    } else {
+      this.webPresenceDetailEl.classList.add('hidden');
+    }
+  }
+
+  public promptRoomPassword(
+    action: 'join' | 'spectate',
+    roomCode: string,
+    title?: string,
+    errorMsg?: string
+  ): void {
+    this.pendingPasswordPrompt = { action, roomCode };
+    const actionTxt = action === 'spectate' ? '실시간 관전' : '대국 입장';
+    this.passwordModalTitleEl.textContent = `비공개방 ${actionTxt}`;
+    this.passwordModalDescEl.textContent = title
+      ? `'${title}' [${roomCode}] 방의 비밀번호를 입력해 주세요.`
+      : `대국방 [${roomCode}]의 비밀번호를 입력해 주세요.`;
+    this.passwordModalInputEl.value = '';
+    if (errorMsg) {
+      this.passwordModalErrorEl.textContent = errorMsg;
+      this.passwordModalErrorEl.classList.remove('hidden');
+    } else {
+      this.passwordModalErrorEl.classList.add('hidden');
+      this.passwordModalErrorEl.textContent = '';
+    }
+    this.passwordModalEl.classList.remove('hidden');
+    window.setTimeout(() => this.passwordModalInputEl.focus(), 40);
+  }
+
+  public closeRoomPasswordModal(): void {
+    this.pendingPasswordPrompt = null;
+    this.passwordModalEl.classList.add('hidden');
+    this.passwordModalErrorEl.classList.add('hidden');
+  }
+
   public renderOpenRooms(rooms: RoomSummary[]): void {
-    if (rooms.length === 0) {
-      this.openRoomsListEl.innerHTML = `
-        <div class="empty-rooms-msg">
-          현재 대기 중인 공개방이 없습니다. 직접 방을 만들거나 빠른 매칭을 시작해 보세요!
-        </div>
-      `;
+    this.cachedOpenRooms = rooms;
+    const filtered = rooms.filter((r) => {
+      if (this.roomFilter === 'waiting') return r.status !== 'in_game';
+      if (this.roomFilter === 'in_game') return r.status === 'in_game';
+      return true;
+    });
+
+    if (filtered.length === 0) {
+      const emptyTxt =
+        this.roomFilter === 'in_game'
+          ? '현재 관전 가능한 진행 중 대국이 없습니다. (대국이 시작되면 목록에 실시간 표시됩니다!)'
+          : this.roomFilter === 'waiting'
+            ? '현재 대기 중인 대국방이 없습니다. 직접 방을 만들거나 빠른 매칭을 시작해 보세요!'
+            : '현재 열린 대국방이 없습니다. 직접 방을 만들거나 빠른 매칭을 시작해 보세요!';
+      this.openRoomsListEl.innerHTML = `<div class="empty-rooms-msg">${emptyTxt}</div>`;
       return;
     }
 
-    this.openRoomsListEl.innerHTML = rooms
+    this.openRoomsListEl.innerHTML = filtered
       .map((r) => {
+        const isPrivate = r.hasPassword || !r.isPublic;
+        const isLive = r.status === 'in_game';
         const isOmok = r.gameType === 'omok';
         const gameBadge = isOmok
           ? `<span class="room-badge omok">오목</span>`
           : `<span class="room-badge">바둑</span>`;
+        const visBadge = isPrivate
+          ? `<span class="room-badge private">🔒 비공개</span>`
+          : `<span class="room-badge public">공개</span>`;
+        const statusBadge = isLive
+          ? `<span class="room-badge live">● 대국 중</span>`
+          : `<span class="room-badge waiting">대기 중</span>`;
         const ruleTxt = isOmok
           ? (r.omokRuleset ?? 'renju') === 'renju'
             ? '렌주룰'
@@ -1705,15 +1963,31 @@ export class UIManager {
             : r.byoyomiPeriods > 0
               ? `초읽기 ${r.byoyomiSeconds}초`
               : '무제한';
+        const subLine = isLive
+          ? `흑 <strong>${escapeHtml(r.blackName || r.hostName)}</strong> vs 백 <strong>${escapeHtml(
+              r.whiteName || '대국자'
+            )}</strong> · ${r.boardSize}줄 · ${r.moveCount ?? 0}수 진행 · 👁 ${r.spectatorCount ?? 0}명 · [${escapeHtml(
+              r.roomCode
+            )}]`
+          : `방장: <strong>${escapeHtml(r.hostName)}</strong> · ${r.boardSize}줄 · ${ruleTxt}${hcTxt} · ${timeTxt} · [${escapeHtml(
+              r.roomCode
+            )}]`;
+
+        const actionBtn = isLive
+          ? `<button class="btn btn-sm btn-spectate" data-spectate-room="${escapeHtml(r.roomCode)}" data-private="${
+              isPrivate ? '1' : '0'
+            }" data-title="${escapeHtml(r.title)}">${isPrivate ? '🔒 ' : '👁 '}실시간 관전</button>`
+          : `<button class="btn btn-sm btn-gold" data-join-room="${escapeHtml(r.roomCode)}" data-private="${
+              isPrivate ? '1' : '0'
+            }" data-title="${escapeHtml(r.title)}">${isPrivate ? '🔒 ' : ''}입장하기</button>`;
+
         return `
-          <div class="room-item-card">
-            <div>
-              <div class="room-item-title">${gameBadge} ${escapeHtml(r.title)}</div>
-              <div class="room-item-sub">
-                방장: <strong>${escapeHtml(r.hostName)}</strong> · ${r.boardSize}줄 · ${ruleTxt}${hcTxt} · ${timeTxt} · 코드 [${escapeHtml(r.roomCode)}]
-              </div>
+          <div class="room-item-card${isLive ? ' live-room' : ''}">
+            <div style="min-width: 0;">
+              <div class="room-item-title">${gameBadge}${visBadge}${statusBadge} ${escapeHtml(r.title)}</div>
+              <div class="room-item-sub">${subLine}</div>
             </div>
-            <button class="btn btn-sm btn-gold" data-join-room="${escapeHtml(r.roomCode)}">입장하기</button>
+            ${actionBtn}
           </div>
         `;
       })
@@ -1722,31 +1996,146 @@ export class UIManager {
     this.openRoomsListEl.querySelectorAll<HTMLButtonElement>('[data-join-room]').forEach((btn) => {
       btn.addEventListener('click', () => {
         const code = btn.dataset.joinRoom;
-        if (code) {
-          this.syncSetupNicknameSilently();
-          this.actions.onJoinOnlineRoom(code);
+        if (!code) return;
+        if (btn.dataset.private === '1') {
+          this.promptRoomPassword('join', code, btn.dataset.title);
+          return;
         }
+        this.syncSetupNicknameSilently();
+        this.actions.onJoinOnlineRoom(code);
+      });
+    });
+
+    this.openRoomsListEl.querySelectorAll<HTMLButtonElement>('[data-spectate-room]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const code = btn.dataset.spectateRoom;
+        if (!code) return;
+        if (btn.dataset.private === '1') {
+          this.promptRoomPassword('spectate', code, btn.dataset.title);
+          return;
+        }
+        this.syncSetupNicknameSilently();
+        this.actions.onSpectateOnlineRoom(code);
       });
     });
   }
 
-  public setOnlineInGameHUD(active: boolean, roomCode?: string, myColor?: PlayerColor): void {
+  private refreshOnlineHudLabel(): void {
+    if (!this.currentOnlineRoomCode) return;
+    if (this.onlineSessionRole === 'spectator') {
+      this.onlineHudTextEl.textContent = `👁 실시간 관전 (${this.currentOnlineRoomCode}) · 관전자 ${this.currentSpectatorCount}명`;
+      return;
+    }
+    const stoneTxt = this.currentOnlineMyColor === BLACK ? '흑번' : this.currentOnlineMyColor === WHITE ? '백번' : '';
+    const pingPart = typeof this.currentOnlinePingMs === 'number' ? ` · ${this.currentOnlinePingMs}ms` : '';
+    const specPart = this.currentSpectatorCount > 0 ? ` · 👁 ${this.currentSpectatorCount}명` : '';
+    this.onlineHudTextEl.textContent = `방 ${this.currentOnlineRoomCode}${stoneTxt ? ` (${stoneTxt})` : ''}${pingPart}${specPart}`;
+  }
+
+  public setOnlineInGameHUD(
+    active: boolean,
+    roomCode?: string,
+    myColor?: PlayerColor,
+    sessionRole: OnlineSessionRole = 'player',
+    spectatorCount = 0
+  ): void {
+    this.onlineSessionRole = active ? sessionRole : 'none';
+    this.currentOnlineRoomCode = active && roomCode ? roomCode : '';
+    this.currentOnlineMyColor = myColor;
+    this.currentOnlinePingMs = undefined;
+    this.currentSpectatorCount = spectatorCount;
+
+    const isSpectator = active && sessionRole === 'spectator';
+    this.root.classList.toggle('spectator-mode', isSpectator);
     this.onlineHudPillEl.classList.toggle('hidden', !active);
     this.leaveOnlineBtn.classList.toggle('hidden', !active);
     this.chatToggleBtn.classList.toggle('hidden', !active);
+    this.leaveOnlineBtn.textContent = isSpectator ? '관전 종료' : '방 나가기';
+
+    const toggleLabel = this.chatToggleBtn.querySelector('#chat-toggle-label');
+    if (toggleLabel) {
+      toggleLabel.textContent = isSpectator ? '관전자 채팅' : '대국자 채팅';
+    }
+
+    this.chatRoleBannerEl.textContent = isSpectator
+      ? '👁 관전자 중계 채팅 (경기 당사자에게는 보이지 않습니다)'
+      : '🔒 대국자 전용 채팅 (관전자에게는 보이지 않습니다)';
+    this.chatRoleBannerEl.classList.toggle('spectator-banner', isSpectator);
+
+    const chips = isSpectator ? SPECTATOR_QUICK_EMOTES : QUICK_EMOTES;
+    this.quickEmotesGridEl.innerHTML = chips
+      .map((txt) => `<button class="emote-chip" data-emote="${escapeHtml(txt)}">${escapeHtml(txt)}</button>`)
+      .join('');
+
     if (!active) {
       this.chatPopoverEl.classList.add('hidden');
       this.chatToggleBtn.classList.remove('btn-active');
+      this.clearChatHistory();
       this.hideOnlinePrompt();
-    } else if (roomCode) {
-      const stoneTxt = myColor === BLACK ? '내 돌: 흑' : myColor === WHITE ? '내 돌: 백' : '';
-      this.onlineHudTextEl.textContent = `방 ${roomCode}${stoneTxt ? ` · ${stoneTxt}` : ''}`;
+    } else {
+      this.clearChatHistory();
+      this.refreshOnlineHudLabel();
     }
   }
 
+  public updateSpectatorCount(count: number): void {
+    this.currentSpectatorCount = Math.max(0, count);
+    this.refreshOnlineHudLabel();
+  }
+
   public updateOnlinePing(roomCode: string, myColor: PlayerColor, pingMs: number): void {
-    const stoneTxt = myColor === BLACK ? '흑번' : '백번';
-    this.onlineHudTextEl.textContent = `방 ${roomCode} (${stoneTxt}) · ${pingMs}ms`;
+    this.currentOnlineRoomCode = roomCode;
+    this.currentOnlineMyColor = myColor;
+    this.currentOnlinePingMs = pingMs;
+    this.refreshOnlineHudLabel();
+  }
+
+  public clearChatHistory(): void {
+    this.chatUnreadCount = 0;
+    this.syncChatUnreadBadge();
+    this.chatMessagesListEl.innerHTML =
+      '<div class="chat-empty-hint">대화 내용이 여기에 표시됩니다.</div>';
+  }
+
+  private syncChatUnreadBadge(): void {
+    if (!this.chatUnreadBadgeEl) return;
+    if (this.chatUnreadCount <= 0) {
+      this.chatUnreadBadgeEl.classList.add('hidden');
+      this.chatUnreadBadgeEl.textContent = '0';
+    } else {
+      this.chatUnreadBadgeEl.textContent = this.chatUnreadCount > 99 ? '99+' : String(this.chatUnreadCount);
+      this.chatUnreadBadgeEl.classList.remove('hidden');
+    }
+  }
+
+  public appendChatMessage(params: {
+    channel: 'player' | 'spectator';
+    senderName: string;
+    text: string;
+    isSelf: boolean;
+    colorLabel?: string;
+  }): void {
+    if (
+      (params.channel === 'player' && this.onlineSessionRole !== 'player') ||
+      (params.channel === 'spectator' && this.onlineSessionRole !== 'spectator')
+    ) {
+      return;
+    }
+
+    const emptyHint = this.chatMessagesListEl.querySelector('.chat-empty-hint');
+    if (emptyHint) emptyHint.remove();
+
+    const row = document.createElement('div');
+    row.className = `chat-msg-item${params.isSelf ? ' self' : ''}`;
+    const tag = params.colorLabel ? `<span class="chat-sender-tag">[${escapeHtml(params.colorLabel)}]</span> ` : '';
+    row.innerHTML = `<div class="chat-msg-sender">${tag}${escapeHtml(params.senderName)}</div><div class="chat-msg-text">${escapeHtml(params.text)}</div>`;
+    this.chatMessagesListEl.appendChild(row);
+    this.chatMessagesListEl.scrollTop = this.chatMessagesListEl.scrollHeight;
+
+    if (!params.isSelf && this.chatPopoverEl.classList.contains('hidden')) {
+      this.chatUnreadCount++;
+      this.syncChatUnreadBadge();
+    }
   }
 
   public showChatBubble(color: PlayerColor, senderName: string, text: string): void {
@@ -1780,8 +2169,18 @@ export class UIManager {
     myColor: PlayerColor | null,
     state: OnlineScoreAgreementState | null
   ): void {
+    if (this.onlineSessionRole === 'spectator' && state) {
+      const count = (state.blackAgreed ? 1 : 0) + (state.whiteAgreed ? 1 : 0);
+      this.confirmScoreBtn.disabled = true;
+      this.resumeScoreBtn.disabled = true;
+      this.confirmScoreBtn.textContent = `양측 계가 합의 대기 (${count}/2)`;
+      this.scoringDescEl.textContent = '관전 모드: 양측 대국자가 사석을 합의·계가 중입니다.';
+      return;
+    }
+
     if (!isOnline || !myColor || !state) {
       this.confirmScoreBtn.disabled = false;
+      this.resumeScoreBtn.disabled = false;
       this.confirmScoreBtn.textContent = '계가 확정';
       this.scoringDescEl.textContent =
         '반상 위의 죽은 돌(사석)을 클릭해 지정·해제한 뒤 계가를 확정하세요.';
@@ -1791,6 +2190,7 @@ export class UIManager {
     const count = (state.blackAgreed ? 1 : 0) + (state.whiteAgreed ? 1 : 0);
     const iAgreed = myColor === BLACK ? state.blackAgreed : state.whiteAgreed;
 
+    this.resumeScoreBtn.disabled = false;
     this.scoringDescEl.textContent =
       '사석을 클릭하면 상대 화면에도 실시간 반영됩니다. 양측 모두 동의하면 계가가 확정됩니다.';
 
@@ -1806,9 +2206,11 @@ export class UIManager {
   public updateGameHeader(config: GameConfig): void {
     const isOmok = config.gameType === 'omok';
     this.brandTitleEl.textContent = isOmok ? '수담 3D 오목' : '수담 3D 바둑';
+    const isSpectator = this.onlineSessionRole === 'spectator';
 
-    const modeText =
-      config.mode === 'ai'
+    const modeText = isSpectator
+      ? '실시간 관전 중계'
+      : config.mode === 'ai'
         ? `AI ${AI_LEVEL_NAMES[config.aiDifficulty]}`
         : config.mode === 'online'
           ? `온라인 실시간`
@@ -1827,9 +2229,9 @@ export class UIManager {
     this.whiteNameEl.textContent = config.whiteName || '백 대국자';
 
     const myTagBlack =
-      config.mode === 'online' ? (config.humanColor === BLACK ? ' · 나' : ' · 상대') : '';
+      !isSpectator && config.mode === 'online' ? (config.humanColor === BLACK ? ' · 나' : ' · 상대') : '';
     const myTagWhite =
-      config.mode === 'online' ? (config.humanColor === WHITE ? ' · 나' : ' · 상대') : '';
+      !isSpectator && config.mode === 'online' ? (config.humanColor === WHITE ? ' · 나' : ' · 상대') : '';
 
     if (isOmok) {
       const isRenju = (config.omokRuleset ?? 'renju') === 'renju';
@@ -1843,7 +2245,7 @@ export class UIManager {
 
     this.hintBtn.classList.toggle('hidden', isOmok);
     this.passBtn.classList.toggle('hidden', isOmok);
-    this.undoBtn.textContent = config.mode === 'online' ? '무르기 요청' : '무르기';
+    this.undoBtn.textContent = !isSpectator && config.mode === 'online' ? '무르기 요청' : '무르기';
   }
 
   public setCoordStatus(text: string): void {
@@ -1875,12 +2277,13 @@ export class UIManager {
     this.whiteTurnPill.textContent = aiThinking && turn === WHITE ? '수읽기 중...' : '착수 차례';
 
     const isOnline = mode === 'online';
-    const isMyTurn = !isOnline || turn === humanColor;
+    const isSpectator = this.onlineSessionRole === 'spectator';
+    const isMyTurn = !isSpectator && (!isOnline || turn === humanColor);
 
-    this.passBtn.disabled = !isPlaying || aiThinking || !isMyTurn;
-    this.undoBtn.disabled = !isPlaying || aiThinking || moveCount === 0;
-    this.resignBtn.disabled = !isPlaying || aiThinking;
-    this.aiHintBtn.disabled = !isPlaying || aiThinking || !isMyTurn || isOnline;
+    this.passBtn.disabled = isSpectator || !isPlaying || aiThinking || !isMyTurn;
+    this.undoBtn.disabled = isSpectator || !isPlaying || aiThinking || moveCount === 0;
+    this.resignBtn.disabled = isSpectator || !isPlaying || aiThinking;
+    this.aiHintBtn.disabled = isSpectator || !isPlaying || aiThinking || !isMyTurn || isOnline;
 
     this.scoringBannerEl.classList.toggle('hidden', phase !== 'scoring');
     this.showResultBtn.classList.toggle('hidden', phase !== 'finished' && phase !== 'review');
@@ -2106,7 +2509,10 @@ export class UIManager {
       ${detailTable}
     `;
 
-    this.rematchResultBtn.classList.toggle('hidden', config.mode !== 'online');
+    this.rematchResultBtn.classList.toggle(
+      'hidden',
+      config.mode !== 'online' || this.onlineSessionRole === 'spectator'
+    );
     this.rematchResultBtn.disabled = false;
     this.rematchResultBtn.textContent = '온라인 재대국 신청';
 
@@ -2148,11 +2554,14 @@ export class UIManager {
         b.classList.toggle('selected', b.dataset.val === val);
       });
     };
+    markSeg('#seg-opt-quality', s.visualQuality);
     markSeg('#seg-opt-motion', s.stoneMotionStyle);
     markSeg('#seg-opt-input', s.inputMode);
     markSeg('#seg-opt-physics', s.physicsIntensity);
     markSeg('#seg-opt-lighting', s.lightingTheme);
 
+    (this.root.querySelector('#opt-bloom') as HTMLInputElement).checked = s.bloomEnabled;
+    (this.root.querySelector('#opt-ornate-finish') as HTMLInputElement).checked = s.ornateFinishEnabled;
     (this.root.querySelector('#opt-true-vertical') as HTMLInputElement).checked = s.trueVerticalView;
     (this.root.querySelector('#opt-auto-mobile-vertical') as HTMLInputElement).checked =
       s.autoMobileVerticalView;

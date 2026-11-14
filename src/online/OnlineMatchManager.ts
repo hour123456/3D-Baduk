@@ -10,9 +10,12 @@ import {
   OnlineRoleInfo,
   OnlineScoreAgreementState,
   OnlineSessionPhase,
+  OnlineSessionRole,
   OnlineTransport,
   OnlineTransportStatus,
   PassPacketPayload,
+  PresenceActivity,
+  PresenceStats,
   QuickMatchSizePref,
   RoomSummary,
   ScoreAgreePacketPayload,
@@ -22,6 +25,11 @@ import {
 const TOPIC_PREFIX = 'sudam-3d-baduk-v1';
 const ROOM_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const ROOM_TTL_MS = 25000;
+const PRESENCE_TTL_MS = 28000;
+
+function generateChatToken(): string {
+  return `${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`;
+}
 
 export function normalizeRoomCode(raw: string): string | null {
   const cleaned = raw.replace(/[\s\-_]/g, '').toUpperCase();
@@ -43,6 +51,16 @@ export interface OnlineMatchCallbacks {
   onOpenRoomsUpdated: (rooms: RoomSummary[]) => void;
   onWaitingRoomReady: (room: RoomSummary, isPublic: boolean) => void;
   onMatchStart: (config: GameConfig, role: OnlineRoleInfo, isRematch: boolean) => void;
+  onSpectateStart?: (
+    config: GameConfig,
+    matchInit: OnlineMatchInitPayload,
+    snapshot: SyncSnapshotPayload | null,
+    spectatorCount: number
+  ) => void;
+  onSpectatorCountUpdated?: (spectatorCount: number) => void;
+  onPresenceUpdated?: (stats: PresenceStats) => void;
+  onRoomPasswordRequired?: (action: 'join' | 'spectate', roomCode: string, title?: string) => void;
+  onRoomPasswordRejected?: (action: 'join' | 'spectate', roomCode: string, reason: string) => void;
   onRemoteMove: (payload: MovePacketPayload) => void;
   onRemotePass: (payload: PassPacketPayload) => void;
   onRemoteDeadToggle: (payload: DeadTogglePacketPayload) => void;
@@ -56,6 +74,8 @@ export interface OnlineMatchCallbacks {
   onRematchRequested: (requesterColor: PlayerColor) => void;
   onRematchDeclined: () => void;
   onRemoteChat: (senderName: string, senderColor: PlayerColor, text: string) => void;
+  onRemotePlayerChat?: (senderName: string, senderColor: PlayerColor, text: string) => void;
+  onRemoteSpectatorChat?: (senderName: string, senderId: string, text: string) => void;
   onOpponentLeft: (opponentName: string) => void;
   onLatencyUpdated: (pingMs: number) => void;
   onSyncRequested: () => SyncSnapshotPayload | null;
@@ -96,6 +116,21 @@ interface RoomJoinReqPayload {
   roomCode: string;
   guestId: string;
   guestName: string;
+  password?: string;
+}
+
+interface SpectateJoinReqPayload {
+  roomCode: string;
+  spectatorId: string;
+  spectatorName: string;
+  password?: string;
+}
+
+interface SpectateWelcomePayload {
+  roomCode: string;
+  matchInit: OnlineMatchInitPayload;
+  snapshot: SyncSnapshotPayload | null;
+  spectatorCount: number;
 }
 
 export class OnlineMatchManager {
@@ -104,10 +139,13 @@ export class OnlineMatchManager {
   private callbacks: OnlineMatchCallbacks;
 
   private phase: OnlineSessionPhase = 'idle';
+  private sessionRole: OnlineSessionRole = 'none';
   private sessionSeq = 0;
   private activeRoomCode: string | null = null;
   private roleInfo: OnlineRoleInfo | null = null;
   private lastMatchInit: OnlineMatchInitPayload | null = null;
+  private activeMatchStartedAt = 0;
+  private pendingPlayerChatToken = '';
 
   // Deduplication ring buffer
   private seenMsgIds = new Set<string>();
@@ -118,10 +156,22 @@ export class OnlineMatchManager {
   private watchingLobby = false;
   private lobbyPruneTimer: ReturnType<typeof setInterval> | null = null;
 
-  // Host waiting room state
+  // Host waiting & live room state (password stays strictly in host memory)
   private hostedRoom: RoomSummary | null = null;
   private hostedIsPublic = true;
+  private hostRoomPassword = '';
   private hostAdvertiseTimer: ReturnType<typeof setInterval> | null = null;
+
+  // Spectator & presence state
+  private pendingJoinAction: 'join' | 'spectate' = 'join';
+  private activeSpectators = new Map<string, { name: string; updatedAt: number }>();
+  private spectatorHbTimer: ReturnType<typeof setInterval> | null = null;
+  private spectatorPruneTimer: ReturnType<typeof setInterval> | null = null;
+
+  private presenceTracking = false;
+  private presencePeers = new Map<string, { activity: PresenceActivity; updatedAt: number }>();
+  private presenceHbTimer: ReturnType<typeof setInterval> | null = null;
+  private presencePruneTimer: ReturnType<typeof setInterval> | null = null;
 
   // Join room retry timer
   private joinRetryTimer: ReturnType<typeof setInterval> | null = null;
@@ -169,6 +219,12 @@ export class OnlineMatchManager {
 
     if (typeof window !== 'undefined') {
       window.addEventListener('beforeunload', () => {
+        if (this.presenceTracking && this.transport.isConnected()) {
+          this.transport.publish(
+            this.presenceTopic(),
+            this.makeEnvelope('presence_bye', { clientId: this.profile.getClientId() })
+          );
+        }
         this.leaveCurrentSession(true);
       });
     }
@@ -176,6 +232,10 @@ export class OnlineMatchManager {
 
   public getPhase(): OnlineSessionPhase {
     return this.phase;
+  }
+
+  public getSessionRole(): OnlineSessionRole {
+    return this.sessionRole;
   }
 
   public getRoleInfo(): OnlineRoleInfo | null {
@@ -193,6 +253,10 @@ export class OnlineMatchManager {
   private setPhase(next: OnlineSessionPhase, detail?: string): void {
     this.phase = next;
     this.callbacks.onPhaseChange(next, detail);
+    if (this.presenceTracking) {
+      this.publishPresenceHeartbeat();
+      this.emitPresenceStats();
+    }
   }
 
   private makeEnvelope<T>(type: string, payload: T): OnlineEnvelope<T> {
@@ -244,9 +308,125 @@ export class OnlineMatchManager {
     return `${TOPIC_PREFIX}/lobby/quickmatch`;
   }
 
+  private presenceTopic(): string {
+    return `${TOPIC_PREFIX}/presence/all`;
+  }
+
+  private spectatorChatTopic(roomCode: string): string {
+    return `${TOPIC_PREFIX}/room/${roomCode}/spectator_chat`;
+  }
+
   public async ensureConnected(): Promise<void> {
     await this.transport.connect();
     await this.transport.subscribe(this.directTopic(this.profile.getClientId()));
+  }
+
+  // =========================================================================
+  // Web Live Concurrent User Presence
+  // =========================================================================
+
+  private getMyPresenceActivity(): PresenceActivity {
+    if (this.phase === 'in_game') return 'playing';
+    if (this.phase === 'spectating') return 'spectating';
+    return 'lobby';
+  }
+
+  public async startPresenceTracking(): Promise<void> {
+    if (this.presenceTracking) {
+      this.publishPresenceHeartbeat();
+      this.emitPresenceStats();
+      return;
+    }
+    this.presenceTracking = true;
+    await this.ensureConnected();
+    if (!this.presenceTracking) return;
+    await this.transport.subscribe(this.presenceTopic());
+    this.transport.publish(
+      this.presenceTopic(),
+      this.makeEnvelope('presence_req', { requesterId: this.profile.getClientId() })
+    );
+    this.publishPresenceHeartbeat();
+    this.emitPresenceStats();
+    this.presenceHbTimer = setInterval(() => this.publishPresenceHeartbeat(), 10000);
+    this.presencePruneTimer = setInterval(() => this.prunePresencePeers(), 5000);
+  }
+
+  public stopPresenceTracking(): void {
+    if (this.presenceHbTimer) {
+      clearInterval(this.presenceHbTimer);
+      this.presenceHbTimer = null;
+    }
+    if (this.presencePruneTimer) {
+      clearInterval(this.presencePruneTimer);
+      this.presencePruneTimer = null;
+    }
+    if (this.presenceTracking && this.transport.isConnected()) {
+      this.transport.publish(
+        this.presenceTopic(),
+        this.makeEnvelope('presence_bye', { clientId: this.profile.getClientId() })
+      );
+      void this.transport.unsubscribe(this.presenceTopic());
+    }
+    this.presenceTracking = false;
+    this.presencePeers.clear();
+  }
+
+  private publishPresenceHeartbeat(): void {
+    if (!this.presenceTracking || !this.transport.isConnected()) return;
+    this.transport.publish(
+      this.presenceTopic(),
+      this.makeEnvelope('presence_hb', {
+        clientId: this.profile.getClientId(),
+        activity: this.getMyPresenceActivity(),
+        sentAt: Date.now(),
+      })
+    );
+  }
+
+  private prunePresencePeers(): void {
+    const now = Date.now();
+    let changed = false;
+    for (const [id, entry] of this.presencePeers.entries()) {
+      if (now - entry.updatedAt > PRESENCE_TTL_MS) {
+        this.presencePeers.delete(id);
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.emitPresenceStats();
+    }
+  }
+
+  public getPresenceStats(): PresenceStats {
+    const now = Date.now();
+    const myId = this.profile.getClientId();
+    let onlineUsers = 0;
+    let inGameUsers = 0;
+    let spectatingUsers = 0;
+
+    if (this.presenceTracking) {
+      onlineUsers = 1;
+      const myActivity = this.getMyPresenceActivity();
+      if (myActivity === 'playing') inGameUsers++;
+      else if (myActivity === 'spectating') spectatingUsers++;
+    }
+
+    for (const [id, entry] of this.presencePeers.entries()) {
+      if (id === myId) continue;
+      if (now - entry.updatedAt > PRESENCE_TTL_MS) {
+        this.presencePeers.delete(id);
+        continue;
+      }
+      onlineUsers++;
+      if (entry.activity === 'playing') inGameUsers++;
+      else if (entry.activity === 'spectating') spectatingUsers++;
+    }
+
+    return { onlineUsers, inGameUsers, spectatingUsers };
+  }
+
+  private emitPresenceStats(): void {
+    this.callbacks.onPresenceUpdated?.(this.getPresenceStats());
   }
 
   // =========================================================================
@@ -317,6 +497,11 @@ export class OnlineMatchManager {
   // =========================================================================
 
   public async createRoom(options: CreateRoomOptions): Promise<RoomSummary> {
+    const trimmedPassword = (options.password ?? '').trim();
+    if (!options.isPublic && !trimmedPassword) {
+      throw new Error('비공개 대국실은 비밀번호를 입력해야 합니다.');
+    }
+
     await this.cancelMatchmakingOrRoom();
     const seq = ++this.sessionSeq;
     await this.ensureConnected();
@@ -327,11 +512,17 @@ export class OnlineMatchManager {
     const hostName = this.profile.getNickname();
     const title = options.title?.trim() || `${hostName}님의 수담 대국실`;
 
+    // Note: password NEVER leaves host memory or enters RoomSummary
     const summary: RoomSummary = {
       roomCode,
       title,
       hostId: this.profile.getClientId(),
       hostName,
+      isPublic: options.isPublic,
+      hasPassword: !options.isPublic,
+      status: 'waiting',
+      moveCount: 0,
+      spectatorCount: 0,
       boardSize: options.boardSize,
       ruleset: options.ruleset,
       gameType: options.gameType ?? 'baduk',
@@ -349,13 +540,14 @@ export class OnlineMatchManager {
     this.activeRoomCode = roomCode;
     this.hostedRoom = summary;
     this.hostedIsPublic = options.isPublic;
+    this.hostRoomPassword = options.isPublic ? '' : trimmedPassword;
+    this.activeSpectators.clear();
 
     await this.transport.subscribe(this.roomTopic(roomCode));
-    if (options.isPublic) {
-      await this.transport.subscribe(this.lobbyRoomsReqTopic());
-      this.publishHostedRoomListing();
-      this.hostAdvertiseTimer = setInterval(() => this.publishHostedRoomListing(), 6000);
-    }
+    // Both public and private rooms appear in the unified lobby listing
+    await this.transport.subscribe(this.lobbyRoomsReqTopic());
+    this.publishHostedRoomListing();
+    this.hostAdvertiseTimer = setInterval(() => this.publishHostedRoomListing(), 6000);
 
     this.setPhase('waiting_room', roomCode);
     this.callbacks.onWaitingRoomReady(summary, options.isPublic);
@@ -363,12 +555,20 @@ export class OnlineMatchManager {
   }
 
   private publishHostedRoomListing(): void {
-    if (!this.hostedRoom || !this.hostedIsPublic || this.phase !== 'waiting_room') return;
+    if (!this.hostedRoom) return;
+    if (this.phase !== 'waiting_room' && this.phase !== 'in_game') return;
     this.hostedRoom.hostName = this.profile.getNickname();
+    this.hostedRoom.spectatorCount = this.activeSpectators.size;
     this.hostedRoom.updatedAt = Date.now();
     this.transport.publish(this.lobbyRoomTopic(this.hostedRoom.roomCode), this.hostedRoom, {
       retain: true,
     });
+  }
+
+  public updateHostMoveCount(moveCount: number): void {
+    if (!this.hostedRoom || !this.roleInfo?.isHost || this.phase !== 'in_game') return;
+    this.hostedRoom.moveCount = moveCount;
+    this.publishHostedRoomListing();
   }
 
   private clearHostedRoomListing(roomCode: string): void {
@@ -381,10 +581,10 @@ export class OnlineMatchManager {
   }
 
   // =========================================================================
-  // Join Room by Code / Open Room Click
+  // Join Room / Spectate Room
   // =========================================================================
 
-  public async joinRoom(rawCode: string): Promise<void> {
+  public async joinRoom(rawCode: string, password?: string): Promise<void> {
     const roomCode = normalizeRoomCode(rawCode);
     if (!roomCode) {
       this.callbacks.onError('올바른 6자리 방 코드를 입력해 주세요.');
@@ -394,6 +594,7 @@ export class OnlineMatchManager {
     await this.cancelMatchmakingOrRoom();
     const seq = ++this.sessionSeq;
     this.activeRoomCode = roomCode;
+    this.pendingJoinAction = 'join';
     this.setPhase('joining_room', roomCode);
     try {
       await this.ensureConnected();
@@ -410,6 +611,7 @@ export class OnlineMatchManager {
         roomCode,
         guestId: this.profile.getClientId(),
         guestName: this.profile.getNickname(),
+        password: password?.trim() || undefined,
       };
       this.transport.publish(this.roomTopic(roomCode), this.makeEnvelope('room_join_req', req));
     };
@@ -420,6 +622,49 @@ export class OnlineMatchManager {
       if (this.phase === 'joining_room' && this.activeRoomCode === roomCode) {
         void this.cancelMatchmakingOrRoom();
         this.callbacks.onError('해당 방을 찾을 수 없거나 이미 대국이 시작되었습니다.');
+      }
+    }, 8000);
+  }
+
+  public async spectateRoom(rawCode: string, password?: string): Promise<void> {
+    const roomCode = normalizeRoomCode(rawCode);
+    if (!roomCode) {
+      this.callbacks.onError('올바른 6자리 방 코드를 입력해 주세요.');
+      return;
+    }
+
+    await this.cancelMatchmakingOrRoom();
+    const seq = ++this.sessionSeq;
+    this.activeRoomCode = roomCode;
+    this.pendingJoinAction = 'spectate';
+    this.setPhase('joining_room', roomCode);
+    try {
+      await this.ensureConnected();
+    } catch (err) {
+      if (seq === this.sessionSeq) this.setPhase('idle');
+      throw err;
+    }
+    if (seq !== this.sessionSeq) return;
+    await this.transport.subscribe(this.roomTopic(roomCode));
+    await this.transport.subscribe(this.spectatorChatTopic(roomCode));
+
+    const sendReq = () => {
+      if (this.phase !== 'joining_room' || this.activeRoomCode !== roomCode) return;
+      const req: SpectateJoinReqPayload = {
+        roomCode,
+        spectatorId: this.profile.getClientId(),
+        spectatorName: this.profile.getNickname(),
+        password: password?.trim() || undefined,
+      };
+      this.transport.publish(this.roomTopic(roomCode), this.makeEnvelope('spectate_join_req', req));
+    };
+
+    sendReq();
+    this.joinRetryTimer = setInterval(sendReq, 1100);
+    this.joinTimeoutTimer = setTimeout(() => {
+      if (this.phase === 'joining_room' && this.activeRoomCode === roomCode) {
+        void this.cancelMatchmakingOrRoom();
+        this.callbacks.onError('관전 가능한 대국방을 찾을 수 없습니다.');
       }
     }, 8000);
   }
@@ -491,25 +736,38 @@ export class OnlineMatchManager {
       clearInterval(this.pingTimer);
       this.pingTimer = null;
     }
+    if (this.spectatorHbTimer) {
+      clearInterval(this.spectatorHbTimer);
+      this.spectatorHbTimer = null;
+    }
+    if (this.spectatorPruneTimer) {
+      clearInterval(this.spectatorPruneTimer);
+      this.spectatorPruneTimer = null;
+    }
 
     const prevHosted = this.hostedRoom;
-    const prevHostedPublic = this.hostedIsPublic;
     const prevRoomCode = this.activeRoomCode;
     const wasInGame = this.phase === 'in_game';
+    const wasSpectating = this.phase === 'spectating';
 
     this.hostedRoom = null;
+    this.hostRoomPassword = '';
+    this.activeSpectators.clear();
     this.activeRoomCode = null;
     this.qmPendingOffer = null;
     this.qmAcceptedRoomCode = null;
     this.roleInfo = null;
     this.lastMatchInit = null;
+    this.activeMatchStartedAt = 0;
+    this.pendingPlayerChatToken = '';
+    this.sessionRole = 'none';
     this.resetScoreAgreement();
 
     if (this.phase !== 'idle') {
       this.setPhase('idle');
     }
 
-    if (prevHosted && prevHostedPublic) {
+    if (prevHosted) {
       this.clearHostedRoomListing(prevHosted.roomCode);
     }
 
@@ -522,9 +780,18 @@ export class OnlineMatchManager {
             senderName: this.profile.getNickname(),
           })
         );
+      } else if (wasSpectating) {
+        this.transport.publish(
+          this.roomTopic(prevRoomCode),
+          this.makeEnvelope('spectator_leave', {
+            roomCode: prevRoomCode,
+            spectatorId: this.profile.getClientId(),
+          })
+        );
       }
       if (seq === this.sessionSeq) {
         await this.transport.unsubscribe(this.roomTopic(prevRoomCode));
+        await this.transport.unsubscribe(this.spectatorChatTopic(prevRoomCode));
       }
     }
 
@@ -534,13 +801,18 @@ export class OnlineMatchManager {
   }
 
   public leaveCurrentSession(silent = false): void {
-    if (this.hostedRoom && this.hostedIsPublic) {
+    if (this.hostedRoom) {
       this.clearHostedRoomListing(this.hostedRoom.roomCode);
     }
     if (this.phase === 'in_game' && this.activeRoomCode) {
       this.sendRoomPacket('leave', {
         roomCode: this.activeRoomCode,
         senderName: this.profile.getNickname(),
+      });
+    } else if (this.phase === 'spectating' && this.activeRoomCode) {
+      this.sendRoomPacket('spectator_leave', {
+        roomCode: this.activeRoomCode,
+        spectatorId: this.profile.getClientId(),
       });
     }
     if (!silent) {
@@ -580,6 +852,47 @@ export class OnlineMatchManager {
     if (env.senderId === this.profile.getClientId()) return;
     if (!this.markSeen(env.msgId)) return;
 
+    // Web live concurrent user presence packets
+    if (topic === this.presenceTopic()) {
+      if (env.type === 'presence_hb') {
+        const p = env.payload as { clientId?: string; activity?: PresenceActivity };
+        if (p?.clientId) {
+          this.presencePeers.set(p.clientId, {
+            activity: p.activity ?? 'lobby',
+            updatedAt: Date.now(),
+          });
+          this.emitPresenceStats();
+        }
+      } else if (env.type === 'presence_bye') {
+        const p = env.payload as { clientId?: string };
+        if (p?.clientId && this.presencePeers.delete(p.clientId)) {
+          this.emitPresenceStats();
+        }
+      } else if (env.type === 'presence_req') {
+        this.publishPresenceHeartbeat();
+      }
+      return;
+    }
+
+    // Spectator-only isolated chat channel (players NEVER process this topic)
+    if (this.activeRoomCode && topic === this.spectatorChatTopic(this.activeRoomCode)) {
+      if (
+        this.phase === 'spectating' &&
+        this.sessionRole === 'spectator' &&
+        env.type === 'spectator_chat'
+      ) {
+        const p = env.payload as { roomCode?: string; senderName?: string; text?: string };
+        if (p && p.roomCode === this.activeRoomCode && typeof p.text === 'string' && p.text.trim()) {
+          this.callbacks.onRemoteSpectatorChat?.(
+            p.senderName || '관전자',
+            env.senderId,
+            p.text
+          );
+        }
+      }
+      return;
+    }
+
     // Lobby rooms ping
     if (topic === this.lobbyRoomsReqTopic() && env.type === 'rooms_ping') {
       this.publishHostedRoomListing();
@@ -592,7 +905,7 @@ export class OnlineMatchManager {
       return;
     }
 
-    // Direct signaling messages
+    // Direct signaling & direct 1:1 player chat
     if (topic === this.directTopic(this.profile.getClientId())) {
       if (env.type === 'qm_offer') {
         void this.handleQuickMatchOffer(env.payload as QuickMatchOfferPayload);
@@ -604,6 +917,74 @@ export class OnlineMatchManager {
       }
       if (env.type === 'match_start') {
         void this.handleMatchStartPacket(env.payload as OnlineMatchInitPayload, false);
+        return;
+      }
+      if (env.type === 'room_password_required') {
+        const p = env.payload as { action: 'join' | 'spectate'; roomCode: string; title?: string };
+        if (this.phase === 'joining_room' && this.activeRoomCode === p.roomCode) {
+          void this.cancelMatchmakingOrRoom().then(() => {
+            this.callbacks.onRoomPasswordRequired?.(p.action, p.roomCode, p.title);
+          });
+        }
+        return;
+      }
+      if (env.type === 'room_password_rejected') {
+        const p = env.payload as { action: 'join' | 'spectate'; roomCode: string; reason: string };
+        if (this.phase === 'joining_room' && this.activeRoomCode === p.roomCode) {
+          void this.cancelMatchmakingOrRoom().then(() => {
+            this.callbacks.onRoomPasswordRejected?.(
+              p.action,
+              p.roomCode,
+              p.reason || '비밀번호가 일치하지 않습니다.'
+            );
+          });
+        }
+        return;
+      }
+      if (env.type === 'spectate_welcome') {
+        void this.handleSpectateWelcome(env.payload as SpectateWelcomePayload);
+        return;
+      }
+      if (env.type === 'rematch_response') {
+        if (this.phase === 'in_game' && this.sessionRole === 'player') {
+          const p = env.payload as { accepted: boolean; nextMatch?: OnlineMatchInitPayload };
+          if (p.accepted && p.nextMatch) {
+            void this.handleMatchStartPacket(p.nextMatch, true);
+          }
+        }
+        return;
+      }
+      // Strictly isolated 1:1 player-to-player chat (Spectators NEVER receive or process this)
+      if (env.type === 'player_chat') {
+        if (
+          this.phase !== 'in_game' ||
+          this.sessionRole !== 'player' ||
+          !this.roleInfo ||
+          env.senderId !== this.roleInfo.opponentId
+        ) {
+          return;
+        }
+        const p = env.payload as {
+          roomCode?: string;
+          token?: string;
+          senderName?: string;
+          senderColor?: PlayerColor;
+          text?: string;
+        };
+        if (
+          !p ||
+          p.roomCode !== this.activeRoomCode ||
+          !this.lastMatchInit?.playerChatToken ||
+          p.token !== this.lastMatchInit.playerChatToken ||
+          typeof p.text !== 'string' ||
+          !p.text.trim()
+        ) {
+          return;
+        }
+        const color = p.senderColor ?? (this.roleInfo.myColor === BLACK ? WHITE : BLACK);
+        const senderName = p.senderName || this.roleInfo.opponentName;
+        this.callbacks.onRemotePlayerChat?.(senderName, color, p.text);
+        this.callbacks.onRemoteChat(senderName, color, p.text);
         return;
       }
     }
@@ -728,15 +1109,19 @@ export class OnlineMatchManager {
     const myName = this.profile.getNickname();
     const hostIsBlack = Math.random() < 0.5;
     const size = this.qmPendingOffer.boardSize;
+    const blackName = hostIsBlack ? myName : accept.guestName;
+    const whiteName = hostIsBlack ? accept.guestName : myName;
+    const playerChatToken = generateChatToken();
+    const now = Date.now();
 
-    const initPayload: OnlineMatchInitPayload = {
+    const initBase: OnlineMatchInitPayload = {
       roomCode: accept.roomCode,
       hostId: myId,
       guestId: accept.guestId,
       blackId: hostIsBlack ? myId : accept.guestId,
       whiteId: hostIsBlack ? accept.guestId : myId,
-      blackName: hostIsBlack ? myName : accept.guestName,
-      whiteName: hostIsBlack ? accept.guestName : myName,
+      blackName,
+      whiteName,
       boardSize: size,
       ruleset: 'korean',
       gameType: accept.gameType ?? this.qmPendingOffer?.gameType ?? this.qmGameType,
@@ -746,25 +1131,62 @@ export class OnlineMatchManager {
       mainTimeSeconds: size === 9 ? 300 : 600,
       byoyomiSeconds: 30,
       byoyomiPeriods: 3,
-      startedAt: Date.now(),
+      startedAt: now,
     };
 
     this.activeRoomCode = accept.roomCode;
-    const env = this.makeEnvelope('match_start', initPayload);
-    this.transport.publish(this.directTopic(accept.guestId), env);
-    this.transport.publish(this.roomTopic(accept.roomCode), env);
+    this.hostedRoom = {
+      roomCode: accept.roomCode,
+      title: `빠른 매칭 (${blackName} vs ${whiteName})`,
+      hostId: myId,
+      hostName: myName,
+      isPublic: true,
+      hasPassword: false,
+      status: 'in_game',
+      blackName,
+      whiteName,
+      moveCount: 0,
+      spectatorCount: 0,
+      gameType: initBase.gameType,
+      omokRuleset: initBase.omokRuleset,
+      boardSize: size,
+      ruleset: initBase.ruleset,
+      handicap: 0,
+      komi: 6.5,
+      mainTimeSeconds: initBase.mainTimeSeconds,
+      byoyomiSeconds: initBase.byoyomiSeconds,
+      byoyomiPeriods: initBase.byoyomiPeriods,
+      hostColorPref: hostIsBlack ? 'black' : 'white',
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.hostedIsPublic = true;
+    this.hostRoomPassword = '';
+    this.activeSpectators.clear();
+    await this.transport.subscribe(this.lobbyRoomsReqTopic());
+    if (this.hostAdvertiseTimer) clearInterval(this.hostAdvertiseTimer);
+    this.hostAdvertiseTimer = setInterval(() => this.publishHostedRoomListing(), 6000);
 
-    await this.handleMatchStartPacket(initPayload, false);
+    const initForGuest: OnlineMatchInitPayload = { ...initBase, playerChatToken };
+    this.transport.publish(this.directTopic(accept.guestId), this.makeEnvelope('match_start', initForGuest));
+    this.transport.publish(this.roomTopic(accept.roomCode), this.makeEnvelope('match_start', initBase));
+
+    await this.handleMatchStartPacket(initForGuest, false);
   }
 
   private handleRoomPacket(env: OnlineEnvelope): void {
+    const isPlayerOrSpectator = this.phase === 'in_game' || this.phase === 'spectating';
+
     switch (env.type) {
       case 'room_join_req': {
         const req = env.payload as RoomJoinReqPayload;
         if (this.phase !== 'waiting_room' || !this.hostedRoom) {
           if (this.phase === 'in_game' && this.lastMatchInit && req.guestId === this.lastMatchInit.guestId) {
-            // Re-send match_start if guest missed the first packet
-            this.sendRoomPacket('match_start', this.lastMatchInit);
+            // Re-send match_start directly so guest receives playerChatToken safely
+            this.transport.publish(
+              this.directTopic(req.guestId),
+              this.makeEnvelope('match_start', this.lastMatchInit)
+            );
           } else if (this.roleInfo?.isHost) {
             this.sendRoomPacket('room_join_reject', {
               targetGuestId: req.guestId,
@@ -775,24 +1197,51 @@ export class OnlineMatchManager {
         }
 
         const room = this.hostedRoom;
+        // Private room password check strictly inside host memory
+        if (!room.isPublic && this.hostRoomPassword) {
+          if (!req.password || !req.password.trim()) {
+            this.transport.publish(
+              this.directTopic(req.guestId),
+              this.makeEnvelope('room_password_required', {
+                action: 'join',
+                roomCode: room.roomCode,
+                title: room.title,
+              })
+            );
+            return;
+          }
+          if (req.password.trim() !== this.hostRoomPassword) {
+            this.transport.publish(
+              this.directTopic(req.guestId),
+              this.makeEnvelope('room_password_rejected', {
+                action: 'join',
+                roomCode: room.roomCode,
+                reason: '비밀번호가 일치하지 않습니다.',
+              })
+            );
+            return;
+          }
+        }
+
         const myId = this.profile.getClientId();
         const myName = this.profile.getNickname();
 
         let hostIsBlack = true;
         if (room.hostColorPref === 'white') hostIsBlack = false;
         else if (room.hostColorPref === 'random') hostIsBlack = Math.random() < 0.5;
-        if (room.handicap >= 2) {
-          // Standard handicap: Black has handicap stones, keep chosen preference
-        }
 
-        const initPayload: OnlineMatchInitPayload = {
+        const blackName = hostIsBlack ? myName : req.guestName;
+        const whiteName = hostIsBlack ? req.guestName : myName;
+        const playerChatToken = generateChatToken();
+
+        const initBase: OnlineMatchInitPayload = {
           roomCode: room.roomCode,
           hostId: myId,
           guestId: req.guestId,
           blackId: hostIsBlack ? myId : req.guestId,
           whiteId: hostIsBlack ? req.guestId : myId,
-          blackName: hostIsBlack ? myName : req.guestName,
-          whiteName: hostIsBlack ? req.guestName : myName,
+          blackName,
+          whiteName,
           boardSize: room.boardSize,
           ruleset: room.ruleset,
           gameType: room.gameType ?? 'baduk',
@@ -805,15 +1254,18 @@ export class OnlineMatchManager {
           startedAt: Date.now(),
         };
 
-        if (this.hostedIsPublic) {
-          this.clearHostedRoomListing(room.roomCode);
-        }
-        this.hostedRoom = null;
+        // Keep room advertised in lobby as live in_game for spectating
+        room.status = 'in_game';
+        room.blackName = blackName;
+        room.whiteName = whiteName;
+        room.moveCount = 0;
+        room.spectatorCount = this.activeSpectators.size;
+        this.publishHostedRoomListing();
 
-        const startEnv = this.makeEnvelope('match_start', initPayload);
-        this.transport.publish(this.roomTopic(room.roomCode), startEnv);
-        this.transport.publish(this.directTopic(req.guestId), startEnv);
-        void this.handleMatchStartPacket(initPayload, false);
+        const initForGuest: OnlineMatchInitPayload = { ...initBase, playerChatToken };
+        this.transport.publish(this.directTopic(req.guestId), this.makeEnvelope('match_start', initForGuest));
+        this.transport.publish(this.roomTopic(room.roomCode), this.makeEnvelope('match_start', initBase));
+        void this.handleMatchStartPacket(initForGuest, false);
         break;
       }
 
@@ -826,25 +1278,132 @@ export class OnlineMatchManager {
         break;
       }
 
+      case 'spectate_join_req': {
+        if (!this.roleInfo?.isHost || this.phase !== 'in_game' || !this.lastMatchInit || !this.hostedRoom) {
+          return;
+        }
+        const req = env.payload as SpectateJoinReqPayload;
+        if (!req || req.roomCode !== this.activeRoomCode || !req.spectatorId) return;
+
+        // Private room password verification for spectators
+        if (!this.hostedRoom.isPublic && this.hostRoomPassword) {
+          if (!req.password || !req.password.trim()) {
+            this.transport.publish(
+              this.directTopic(req.spectatorId),
+              this.makeEnvelope('room_password_required', {
+                action: 'spectate',
+                roomCode: this.hostedRoom.roomCode,
+                title: this.hostedRoom.title,
+              })
+            );
+            return;
+          }
+          if (req.password.trim() !== this.hostRoomPassword) {
+            this.transport.publish(
+              this.directTopic(req.spectatorId),
+              this.makeEnvelope('room_password_rejected', {
+                action: 'spectate',
+                roomCode: this.hostedRoom.roomCode,
+                reason: '비밀번호가 일치하지 않습니다.',
+              })
+            );
+            return;
+          }
+        }
+
+        this.activeSpectators.set(req.spectatorId, {
+          name: req.spectatorName || '관전자',
+          updatedAt: Date.now(),
+        });
+        const count = this.activeSpectators.size;
+        this.roleInfo.spectatorCount = count;
+        this.hostedRoom.spectatorCount = count;
+        this.publishHostedRoomListing();
+        this.sendRoomPacket('spectator_count', { roomCode: req.roomCode, count });
+        this.callbacks.onSpectatorCountUpdated?.(count);
+
+        // Strip playerChatToken so spectators never possess the private player chat token
+        const safeInit: OnlineMatchInitPayload = { ...this.lastMatchInit };
+        delete safeInit.playerChatToken;
+
+        const welcome: SpectateWelcomePayload = {
+          roomCode: req.roomCode,
+          matchInit: safeInit,
+          snapshot: this.callbacks.onSyncRequested(),
+          spectatorCount: count,
+        };
+        this.transport.publish(this.directTopic(req.spectatorId), this.makeEnvelope('spectate_welcome', welcome));
+        break;
+      }
+
+      case 'spectator_hb': {
+        if (!this.roleInfo?.isHost || this.phase !== 'in_game') return;
+        const p = env.payload as { roomCode?: string; spectatorId?: string };
+        if (!p?.spectatorId || p.roomCode !== this.activeRoomCode) return;
+        const existing = this.activeSpectators.get(p.spectatorId);
+        if (existing) {
+          existing.updatedAt = Date.now();
+        } else {
+          this.activeSpectators.set(p.spectatorId, { name: '관전자', updatedAt: Date.now() });
+          const count = this.activeSpectators.size;
+          this.roleInfo.spectatorCount = count;
+          if (this.hostedRoom) {
+            this.hostedRoom.spectatorCount = count;
+            this.publishHostedRoomListing();
+          }
+          this.sendRoomPacket('spectator_count', { roomCode: this.activeRoomCode, count });
+          this.callbacks.onSpectatorCountUpdated?.(count);
+        }
+        break;
+      }
+
+      case 'spectator_leave': {
+        if (!this.roleInfo?.isHost || this.phase !== 'in_game') return;
+        const p = env.payload as { roomCode?: string; spectatorId?: string };
+        if (p?.spectatorId && this.activeSpectators.delete(p.spectatorId)) {
+          const count = this.activeSpectators.size;
+          this.roleInfo.spectatorCount = count;
+          if (this.hostedRoom) {
+            this.hostedRoom.spectatorCount = count;
+            this.publishHostedRoomListing();
+          }
+          if (this.activeRoomCode) {
+            this.sendRoomPacket('spectator_count', { roomCode: this.activeRoomCode, count });
+          }
+          this.callbacks.onSpectatorCountUpdated?.(count);
+        }
+        break;
+      }
+
+      case 'spectator_count': {
+        if (!isPlayerOrSpectator) return;
+        const p = env.payload as { roomCode?: string; count?: number };
+        if (p && typeof p.count === 'number') {
+          if (this.roleInfo) this.roleInfo.spectatorCount = p.count;
+          this.callbacks.onSpectatorCountUpdated?.(p.count);
+        }
+        break;
+      }
+
       case 'match_start': {
         void this.handleMatchStartPacket(env.payload as OnlineMatchInitPayload, false);
         break;
       }
 
       case 'move': {
-        if (this.phase !== 'in_game') return;
+        if (!isPlayerOrSpectator) return;
         this.callbacks.onRemoteMove(env.payload as MovePacketPayload);
         break;
       }
 
       case 'pass': {
-        if (this.phase !== 'in_game') return;
+        if (!isPlayerOrSpectator) return;
         this.callbacks.onRemotePass(env.payload as PassPacketPayload);
         break;
       }
 
       case 'dead_toggle': {
-        if (this.phase !== 'in_game') return;
+        if (!isPlayerOrSpectator) return;
         this.resetScoreAgreement();
         this.callbacks.onRemoteDeadToggle(env.payload as DeadTogglePacketPayload);
         this.callbacks.onScoreAgreementChanged(this.getScoreAgreement());
@@ -852,7 +1411,7 @@ export class OnlineMatchManager {
       }
 
       case 'score_agree': {
-        if (this.phase !== 'in_game') return;
+        if (!isPlayerOrSpectator) return;
         const p = env.payload as ScoreAgreePacketPayload;
         const maskKey = p.deadIndices.slice().sort((a, b) => a - b).join(',');
         if (this.lastAgreedMaskKey && this.lastAgreedMaskKey !== maskKey) {
@@ -870,7 +1429,7 @@ export class OnlineMatchManager {
       }
 
       case 'score_resume': {
-        if (this.phase !== 'in_game') return;
+        if (!isPlayerOrSpectator) return;
         const p = env.payload as { color: PlayerColor };
         this.resetScoreAgreement();
         this.callbacks.onRemoteScoreResume(p.color);
@@ -878,43 +1437,50 @@ export class OnlineMatchManager {
       }
 
       case 'resign': {
-        if (this.phase !== 'in_game') return;
+        if (!isPlayerOrSpectator) return;
         const p = env.payload as { color: PlayerColor };
         this.callbacks.onRemoteResign(p.color);
         break;
       }
 
       case 'timeout': {
-        if (this.phase !== 'in_game') return;
+        if (!isPlayerOrSpectator) return;
         const p = env.payload as { timedOutColor: PlayerColor };
         this.callbacks.onRemoteTimeout(p.timedOutColor);
         break;
       }
 
       case 'undo_request': {
-        if (this.phase !== 'in_game') return;
+        if (this.phase !== 'in_game' || this.sessionRole !== 'player') return;
         const p = env.payload as { requesterColor: PlayerColor; steps: number };
         this.callbacks.onUndoRequested(p.requesterColor, p.steps);
         break;
       }
 
       case 'undo_response': {
-        if (this.phase !== 'in_game') return;
+        if (!isPlayerOrSpectator) return;
         const p = env.payload as { accepted: boolean; steps: number; clock?: ClockSnapshot };
+        if (this.phase === 'spectating' && !p.accepted) return;
         this.callbacks.onUndoResolved(p.accepted, p.steps, p.clock);
         break;
       }
 
       case 'rematch_request': {
-        if (this.phase !== 'in_game') return;
+        if (this.phase !== 'in_game' || this.sessionRole !== 'player') return;
         const p = env.payload as { requesterColor: PlayerColor };
         this.callbacks.onRematchRequested(p.requesterColor);
         break;
       }
 
       case 'rematch_response': {
-        if (this.phase !== 'in_game') return;
+        if (!isPlayerOrSpectator) return;
         const p = env.payload as { accepted: boolean; nextMatch?: OnlineMatchInitPayload };
+        if (this.phase === 'spectating') {
+          if (p.accepted && p.nextMatch) {
+            void this.handleSpectateRematch(p.nextMatch);
+          }
+          return;
+        }
         if (p.accepted && p.nextMatch) {
           void this.handleMatchStartPacket(p.nextMatch, true);
         } else {
@@ -924,21 +1490,23 @@ export class OnlineMatchManager {
       }
 
       case 'chat': {
-        if (this.phase !== 'in_game') return;
+        // Legacy room topic chat strictly ignored by spectators
+        if (this.phase !== 'in_game' || this.sessionRole !== 'player') return;
         const p = env.payload as { senderName: string; senderColor: PlayerColor; text: string };
+        this.callbacks.onRemotePlayerChat?.(p.senderName, p.senderColor, p.text);
         this.callbacks.onRemoteChat(p.senderName, p.senderColor, p.text);
         break;
       }
 
       case 'ping': {
-        if (this.phase !== 'in_game') return;
+        if (this.phase !== 'in_game' || this.sessionRole !== 'player') return;
         const p = env.payload as { pingSentAt: number };
         this.sendRoomPacket('pong', { pingSentAt: p.pingSentAt });
         break;
       }
 
       case 'pong': {
-        if (this.phase !== 'in_game') return;
+        if (this.phase !== 'in_game' || this.sessionRole !== 'player') return;
         const p = env.payload as { pingSentAt: number };
         const rtt = Math.max(1, Math.round(Date.now() - p.pingSentAt));
         this.callbacks.onLatencyUpdated(rtt);
@@ -946,7 +1514,7 @@ export class OnlineMatchManager {
       }
 
       case 'sync_request': {
-        if (this.phase !== 'in_game') return;
+        if (this.phase !== 'in_game' || !this.roleInfo?.isHost) return;
         const snap = this.callbacks.onSyncRequested();
         if (snap) {
           this.sendRoomPacket('sync_snapshot', snap);
@@ -955,18 +1523,128 @@ export class OnlineMatchManager {
       }
 
       case 'sync_snapshot': {
-        if (this.phase !== 'in_game') return;
+        if (!isPlayerOrSpectator) return;
         this.callbacks.onSyncSnapshotReceived(env.payload as SyncSnapshotPayload);
         break;
       }
 
       case 'leave': {
-        if (this.phase !== 'in_game') return;
+        if (!isPlayerOrSpectator) return;
         const p = env.payload as { senderName?: string };
         this.callbacks.onOpponentLeft(p.senderName || this.roleInfo?.opponentName || '상대 대국자');
         break;
       }
     }
+  }
+
+  private buildGameConfigFromInit(init: OnlineMatchInitPayload, myColor: PlayerColor): GameConfig {
+    return {
+      boardSize: init.boardSize,
+      ruleset: init.ruleset,
+      gameType: init.gameType ?? 'baduk',
+      omokRuleset: init.omokRuleset ?? 'renju',
+      handicap: init.handicap,
+      komi: init.komi,
+      superko: true,
+      mode: 'online',
+      humanColor: myColor,
+      aiDifficulty: 3,
+      mainTimeSeconds: init.mainTimeSeconds,
+      byoyomiSeconds: init.byoyomiSeconds,
+      byoyomiPeriods: init.byoyomiPeriods,
+      blackName: init.blackName,
+      whiteName: init.whiteName,
+      roomCode: init.roomCode,
+    };
+  }
+
+  private startSpectatorPruneLoop(): void {
+    if (this.spectatorPruneTimer) clearInterval(this.spectatorPruneTimer);
+    this.spectatorPruneTimer = setInterval(() => {
+      if (!this.roleInfo?.isHost || this.phase !== 'in_game') return;
+      const now = Date.now();
+      let changed = false;
+      for (const [id, info] of this.activeSpectators.entries()) {
+        if (now - info.updatedAt > PRESENCE_TTL_MS) {
+          this.activeSpectators.delete(id);
+          changed = true;
+        }
+      }
+      if (changed && this.activeRoomCode) {
+        const count = this.activeSpectators.size;
+        this.roleInfo.spectatorCount = count;
+        if (this.hostedRoom) {
+          this.hostedRoom.spectatorCount = count;
+          this.publishHostedRoomListing();
+        }
+        this.sendRoomPacket('spectator_count', { roomCode: this.activeRoomCode, count });
+        this.callbacks.onSpectatorCountUpdated?.(count);
+      }
+    }, 7000);
+  }
+
+  private async handleSpectateWelcome(welcome: SpectateWelcomePayload): Promise<void> {
+    if (
+      this.phase !== 'joining_room' ||
+      this.pendingJoinAction !== 'spectate' ||
+      this.activeRoomCode !== welcome.roomCode
+    ) {
+      return;
+    }
+
+    if (this.joinRetryTimer) {
+      clearInterval(this.joinRetryTimer);
+      this.joinRetryTimer = null;
+    }
+    if (this.joinTimeoutTimer) {
+      clearTimeout(this.joinTimeoutTimer);
+      this.joinTimeoutTimer = null;
+    }
+
+    await this.transport.subscribe(this.roomTopic(welcome.roomCode));
+    await this.transport.subscribe(this.spectatorChatTopic(welcome.roomCode));
+
+    const safeInit: OnlineMatchInitPayload = { ...welcome.matchInit };
+    delete safeInit.playerChatToken;
+
+    this.sessionRole = 'spectator';
+    this.lastMatchInit = safeInit;
+    this.resetScoreAgreement();
+    this.roleInfo = {
+      roomCode: welcome.roomCode,
+      isHost: false,
+      myColor: BLACK,
+      opponentName: safeInit.whiteName,
+      opponentId: '',
+      sessionRole: 'spectator',
+      spectatorCount: welcome.spectatorCount,
+    };
+
+    this.setPhase('spectating', welcome.roomCode);
+
+    if (this.spectatorHbTimer) clearInterval(this.spectatorHbTimer);
+    this.spectatorHbTimer = setInterval(() => {
+      if (this.phase !== 'spectating' || !this.activeRoomCode) return;
+      this.sendRoomPacket('spectator_hb', {
+        roomCode: this.activeRoomCode,
+        spectatorId: this.profile.getClientId(),
+      });
+    }, 10000);
+
+    const config = this.buildGameConfigFromInit(safeInit, BLACK);
+    this.callbacks.onSpectateStart?.(config, safeInit, welcome.snapshot, welcome.spectatorCount);
+  }
+
+  private async handleSpectateRematch(nextInit: OnlineMatchInitPayload): Promise<void> {
+    if (this.phase !== 'spectating' || this.sessionRole !== 'spectator') return;
+    if (this.lastMatchInit?.startedAt === nextInit.startedAt) return;
+    const safeInit: OnlineMatchInitPayload = { ...nextInit };
+    delete safeInit.playerChatToken;
+    this.lastMatchInit = safeInit;
+    this.resetScoreAgreement();
+    const count = this.roleInfo?.spectatorCount ?? 1;
+    const config = this.buildGameConfigFromInit(safeInit, BLACK);
+    this.callbacks.onSpectateStart?.(config, safeInit, null, count);
   }
 
   private async handleMatchStartPacket(
@@ -975,9 +1653,20 @@ export class OnlineMatchManager {
   ): Promise<void> {
     const myId = this.profile.getClientId();
     if (init.hostId !== myId && init.guestId !== myId) return;
-    if (!isRematch && this.phase === 'in_game' && this.lastMatchInit?.startedAt === init.startedAt) {
+
+    // Save private chat token synchronously before any await so dual delivery
+    // (directTopic + roomTopic) never overwrites or drops the secret token.
+    if (init.playerChatToken) {
+      this.pendingPlayerChatToken = init.playerChatToken;
+      if (this.lastMatchInit && this.lastMatchInit.startedAt === init.startedAt) {
+        this.lastMatchInit.playerChatToken = init.playerChatToken;
+      }
+    }
+
+    if (this.activeMatchStartedAt === init.startedAt) {
       return;
     }
+    this.activeMatchStartedAt = init.startedAt;
 
     if (this.joinRetryTimer) {
       clearInterval(this.joinRetryTimer);
@@ -996,7 +1685,12 @@ export class OnlineMatchManager {
     this.activeRoomCode = init.roomCode;
     await this.transport.subscribe(this.roomTopic(init.roomCode));
 
-    this.lastMatchInit = init;
+    const retainedToken =
+      init.playerChatToken ||
+      this.pendingPlayerChatToken ||
+      (isRematch ? this.lastMatchInit?.playerChatToken : undefined);
+    this.lastMatchInit = { ...init, playerChatToken: retainedToken };
+    this.sessionRole = 'player';
     this.resetScoreAgreement();
 
     const myColor: PlayerColor = init.blackId === myId ? BLACK : WHITE;
@@ -1009,28 +1703,25 @@ export class OnlineMatchManager {
       myColor,
       opponentName,
       opponentId,
+      sessionRole: 'player',
+      spectatorCount: this.activeSpectators.size,
     };
 
-    const config: GameConfig = {
-      boardSize: init.boardSize,
-      ruleset: init.ruleset,
-      gameType: init.gameType ?? 'baduk',
-      omokRuleset: init.omokRuleset ?? 'renju',
-      handicap: init.handicap,
-      komi: init.komi,
-      superko: true,
-      mode: 'online',
-      humanColor: myColor,
-      aiDifficulty: 3,
-      mainTimeSeconds: init.mainTimeSeconds,
-      byoyomiSeconds: init.byoyomiSeconds,
-      byoyomiPeriods: init.byoyomiPeriods,
-      blackName: init.blackName,
-      whiteName: init.whiteName,
-      roomCode: init.roomCode,
-    };
+    if (this.roleInfo.isHost && this.hostedRoom) {
+      this.hostedRoom.status = 'in_game';
+      this.hostedRoom.blackName = init.blackName;
+      this.hostedRoom.whiteName = init.whiteName;
+      this.hostedRoom.moveCount = 0;
+      this.hostedRoom.spectatorCount = this.activeSpectators.size;
+      this.startSpectatorPruneLoop();
+    }
+
+    const config = this.buildGameConfigFromInit(init, myColor);
 
     this.setPhase('in_game', init.roomCode);
+    if (this.roleInfo.isHost && this.hostedRoom) {
+      this.publishHostedRoomListing();
+    }
     this.startPingLoop();
     this.callbacks.onMatchStart(config, { ...this.roleInfo }, isRematch);
   }
@@ -1167,7 +1858,13 @@ export class OnlineMatchManager {
   }
 
   public respondRematch(accepted: boolean): void {
-    if (this.phase !== 'in_game' || !this.activeRoomCode || !this.lastMatchInit || !this.roleInfo) {
+    if (
+      this.phase !== 'in_game' ||
+      this.sessionRole !== 'player' ||
+      !this.activeRoomCode ||
+      !this.lastMatchInit ||
+      !this.roleInfo
+    ) {
       return;
     }
     if (!accepted) {
@@ -1177,7 +1874,8 @@ export class OnlineMatchManager {
 
     // Swap Black and White colors on rematch!
     const prev = this.lastMatchInit;
-    const nextMatch: OnlineMatchInitPayload = {
+    const token = prev.playerChatToken || generateChatToken();
+    const nextPublic: OnlineMatchInitPayload = {
       ...prev,
       blackId: prev.whiteId,
       whiteId: prev.blackId,
@@ -1185,19 +1883,81 @@ export class OnlineMatchManager {
       whiteName: prev.blackName,
       startedAt: Date.now(),
     };
-    this.sendRoomPacket('rematch_response', { accepted: true, nextMatch });
-    void this.handleMatchStartPacket(nextMatch, true);
+    delete nextPublic.playerChatToken;
+
+    const nextForPlayers: OnlineMatchInitPayload = {
+      ...nextPublic,
+      playerChatToken: token,
+    };
+
+    // Send secret token ONLY directly to opponent; broadcast tokenless init on roomTopic for spectators
+    this.transport.publish(
+      this.directTopic(this.roleInfo.opponentId),
+      this.makeEnvelope('rematch_response', { accepted: true, nextMatch: nextForPlayers })
+    );
+    this.sendRoomPacket('rematch_response', { accepted: true, nextMatch: nextPublic });
+    void this.handleMatchStartPacket(nextForPlayers, true);
+  }
+
+  public sendPlayerChat(text: string): boolean {
+    if (
+      this.phase !== 'in_game' ||
+      this.sessionRole !== 'player' ||
+      !this.activeRoomCode ||
+      !this.roleInfo ||
+      !this.roleInfo.opponentId
+    ) {
+      return false;
+    }
+    const token = this.lastMatchInit?.playerChatToken;
+    if (!token) return false;
+
+    const trimmed = text.trim().slice(0, 120);
+    if (!trimmed) return false;
+
+    // Published strictly 1:1 to opponent's directTopic with token (spectators never receive)
+    this.transport.publish(
+      this.directTopic(this.roleInfo.opponentId),
+      this.makeEnvelope('player_chat', {
+        roomCode: this.activeRoomCode,
+        token,
+        senderName: this.profile.getNickname(),
+        senderColor: this.roleInfo.myColor,
+        text: trimmed,
+      })
+    );
+    return true;
+  }
+
+  public sendSpectatorChat(text: string): boolean {
+    if (
+      this.phase !== 'spectating' ||
+      this.sessionRole !== 'spectator' ||
+      !this.activeRoomCode
+    ) {
+      return false;
+    }
+    const trimmed = text.trim().slice(0, 120);
+    if (!trimmed) return false;
+
+    // Published strictly to spectator-only topic (players never subscribe or receive)
+    this.transport.publish(
+      this.spectatorChatTopic(this.activeRoomCode),
+      this.makeEnvelope('spectator_chat', {
+        roomCode: this.activeRoomCode,
+        senderName: this.profile.getNickname(),
+        text: trimmed,
+      })
+    );
+    return true;
   }
 
   public sendChat(text: string): void {
-    if (this.phase !== 'in_game' || !this.activeRoomCode || !this.roleInfo) return;
-    const trimmed = text.trim().slice(0, 80);
-    if (!trimmed) return;
-    this.sendRoomPacket('chat', {
-      senderName: this.profile.getNickname(),
-      senderColor: this.roleInfo.myColor,
-      text: trimmed,
-    });
+    if (this.sessionRole === 'spectator') {
+      this.sendSpectatorChat(text);
+    } else if (this.sessionRole === 'player') {
+      this.sendPlayerChat(text);
+    }
   }
 
   public getInviteUrl(): string {

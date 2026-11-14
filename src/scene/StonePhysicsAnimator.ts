@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { BLACK, WHITE, EMPTY, Coord, PlayerColor, StoneColor } from '../rules/types';
 import { AcousticStoneAudioEngine } from '../audio/AcousticStoneAudioEngine';
-import type { PhysicsIntensity, StoneMotionStyle } from '../settings/SettingsManager';
+import type { PhysicsIntensity, StoneMotionStyle, VisualQuality } from '../settings/SettingsManager';
 import { BoardGridMetrics, createClamshellStoneTexture, createSlateStoneTexture } from './ProceduralTextures';
 import { BowlAnchor } from './GobanBuilder';
 import {
@@ -105,6 +105,10 @@ export class StonePhysicsAnimator {
 
   private bowlStonesBlack: BowlStoneVisual[] = [];
   private bowlStonesWhite: BowlStoneVisual[] = [];
+  private bowlAwakeTimerBlack = 0;
+  private bowlAwakeTimerWhite = 0;
+  private slateTex: THREE.CanvasTexture;
+  private shellTex: THREE.CanvasTexture;
 
   private boardStones = new Map<number, ActiveBoardStone>();
   private flyingPrisoners: FlyingPrisoner[] = [];
@@ -163,25 +167,33 @@ export class StonePhysicsAnimator {
       },
     });
 
-    const slateTex = createSlateStoneTexture();
-    const shellTex = createClamshellStoneTexture();
+    this.slateTex = createSlateStoneTexture(true);
+    this.shellTex = createClamshellStoneTexture(true);
 
     this.blackMat = new THREE.MeshPhysicalMaterial({
-      map: slateTex,
+      map: this.slateTex,
       color: 0x1a1c20,
-      roughness: 0.27,
+      roughness: 0.25,
       metalness: 0.04,
-      clearcoat: 0.34,
-      clearcoatRoughness: 0.26,
+      clearcoat: 0.44,
+      clearcoatRoughness: 0.22,
+      sheen: 0.22,
+      sheenRoughness: 0.38,
+      sheenColor: new THREE.Color(0xd8e0ef),
     });
 
     this.whiteMat = new THREE.MeshPhysicalMaterial({
-      map: shellTex,
+      map: this.shellTex,
       color: 0xfbf9f3,
-      roughness: 0.14,
+      roughness: 0.13,
       metalness: 0.02,
-      clearcoat: 0.68,
-      clearcoatRoughness: 0.12,
+      clearcoat: 0.82,
+      clearcoatRoughness: 0.09,
+      iridescence: 0.36,
+      iridescenceIOR: 1.38,
+      sheen: 0.35,
+      sheenRoughness: 0.25,
+      sheenColor: new THREE.Color(0xfff6e8),
     });
 
     this.deadBlackMat = this.blackMat.clone();
@@ -193,6 +205,36 @@ export class StonePhysicsAnimator {
     this.deadWhiteMat.opacity = 0.42;
 
     this.populateBowlStones();
+  }
+
+  public applyVisualQuality(quality: VisualQuality, maxAnisotropy: number): void {
+    const safeAniso = Math.max(1, Math.min(16, maxAnisotropy));
+    this.slateTex.anisotropy = safeAniso;
+    this.shellTex.anisotropy = safeAniso;
+    this.slateTex.needsUpdate = true;
+    this.shellTex.needsUpdate = true;
+
+    if (quality === 'ultra') {
+      this.whiteMat.iridescence = 0.38;
+      this.whiteMat.sheen = 0.38;
+      this.whiteMat.clearcoat = 0.86;
+      this.blackMat.sheen = 0.24;
+      this.blackMat.clearcoat = 0.48;
+    } else if (quality === 'high') {
+      this.whiteMat.iridescence = 0.18;
+      this.whiteMat.sheen = 0.2;
+      this.whiteMat.clearcoat = 0.72;
+      this.blackMat.sheen = 0.12;
+      this.blackMat.clearcoat = 0.36;
+    } else {
+      this.whiteMat.iridescence = 0;
+      this.whiteMat.sheen = 0;
+      this.whiteMat.clearcoat = 0.45;
+      this.blackMat.sheen = 0;
+      this.blackMat.clearcoat = 0.25;
+    }
+    this.whiteMat.needsUpdate = true;
+    this.blackMat.needsUpdate = true;
   }
 
   public setMotionStyle(style: StoneMotionStyle): void {
@@ -225,24 +267,18 @@ export class StonePhysicsAnimator {
       for (let i = 0; i < count; i++) {
         const layer = Math.floor(i / 12);
         const idxInLayer = i % 12;
-        const ringR = idxInLayer === 0 ? 0.0 : idxInLayer < 5 ? 0.15 : 0.285;
+        const ringR = idxInLayer === 0 ? 0.0 : idxInLayer < 5 ? 0.16 : 0.29;
         const angle = idxInLayer * 1.65 + layer * 0.9;
 
-        const rx = Math.cos(angle) * ringR + (Math.random() - 0.5) * 0.03;
-        const rz = Math.sin(angle) * ringR + (Math.random() - 0.5) * 0.03;
+        const rx = Math.cos(angle) * ringR + (Math.random() - 0.5) * 0.025;
+        const rz = Math.sin(angle) * ringR + (Math.random() - 0.5) * 0.025;
         const ry = anchor.stonePileOrigin.y - 0.12 + layer * 0.068 + (1 - ringR) * 0.03;
 
         const mesh = new THREE.Mesh(this.stoneGeo, mat);
         mesh.scale.setScalar(bowlStoneRadius);
-        mesh.position.set(
-          anchor.stonePileOrigin.x + rx,
-          ry,
-          anchor.stonePileOrigin.z + rz
-        );
         const baseRotY = Math.random() * Math.PI * 2;
-        const rotX = (Math.random() - 0.5) * 0.48;
-        const rotZ = (Math.random() - 0.5) * 0.48;
-        mesh.rotation.set(rotX, baseRotY, rotZ);
+        const rotX = (Math.random() - 0.5) * 0.42;
+        const rotZ = (Math.random() - 0.5) * 0.42;
         mesh.castShadow = true;
         mesh.receiveShadow = true;
         this.parent.add(mesh);
@@ -263,31 +299,71 @@ export class StonePhysicsAnimator {
             rotX,
             rotY: baseRotY,
             rotZ,
+            restRotX: rotX,
+            restRotZ: rotZ,
             angVx: 0,
             angVz: 0,
           },
         });
       }
+
+      // Deterministic static relaxation at startup so stones begin in settled equilibrium
+      const particles = items.map((v) => v.particle);
+      for (let iter = 0; iter < 30; iter++) {
+        this.physicsWorld.stepContainerStones(particles, 0.02, 0.36, bowlStoneRadius, 0.045);
+      }
+      for (const it of items) {
+        const p = it.particle;
+        p.vx = 0;
+        p.vy = 0;
+        p.vz = 0;
+        p.angVx = 0;
+        p.angVz = 0;
+        p.restX = p.x;
+        p.restY = p.y;
+        p.restZ = p.z;
+        p.restRotX = p.rotX;
+        p.restRotZ = p.rotZ;
+        it.mesh.position.set(anchor.stonePileOrigin.x + p.x, p.y, anchor.stonePileOrigin.z + p.z);
+        it.mesh.rotation.set(p.rotX, it.baseRotY, p.rotZ);
+      }
+
       return items;
     };
 
     this.bowlStonesBlack = buildPile(this.blackBowl, BLACK);
     this.bowlStonesWhite = buildPile(this.whiteBowl, WHITE);
+    this.bowlAwakeTimerBlack = 0;
+    this.bowlAwakeTimerWhite = 0;
+  }
+
+  public isBowlAwake(which: 'black' | 'white'): boolean {
+    return which === 'black' ? this.bowlAwakeTimerBlack > 0 : this.bowlAwakeTimerWhite > 0;
+  }
+
+  public getBowlStones(which: 'black' | 'white'): ReadonlyArray<BowlStoneVisual> {
+    return which === 'black' ? this.bowlStonesBlack : this.bowlStonesWhite;
   }
 
   public stirBowl(which: 'black' | 'white', intensity = 0.8, playSound = true): void {
     const items = which === 'black' ? this.bowlStonesBlack : this.bowlStonesWhite;
     const clamped = Math.max(0.25, Math.min(1.25, intensity));
 
+    if (which === 'black') {
+      this.bowlAwakeTimerBlack = 0.92;
+    } else {
+      this.bowlAwakeTimerWhite = 0.92;
+    }
+
     for (let i = 0; i < items.length; i++) {
       const layerFactor = 0.4 + (i / items.length) * 0.85;
       const amp = 0.095 * clamped * layerFactor;
       const p = items[i].particle;
       p.vx += (Math.random() - 0.5) * amp * 13;
-      p.vy += Math.random() * amp * 9;
+      p.vy += Math.random() * amp * 8;
       p.vz += (Math.random() - 0.5) * amp * 13;
-      p.angVx += (Math.random() - 0.5) * clamped * 10;
-      p.angVz += (Math.random() - 0.5) * clamped * 10;
+      p.angVx += (Math.random() - 0.5) * clamped * 9;
+      p.angVz += (Math.random() - 0.5) * clamped * 9;
     }
 
     if (playSound) {
@@ -316,11 +392,10 @@ export class StonePhysicsAnimator {
 
     this.removeBoardStoneImmediate(idx);
 
-    const whichBowl = color === BLACK ? 'black' : 'white';
     const bowlAnchor = color === BLACK ? this.blackBowl : this.whiteBowl;
     const side = color === BLACK ? 'right' : 'left';
 
-    this.stirBowl(whichBowl, 0.42, false);
+    // Keep bowl stones strictly still during normal board moves; only play subtle pickup sound
     this.audio.playStonePickup(side, color === BLACK);
 
     const restWorld = this.gridToWorld(x, y);
@@ -731,22 +806,70 @@ export class StonePhysicsAnimator {
   public update(dt: number): void {
     const clampedDt = Math.min(0.05, dt);
 
-    // 1. N-body bowl stone dynamics inside jujube bowls
-    const stepBowl = (items: BowlStoneVisual[], anchor: BowlAnchor) => {
+    // 1. Touch-only bowl stone dynamics inside jujube bowls (zero motion unless stirred)
+    const stepBowl = (
+      items: BowlStoneVisual[],
+      anchor: BowlAnchor,
+      timer: number
+    ): number => {
+      if (timer <= 0) return 0;
+
+      const nextTimer = Math.max(0, timer - clampedDt);
       const particles = items.map((v) => v.particle);
       this.physicsWorld.stepContainerStones(particles, clampedDt, 0.36, 0.104, 0.045);
+
+      const dampingTail = nextTimer < 0.25 ? Math.max(0, nextTimer / 0.25) : 1;
       for (let i = 0; i < items.length; i++) {
         const it = items[i];
+        const p = it.particle;
+        if (nextTimer <= 0) {
+          p.x = p.restX;
+          p.y = p.restY;
+          p.z = p.restZ;
+          p.vx = 0;
+          p.vy = 0;
+          p.vz = 0;
+          p.rotX = p.restRotX;
+          p.rotZ = p.restRotZ;
+          p.angVx = 0;
+          p.angVz = 0;
+        } else if (dampingTail < 1) {
+          p.vx *= 0.8;
+          p.vy *= 0.8;
+          p.vz *= 0.8;
+          p.angVx *= 0.8;
+          p.angVz *= 0.8;
+          p.x = p.restX + (p.x - p.restX) * dampingTail;
+          p.y = p.restY + (p.y - p.restY) * dampingTail;
+          p.z = p.restZ + (p.z - p.restZ) * dampingTail;
+          p.rotX = p.restRotX + (p.rotX - p.restRotX) * dampingTail;
+          p.rotZ = p.restRotZ + (p.rotZ - p.restRotZ) * dampingTail;
+        }
+
         it.mesh.position.set(
-          anchor.stonePileOrigin.x + it.particle.x,
-          it.particle.y,
-          anchor.stonePileOrigin.z + it.particle.z
+          anchor.stonePileOrigin.x + p.x,
+          p.y,
+          anchor.stonePileOrigin.z + p.z
         );
-        it.mesh.rotation.set(it.particle.rotX, it.baseRotY, it.particle.rotZ);
+        it.mesh.rotation.set(p.rotX, it.baseRotY, p.rotZ);
       }
+      return nextTimer;
     };
-    stepBowl(this.bowlStonesBlack, this.blackBowl);
-    stepBowl(this.bowlStonesWhite, this.whiteBowl);
+
+    if (this.bowlAwakeTimerBlack > 0) {
+      this.bowlAwakeTimerBlack = stepBowl(
+        this.bowlStonesBlack,
+        this.blackBowl,
+        this.bowlAwakeTimerBlack
+      );
+    }
+    if (this.bowlAwakeTimerWhite > 0) {
+      this.bowlAwakeTimerWhite = stepBowl(
+        this.bowlStonesWhite,
+        this.whiteBowl,
+        this.bowlAwakeTimerWhite
+      );
+    }
 
     // 2. Sub-stepped 2.5D rigid-body board stones (motion arc, impact bounce, neighbor clinks)
     this.bodiesScratch.length = 0;

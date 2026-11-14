@@ -48,6 +48,8 @@ export interface BowlPhysicsParticle {
   rotX: number;
   rotY: number;
   rotZ: number;
+  restRotX: number;
+  restRotZ: number;
   angVx: number;
   angVz: number;
 }
@@ -594,9 +596,9 @@ export class StonePhysicsWorld {
     const maxR = Math.max(stoneRadius, containerRadius - stoneRadius * 0.9);
     for (let i = 0; i < n; i++) {
       const p = particles[i];
-      const fx = (p.restX - p.x) * 28 - p.vx * 11;
-      const fy = (p.restY - p.y) * 170 - p.vy * 14;
-      const fz = (p.restZ - p.z) * 28 - p.vz * 11;
+      const fx = (p.restX - p.x) * 34 - p.vx * 14;
+      const fy = (p.restY - p.y) * 185 - p.vy * 18;
+      const fz = (p.restZ - p.z) * 34 - p.vz * 14;
 
       p.vx += fx * dt;
       p.vy += fy * dt;
@@ -611,18 +613,18 @@ export class StonePhysicsWorld {
         const s = maxR / r;
         p.x *= s;
         p.z *= s;
-        p.vx *= -0.35;
-        p.vz *= -0.35;
+        p.vx *= -0.3;
+        p.vz *= -0.3;
       }
 
-      const dishFloor = p.restY + (r / maxR) ** 2 * dishCurve;
-      if (p.y < dishFloor - 0.008) {
-        p.y = dishFloor - 0.008;
-        if (p.vy < 0) p.vy = -p.vy * 0.25;
+      const dishFloor = p.restY - 0.014 + (r / maxR) ** 2 * dishCurve * 0.2;
+      if (p.y < dishFloor) {
+        p.y = dishFloor;
+        if (p.vy < 0) p.vy = -p.vy * 0.22;
       }
 
-      p.angVx += (-p.rotX * 140 - p.angVx * 15) * dt;
-      p.angVz += (-p.rotZ * 140 - p.angVz * 15) * dt;
+      p.angVx += ((p.restRotX - p.rotX) * 145 - p.angVx * 18) * dt;
+      p.angVz += ((p.restRotZ - p.rotZ) * 145 - p.angVz * 18) * dt;
       p.rotX += p.angVx * dt;
       p.rotZ += p.angVz * dt;
     }

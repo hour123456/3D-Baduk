@@ -11,10 +11,16 @@ import {
 } from './types';
 import { inspectChain } from './GoEngine';
 
+/**
+ * Computes radiological influence field across the board (+ for Black, - for White)
+ * and combines chain liberties, size, and surroundedness to automatically mark dead stones
+ * when entering the scoring phase.
+ */
 export function estimateDeadStones(board: Uint8Array, size: BoardSize): Uint8Array {
   const total = size * size;
   const deadMask = new Uint8Array(total);
 
+  // Build smoothed influence field (Bouzy 5-step dilation)
   let field = new Float32Array(total);
   for (let i = 0; i < total; i++) {
     if (board[i] === BLACK) field[i] = 16;
@@ -47,12 +53,14 @@ export function estimateDeadStones(board: Uint8Array, size: BoardSize): Uint8Arr
     const chain = inspectChain(board, size, idx);
     for (const s of chain.stones) visited[s] = 1;
 
+    // Large chains (>= 7 stones) or chains with >= 5 liberties are practically alive unless completely hopeless
     if (chain.stones.length >= 8 || chain.liberties.size >= 5) {
       continue;
     }
 
+    // Count eye-like enclosed liberties & surrounding influence around the chain's liberties
     let friendlyInfluenceSum = 0;
-    const libertyCount = chain.liberties.size;
+    let libertyCount = chain.liberties.size;
     const sign = color === BLACK ? 1 : -1;
     const opp = opponentColor(color);
 
@@ -60,6 +68,7 @@ export function estimateDeadStones(board: Uint8Array, size: BoardSize): Uint8Arr
     let friendlyExtendedSpace = 0;
     const seenSpace = new Uint8Array(total);
 
+    // Flood up to depth 3 through empty cells from this chain to measure living room
     const queue: Array<{ cell: number; dist: number }> = [];
     for (const lib of chain.liberties) {
       seenSpace[lib] = 1;
@@ -91,6 +100,9 @@ export function estimateDeadStones(board: Uint8Array, size: BoardSize): Uint8Arr
 
     const avgLibInfluence = libertyCount > 0 ? friendlyInfluenceSum / libertyCount : -10;
 
+    // Heuristic criteria for dead isolated stones/small groups trapped in opponent territory:
+    // 1) In atari (1 liberty) and small (<= 4 stones) with strong hostile influence
+    // 2) Small chain (<= 4 stones) with very small enclosed space (< 5) surrounded heavily by opponent
     const clearlyDead =
       (libertyCount === 1 && chain.stones.length <= 4 && avgLibInfluence < 1.5) ||
       (chain.stones.length <= 3 && friendlyExtendedSpace <= 4 && avgLibInfluence < -2.2 && oppNeighborStones >= 3) ||
@@ -106,6 +118,9 @@ export function estimateDeadStones(board: Uint8Array, size: BoardSize): Uint8Arr
   return deadMask;
 }
 
+/**
+ * Toggles the dead/alive state of the connected stone chain at (x, y).
+ */
 export function toggleDeadChainAt(
   board: Uint8Array,
   size: BoardSize,
@@ -138,6 +153,7 @@ export function calculateScore(params: {
   const total = size * size;
   const deadStoneMask = params.deadStoneMask ? new Uint8Array(params.deadStoneMask) : new Uint8Array(total);
 
+  // Build effective board with dead stones removed
   const effective = new Uint8Array(board);
   let deadBlackStones = 0;
   let deadWhiteStones = 0;
@@ -163,6 +179,7 @@ export function calculateScore(params: {
     }
   }
 
+  // Flood-fill empty regions on effective board
   const visited = new Uint8Array(total);
   const territoryMap = new Int8Array(total);
   let blackTerritory = 0;
@@ -219,9 +236,11 @@ export function calculateScore(params: {
   let whiteTotal: number;
 
   if (ruleset === 'korean') {
+    // Korean / Territory rules: Territory + Prisoners captured during game + Dead opponent stones on board
     blackTotal = blackTerritory + captures.black + deadWhiteStones;
     whiteTotal = whiteTerritory + captures.white + deadBlackStones + komi;
   } else {
+    // Chinese / Area rules: Alive stones on board + Surrounded territory
     blackTotal = blackAliveStones + blackTerritory;
     whiteTotal = whiteAliveStones + whiteTerritory + komi;
   }

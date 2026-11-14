@@ -380,8 +380,8 @@ export function createJujubeWoodTexture(): THREE.CanvasTexture {
 /**
  * Hyuga Clamshell White Stone (일향백석/해남석 조개돌) texture with delicate pearlescent growth striations
  */
-export function createClamshellStoneTexture(): THREE.CanvasTexture {
-  const size = 512;
+export function createClamshellStoneTexture(highRes = true): THREE.CanvasTexture {
+  const size = highRes ? 768 : 512;
   const canvas = document.createElement('canvas');
   canvas.width = size;
   canvas.height = size;
@@ -396,15 +396,16 @@ export function createClamshellStoneTexture(): THREE.CanvasTexture {
       const idx = (py * size + px) * 4;
 
       // Gently curved parallel aragonite shell striations (조개결 줄무늬)
-      const curve = ny + 0.14 * (nx - 0.5) * (nx - 0.5) + fbm2D(nx * 4, ny * 4, 212, 3) * 0.015;
-      const stripe1 = 0.5 + 0.5 * Math.sin(curve * 165);
-      const stripe2 = 0.5 + 0.5 * Math.sin(curve * 72 + 1.1);
-      const subtleBand = stripe1 * 0.6 + stripe2 * 0.4;
+      const curve = ny + 0.14 * (nx - 0.5) * (nx - 0.5) + fbm2D(nx * 4.5, ny * 4.5, 212, 3) * 0.016;
+      const stripe1 = 0.5 + 0.5 * Math.sin(curve * 175);
+      const stripe2 = 0.5 + 0.5 * Math.sin(curve * 78 + 1.1);
+      const fineRipple = 0.5 + 0.5 * Math.sin(curve * 310 + nx * 6.0);
+      const subtleBand = stripe1 * 0.5 + stripe2 * 0.35 + fineRipple * 0.15;
 
-      // Warm milky ivory-white (#f7f4ed -> #ebe5d8)
-      const r = Math.min(255, 248 - subtleBand * 8);
-      const g = Math.min(255, 244 - subtleBand * 9);
-      const b = Math.min(255, 236 - subtleBand * 12);
+      // Warm milky ivory-white with delicate aragonite shimmer
+      const r = Math.min(255, 249 - subtleBand * 9);
+      const g = Math.min(255, 245 - subtleBand * 10 + (1 - stripe1) * 1.5);
+      const b = Math.min(255, 237 - subtleBand * 12 + stripe2 * 2);
 
       data[idx] = r;
       data[idx + 1] = g;
@@ -422,8 +423,8 @@ export function createClamshellStoneTexture(): THREE.CanvasTexture {
 /**
  * Nachi Black Slate Stone (나치흑석 오석) micro-crystalline satin texture
  */
-export function createSlateStoneTexture(): THREE.CanvasTexture {
-  const size = 512;
+export function createSlateStoneTexture(highRes = true): THREE.CanvasTexture {
+  const size = highRes ? 768 : 512;
   const canvas = document.createElement('canvas');
   canvas.width = size;
   canvas.height = size;
@@ -438,12 +439,12 @@ export function createSlateStoneTexture(): THREE.CanvasTexture {
       const idx = (py * size + px) * 4;
 
       const micro = fbm2D(nx * 28, ny * 28, 313, 3);
-      const sheen = smoothNoise2D(nx * 95, ny * 95, 414);
-      const base = 21 + (micro - 0.5) * 6 + (sheen - 0.5) * 4;
+      const sheen = smoothNoise2D(nx * 110, ny * 110, 414);
+      const base = 19 + (micro - 0.5) * 7 + (sheen - 0.5) * 4.5;
 
-      data[idx] = base;
-      data[idx + 1] = base + 1;
-      data[idx + 2] = base + 3; // Faint cool blue-charcoal slate undertone
+      data[idx] = Math.max(0, base);
+      data[idx + 1] = Math.max(0, base + 1.5);
+      data[idx + 2] = Math.max(0, base + 4); // Faint cool blue-charcoal slate undertone
       data[idx + 3] = 255;
     }
   }
@@ -537,6 +538,117 @@ export function createMaruFloorTexture(): THREE.CanvasTexture {
   }
 
   ctx.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(3, 3);
+  return tex;
+}
+
+/**
+ * Korean Mother-of-Pearl Lacquerware Inlay (나전칠기 매화·운문 자개 상감) texture
+ */
+export function createMotherOfPearlTexture(): THREE.CanvasTexture {
+  const size = 512;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d')!;
+
+  // Deep glossy ottchil black lacquer base
+  const bg = ctx.createRadialGradient(256, 256, 30, 256, 256, 360);
+  bg.addColorStop(0, '#18100d');
+  bg.addColorStop(1, '#090605');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, size, size);
+
+  // Subtle gold hairline border (금사 경계선)
+  ctx.strokeStyle = 'rgba(224, 182, 102, 0.78)';
+  ctx.lineWidth = 4;
+  ctx.strokeRect(18, 18, size - 36, size - 36);
+  ctx.strokeStyle = 'rgba(224, 182, 102, 0.35)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(28, 28, size - 56, size - 56);
+
+  // Stylized flowering branch & pearl blossoms (매화 가지 & 오색 자개 꽃잎)
+  ctx.strokeStyle = '#c89b52';
+  ctx.lineWidth = 3.2;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(64, 420);
+  ctx.quadraticCurveTo(180, 310, 290, 230);
+  ctx.quadraticCurveTo(370, 170, 442, 118);
+  ctx.moveTo(215, 290);
+  ctx.quadraticCurveTo(175, 200, 145, 132);
+  ctx.moveTo(318, 208);
+  ctx.quadraticCurveTo(375, 225, 424, 260);
+  ctx.stroke();
+
+  const drawNacreBlossom = (cx: number, cy: number, radius: number, hueOffset: number) => {
+    const grad = ctx.createLinearGradient(cx - radius, cy - radius, cx + radius, cy + radius);
+    grad.addColorStop(0, `hsla(${175 + hueOffset}, 72%, 80%, 0.92)`);
+    grad.addColorStop(0.45, `hsla(${285 + hueOffset}, 62%, 82%, 0.88)`);
+    grad.addColorStop(1, `hsla(${48 + hueOffset}, 80%, 84%, 0.94)`);
+    ctx.fillStyle = grad;
+
+    for (let i = 0; i < 5; i++) {
+      const a = (i * Math.PI * 2) / 5 - Math.PI / 2;
+      const px = cx + Math.cos(a) * radius * 0.62;
+      const py = cy + Math.sin(a) * radius * 0.62;
+      ctx.beginPath();
+      ctx.ellipse(px, py, radius * 0.48, radius * 0.32, a, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.fillStyle = '#f5d27a';
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius * 0.18, 0, Math.PI * 2);
+    ctx.fill();
+  };
+
+  drawNacreBlossom(152, 138, 24, 0);
+  drawNacreBlossom(272, 240, 28, 25);
+  drawNacreBlossom(346, 174, 22, -18);
+  drawNacreBlossom(422, 122, 18, 40);
+  drawNacreBlossom(416, 254, 20, 12);
+  drawNacreBlossom(118, 355, 19, -30);
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 8;
+  return tex;
+}
+
+/**
+ * Woven Korean Silk Cushion Brocade (비단 대국 방석 직조 텍스처)
+ */
+export function createSilkBrocadeTexture(isBlackSide: boolean): THREE.CanvasTexture {
+  const size = 256;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d')!;
+
+  ctx.fillStyle = isBlackSide ? '#2b2024' : '#263230';
+  ctx.fillRect(0, 0, size, size);
+
+  ctx.strokeStyle = isBlackSide ? 'rgba(218, 174, 98, 0.16)' : 'rgba(196, 214, 178, 0.16)';
+  ctx.lineWidth = 1.2;
+  const step = 32;
+  for (let y = 0; y <= size; y += step) {
+    for (let x = 0; x <= size; x += step) {
+      ctx.beginPath();
+      ctx.arc(x, y, 12, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(x - 16, y);
+      ctx.lineTo(x + 16, y);
+      ctx.moveTo(x, y - 16);
+      ctx.lineTo(x, y + 16);
+      ctx.stroke();
+    }
+  }
+
   const tex = new THREE.CanvasTexture(canvas);
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.wrapS = THREE.RepeatWrapping;

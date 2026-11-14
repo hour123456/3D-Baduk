@@ -3,6 +3,7 @@ export type PlacementInputMode = 'auto' | 'instant' | 'confirm' | 'double_tap';
 export type EffectiveInputMode = 'instant' | 'confirm' | 'double_tap';
 export type PhysicsIntensity = 'realistic' | 'subtle' | 'minimal';
 export type LightingTheme = 'hanok_warm' | 'studio_bright' | 'night_lantern';
+export type VisualQuality = 'ultra' | 'high' | 'standard';
 
 export interface UserSettings {
   stoneMotionStyle: StoneMotionStyle;
@@ -13,11 +14,18 @@ export interface UserSettings {
   touchLoupeEnabled: boolean;
   physicsIntensity: PhysicsIntensity;
   lightingTheme: LightingTheme;
+  visualQuality: VisualQuality;
+  bloomEnabled: boolean;
+  ornateFinishEnabled: boolean;
   showCoordinates: boolean;
   showMoveNumbers: boolean;
   showForbiddenPoints: boolean;
   soundVolume: number;
   soundMuted: boolean;
+}
+
+export function getDefaultVisualQuality(): VisualQuality {
+  return isMobileOrTouchViewport() ? 'high' : 'ultra';
 }
 
 export const DEFAULT_USER_SETTINGS: UserSettings = {
@@ -29,6 +37,9 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   touchLoupeEnabled: true,
   physicsIntensity: 'realistic',
   lightingTheme: 'hanok_warm',
+  visualQuality: 'ultra',
+  bloomEnabled: true,
+  ornateFinishEnabled: true,
   showCoordinates: true,
   showMoveNumbers: false,
   showForbiddenPoints: true,
@@ -42,6 +53,7 @@ const VALID_MOTIONS = new Set<StoneMotionStyle>(['realistic', 'classic_bowl', 'i
 const VALID_INPUTS = new Set<PlacementInputMode>(['auto', 'instant', 'confirm', 'double_tap']);
 const VALID_PHYSICS = new Set<PhysicsIntensity>(['realistic', 'subtle', 'minimal']);
 const VALID_THEMES = new Set<LightingTheme>(['hanok_warm', 'studio_bright', 'night_lantern']);
+const VALID_QUALITIES = new Set<VisualQuality>(['ultra', 'high', 'standard']);
 
 export function isMobileOrTouchViewport(): boolean {
   if (typeof window === 'undefined') return false;
@@ -60,8 +72,15 @@ export function resolveEffectiveInputMode(mode: PlacementInputMode): EffectiveIn
   return mode;
 }
 
+function createPlatformDefaults(): UserSettings {
+  return {
+    ...DEFAULT_USER_SETTINGS,
+    visualQuality: getDefaultVisualQuality(),
+  };
+}
+
 function sanitizeSettings(raw: Partial<UserSettings> | null | undefined): UserSettings {
-  const base: UserSettings = { ...DEFAULT_USER_SETTINGS };
+  const base: UserSettings = createPlatformDefaults();
   if (!raw || typeof raw !== 'object') return base;
 
   if (raw.stoneMotionStyle && VALID_MOTIONS.has(raw.stoneMotionStyle)) {
@@ -84,6 +103,11 @@ function sanitizeSettings(raw: Partial<UserSettings> | null | undefined): UserSe
   if (raw.lightingTheme && VALID_THEMES.has(raw.lightingTheme)) {
     base.lightingTheme = raw.lightingTheme;
   }
+  if (raw.visualQuality && VALID_QUALITIES.has(raw.visualQuality)) {
+    base.visualQuality = raw.visualQuality;
+  }
+  if (typeof raw.bloomEnabled === 'boolean') base.bloomEnabled = raw.bloomEnabled;
+  if (typeof raw.ornateFinishEnabled === 'boolean') base.ornateFinishEnabled = raw.ornateFinishEnabled;
   if (typeof raw.showCoordinates === 'boolean') base.showCoordinates = raw.showCoordinates;
   if (typeof raw.showMoveNumbers === 'boolean') base.showMoveNumbers = raw.showMoveNumbers;
   if (typeof raw.showForbiddenPoints === 'boolean') {
@@ -108,14 +132,14 @@ export class SettingsManager {
   private loadFromStorage(): UserSettings {
     try {
       if (typeof window === 'undefined' || !window.localStorage) {
-        return { ...DEFAULT_USER_SETTINGS };
+        return createPlatformDefaults();
       }
       const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (!raw) return { ...DEFAULT_USER_SETTINGS };
+      if (!raw) return createPlatformDefaults();
       const parsed = JSON.parse(raw) as Partial<UserSettings>;
       return sanitizeSettings(parsed);
     } catch {
-      return { ...DEFAULT_USER_SETTINGS };
+      return createPlatformDefaults();
     }
   }
 
@@ -143,7 +167,7 @@ export class SettingsManager {
   }
 
   public resetDefaults(): UserSettings {
-    return this.update({ ...DEFAULT_USER_SETTINGS });
+    return this.update(createPlatformDefaults());
   }
 
   public subscribe(listener: (settings: UserSettings) => void): () => void {

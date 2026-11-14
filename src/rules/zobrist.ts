@@ -2,6 +2,7 @@ import { BoardSize, PlayerColor, StoneColor, BLACK, WHITE } from './types';
 
 const MAX_CELLS = 19 * 19;
 
+// Deterministic SplitMix64 generator so hashes are reproducible across threads & sessions
 class SplitMix64 {
   private state: bigint;
 
@@ -20,6 +21,7 @@ class SplitMix64 {
 
 const rng = new SplitMix64(0x2026bad0c3d9a7f1n);
 
+// [cellIndex * 2 + (color - 1)] -> 64-bit random key
 const ZOBRIST_TABLE: BigUint64Array = new BigUint64Array(MAX_CELLS * 2);
 for (let i = 0; i < MAX_CELLS * 2; i++) {
   ZOBRIST_TABLE[i] = rng.next();

@@ -10,10 +10,10 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1480,
     height: 940,
-    minWidth: 1080,
-    minHeight: 720,
+    minWidth: 1024,
+    minHeight: 680,
     backgroundColor: '#14100c',
-    title: '3D 정통 바둑 — 수담(手談)',
+    title: '3D 정통 바둑 — 수담(手談) v3.0',
     autoHideMenuBar: true,
     show: false,
     webPreferences: {
@@ -24,12 +24,17 @@ function createWindow() {
     },
   });
 
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+
   const isDev = !app.isPackaged && process.env.ELECTRON_START_URL !== 'file';
   const devServerUrl = process.env.VITE_DEV_SERVER_URL || 'http://localhost:5173';
 
   if (isDev && process.argv.includes('--dev-server')) {
     mainWindow.loadURL(devServerUrl);
+  } else if (!app.isPackaged && !fs.stat(path.join(__dirname, '../dist/index.html')).catch(() => null)) {
+    mainWindow.loadURL(devServerUrl);
   } else {
+    // Check if dev server is explicitly requested via env, else prefer dist if built or dev URL
     const distIndex = path.join(__dirname, '../dist/index.html');
     fs.access(distIndex)
       .then(() => {

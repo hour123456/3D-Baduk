@@ -1,6 +1,11 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
+import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
 import {
   BLACK,
   WHITE,
@@ -14,7 +19,7 @@ import {
 import { coordToLabel } from '../rules/GoEngine';
 import type { AISuggestion } from '../ai/MctsEngine';
 import { AcousticStoneAudioEngine } from '../audio/AcousticStoneAudioEngine';
-import type { LightingTheme } from '../settings/SettingsManager';
+import type { LightingTheme, VisualQuality } from '../settings/SettingsManager';
 import { BoardGridMetrics, getBoardMetrics } from './ProceduralTextures';
 import { BuiltRoomAssets, buildTraditionalBadukRoom } from './GobanBuilder';
 import { StonePhysicsAnimator, createBiconvexStoneGeometry } from './StonePhysicsAnimator';
@@ -39,6 +44,16 @@ export interface SceneCallbacks {
 export class SceneManager {
   private container: HTMLElement;
   private renderer: THREE.WebGLRenderer;
+  private composer!: EffectComposer;
+  private renderPass!: RenderPass;
+  private bloomPass!: UnrealBloomPass;
+  private outputPass!: OutputPass;
+  private smaaPass!: SMAAPass;
+  private usePostProcessing = true;
+  private currentQuality: VisualQuality = 'ultra';
+  private bloomEnabled = true;
+  private ornateEnabled = true;
+
   private scene: THREE.Scene;
   private perspectiveCamera: THREE.PerspectiveCamera;
   private orthoCamera: THREE.OrthographicCamera;
@@ -63,6 +78,7 @@ export class SceneManager {
   private pointerDownPos = new THREE.Vector2();
   private lastHoveredCoordKey = '';
   private lastBowlHoverMs = 0;
+  private pointerDownOnBowl = false;
 
   // Touch guard & Magnifier Loupe state
   private activePointers = new Set<number>();
@@ -325,6 +341,31 @@ export class SceneManager {
     this.loupeCtx = this.loupeCanvas.getContext('2d')!;
     container.appendChild(this.loupeCanvas);
 
+    // 7. Post-processing Pipeline (HDR HalfFloat + Subtle Cinematic Bloom + ToneMapping Output + SMAA)
+    const w = Math.max(1, container.clientWidth);
+    const h = Math.max(1, container.clientHeight);
+    const rt = new THREE.WebGLRenderTarget(w, h, {
+      type: THREE.HalfFloatType,
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
+    });
+    this.composer = new EffectComposer(this.renderer, rt);
+    this.composer.setPixelRatio(this.renderer.getPixelRatio());
+    this.composer.setSize(w, h);
+
+    this.renderPass = new RenderPass(this.scene, this.activeCamera);
+    this.bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), 0.22, 0.5, 0.88);
+    this.outputPass = new OutputPass();
+    this.smaaPass = new SMAAPass(
+      w * this.renderer.getPixelRatio(),
+      h * this.renderer.getPixelRatio()
+    );
+
+    this.composer.addPass(this.renderPass);
+    this.composer.addPass(this.bloomPass);
+    this.composer.addPass(this.outputPass);
+    this.composer.addPass(this.smaaPass);
+
     this.bindEvents();
     this.animate();
   }
@@ -351,6 +392,60 @@ export class SceneManager {
     this.lanternFill = new THREE.DirectionalLight(0xffd7a3, 0.72);
     this.lanternFill.position.set(4.5, 4.2, 4.8);
     this.scene.add(this.lanternFill);
+  }
+
+  public setVisualQuality(
+    quality: VisualQuality,
+    bloomEnabled: boolean,
+    ornateEnabled: boolean
+  ): void {
+    this.currentQuality = quality;
+    this.bloomEnabled = bloomEnabled;
+    this.ornateEnabled = ornateEnabled;
+
+    const maxDevicePr = Math.max(1, window.devicePixelRatio || 1);
+    const pr =
+      quality === 'ultra'
+        ? Math.min(maxDevicePr, 2.0)
+        : quality === 'high'
+          ? Math.min(maxDevicePr, 1.6)
+          : Math.min(maxDevicePr, 1.15);
+
+    this.renderer.setPixelRatio(pr);
+    const w = Math.max(1, this.container.clientWidth);
+    const h = Math.max(1, this.container.clientHeight);
+    this.renderer.setSize(w, h);
+    this.composer.setPixelRatio(pr);
+    this.composer.setSize(w, h);
+    this.bloomPass.resolution.set(w, h);
+
+    // Shadow map resolution scaling
+    const targetShadow = quality === 'ultra' ? 4096 : quality === 'high' ? 2048 : 1024;
+    if (this.sunLight.shadow.mapSize.x !== targetShadow) {
+      this.sunLight.shadow.mapSize.set(targetShadow, targetShadow);
+      if (this.sunLight.shadow.map) {
+        this.sunLight.shadow.map.dispose();
+        (this.sunLight.shadow as { map: THREE.WebGLRenderTarget | null }).map = null;
+      }
+    }
+
+    // Anisotropy scaling
+    const capAniso = Math.max(1, this.renderer.capabilities.getMaxAnisotropy());
+    const targetAniso =
+      quality === 'ultra'
+        ? Math.min(16, capAniso)
+        : quality === 'high'
+          ? Math.min(8, capAniso)
+          : Math.min(2, capAniso);
+
+    this.room.setTextureAnisotropy(targetAniso);
+    this.room.setOrnateFinish(this.ornateEnabled);
+    this.stoneAnimator.applyVisualQuality(quality, targetAniso);
+
+    // Post-processing control (Bloom & SMAA)
+    this.bloomPass.enabled = this.bloomEnabled;
+    this.smaaPass.enabled = quality === 'ultra';
+    this.usePostProcessing = this.bloomEnabled || quality === 'ultra';
   }
 
   public setLightingTheme(theme: LightingTheme): void {
@@ -484,6 +579,7 @@ export class SceneManager {
     if (preset === 'true_top') {
       this.camTransition = null;
       this.activeCamera = this.orthoCamera;
+      this.renderPass.camera = this.activeCamera;
       this.updateOrthoFrustum();
       this.applyOrthoControlConstraints();
       return;
@@ -492,6 +588,7 @@ export class SceneManager {
     // Switching from Ortho back to Perspective camera
     if (this.activeCamera !== this.perspectiveCamera) {
       this.activeCamera = this.perspectiveCamera;
+      this.renderPass.camera = this.activeCamera;
       this.controls.object = this.perspectiveCamera;
       this.controls.enableRotate = true;
       this.controls.enablePan = true;
@@ -876,8 +973,16 @@ export class SceneManager {
         this.multiTouchGuardUntil = performance.now() + 280;
         this.touchDraggingLoupe = false;
         this.loupeCoord = null;
+        this.pointerDownOnBowl = false;
         return;
       }
+
+      this.raycaster.setFromCamera(this.pointerNdc, this.activeCamera);
+      const bowlHits = this.raycaster.intersectObjects(
+        [this.room.blackBowl.bowlCollider, this.room.whiteBowl.bowlCollider],
+        false
+      );
+      this.pointerDownOnBowl = bowlHits.length > 0;
 
       if (e.pointerType === 'touch' && this.touchLoupeEnabled) {
         const coord = this.handlePointerHover();
@@ -890,6 +995,9 @@ export class SceneManager {
 
     const handlePointerEnd = (e: PointerEvent, triggerClick: boolean) => {
       this.activePointers.delete(e.pointerId);
+      if (this.activePointers.size === 0) {
+        this.pointerDownOnBowl = false;
+      }
       this.touchDraggingLoupe = false;
       this.loupeCoord = null;
 
@@ -920,6 +1028,8 @@ export class SceneManager {
       this.perspectiveCamera.updateProjectionMatrix();
       this.updateOrthoFrustum();
       this.renderer.setSize(w, h);
+      this.composer.setSize(w, h);
+      this.bloomPass.resolution.set(w, h);
     });
   }
 
@@ -953,12 +1063,15 @@ export class SceneManager {
     );
     if (bowlHits.length > 0) {
       const side = bowlHits[0].object.userData.bowlSide as 'black' | 'white';
-      const now = performance.now();
-      if (now - this.lastBowlHoverMs > 180) {
-        this.lastBowlHoverMs = now;
-        this.stoneAnimator.stirBowl(side, 0.58, true);
+      // Only rattle bowl stones while actively pressing/dragging on the bowl itself
+      if (this.pointerDownOnBowl && this.activePointers.size === 1) {
+        const now = performance.now();
+        if (now - this.lastBowlHoverMs > 180) {
+          this.lastBowlHoverMs = now;
+          this.stoneAnimator.stirBowl(side, 0.58, true);
+        }
       }
-      this.renderer.domElement.style.cursor = 'grab';
+      this.renderer.domElement.style.cursor = 'pointer';
       this.clearHover();
       return null;
     }
@@ -1120,7 +1233,11 @@ export class SceneManager {
 
     this.stoneAnimator.update(dt);
     this.room.updateAtmosphere(dt, elapsed);
-    this.renderer.render(this.scene, this.activeCamera);
+    if (this.usePostProcessing) {
+      this.composer.render();
+    } else {
+      this.renderer.render(this.scene, this.activeCamera);
+    }
     this.drawTouchLoupeOverlay();
   };
 }

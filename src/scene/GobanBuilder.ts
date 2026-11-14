@@ -5,6 +5,8 @@ import {
   createGobanTopTextures,
   createJujubeWoodTexture,
   createMaruFloorTexture,
+  createMotherOfPearlTexture,
+  createSilkBrocadeTexture,
   createTatamiTexture,
 } from './ProceduralTextures';
 
@@ -22,6 +24,10 @@ export interface BuiltRoomAssets {
   blackBowl: BowlAnchor;
   whiteBowl: BowlAnchor;
   steamParticles: THREE.Points;
+  ornateGroup: THREE.Group;
+  lanternLight: THREE.PointLight;
+  setOrnateFinish: (enabled: boolean) => void;
+  setTextureAnisotropy: (anisotropy: number) => void;
   updateBoardTop: (metrics: BoardGridMetrics, showCoords: boolean) => void;
   updateAtmosphere: (dt: number, elapsed: number) => void;
 }
@@ -38,6 +44,12 @@ export function buildTraditionalBadukRoom(
   const jujubeTex = createJujubeWoodTexture();
   const tatamiTex = createTatamiTexture();
   const maruTex = createMaruFloorTexture();
+  const motherOfPearlTex = createMotherOfPearlTexture();
+  const blackSilkTex = createSilkBrocadeTexture(true);
+  const whiteSilkTex = createSilkBrocadeTexture(false);
+
+  const ornateGroup = new THREE.Group();
+  root.add(ornateGroup);
 
   // 1. Maru Hardwood Floor & Tatami Rush Mat (Y = -2.10)
   const floorY = -2.1;
@@ -68,13 +80,16 @@ export function buildTraditionalBadukRoom(
   root.add(tatamiMat);
 
   // Silk Floor Cushions (비단 대국 방석 - 흑/백)
-  const buildCushion = (zPos: number, colorHex: number) => {
+  const buildCushion = (zPos: number, silkTex: THREE.CanvasTexture) => {
     const cushion = new THREE.Mesh(
       new THREE.CylinderGeometry(0.95, 1.02, 0.14, 32),
-      new THREE.MeshStandardMaterial({
-        color: colorHex,
-        roughness: 0.68,
-        metalness: 0.05,
+      new THREE.MeshPhysicalMaterial({
+        map: silkTex,
+        roughness: 0.58,
+        metalness: 0.04,
+        sheen: 0.6,
+        sheenRoughness: 0.45,
+        sheenColor: new THREE.Color(0xe5c488),
       })
     );
     cushion.scale.set(1.15, 1, 0.92);
@@ -83,8 +98,8 @@ export function buildTraditionalBadukRoom(
     cushion.receiveShadow = true;
     root.add(cushion);
   };
-  buildCushion(3.38, 0x2c221e);
-  buildCushion(-3.38, 0x3b3028);
+  buildCushion(3.38, blackSilkTex);
+  buildCushion(-3.38, whiteSilkTex);
 
   // 2. Backlit Traditional Korean Changhoji / Shoji Screen Wall (Z = -5.6)
   const screenGroup = new THREE.Group();
@@ -412,11 +427,156 @@ export function buildTraditionalBadukRoom(
   );
   root.add(steamParticles);
 
+  // 7. Ornate Korean Craft Finish (황동 두석 · 나전칠기 상감 · 한옥 사방등 · 금빛 햇살 입자)
+  const brassMat = new THREE.MeshStandardMaterial({
+    color: 0xd9ad5b,
+    metalness: 0.86,
+    roughness: 0.24,
+  });
+
+  const nacreMat = new THREE.MeshPhysicalMaterial({
+    map: motherOfPearlTex,
+    roughness: 0.14,
+    metalness: 0.12,
+    clearcoat: 1.0,
+    clearcoatRoughness: 0.06,
+    iridescence: 1.0,
+    iridescenceIOR: 1.44,
+  });
+
+  // 7a. Brass Corner Brackets & Nacre Coasters on Side Stands
+  const addStandOrnaments = (cx: number, cz: number, depthZ: number) => {
+    const hw = 1.48 * 0.5;
+    const hd = depthZ * 0.5;
+    const capGeo = new THREE.BoxGeometry(0.11, 0.095, 0.11);
+    for (const sx of [-1, 1]) {
+      for (const sz of [-1, 1]) {
+        const cap = new THREE.Mesh(capGeo, brassMat);
+        cap.position.set(cx + sx * (hw - 0.045), standTopY - 0.045, cz + sz * (hd - 0.045));
+        ornateGroup.add(cap);
+      }
+    }
+    const inlay = new THREE.Mesh(new THREE.PlaneGeometry(1.18, depthZ - 0.48), nacreMat);
+    inlay.rotation.x = -Math.PI / 2;
+    inlay.position.set(cx, standTopY + 0.0012, cz);
+    inlay.receiveShadow = true;
+    ornateGroup.add(inlay);
+  };
+  addStandOrnaments(3.18, 0.68, 2.85);
+  addStandOrnaments(-3.18, -0.25, 4.15);
+
+  // Brass Collar Trim around Coaster
+  const coasterTrim = new THREE.Mesh(new THREE.TorusGeometry(0.285, 0.012, 10, 32), brassMat);
+  coasterTrim.rotation.x = Math.PI / 2;
+  coasterTrim.position.copy(teaPos).add(new THREE.Vector3(0, 0.036, 0));
+  ornateGroup.add(coasterTrim);
+
+  // Brass Ferrule Rings around Goban Gardenia-Pod Feet
+  const footRingGeo = new THREE.TorusGeometry(0.17, 0.014, 10, 24);
+  for (const [lx, lz] of legOffsets) {
+    const ring = new THREE.Mesh(footRingGeo, brassMat);
+    ring.rotation.x = Math.PI / 2;
+    ring.position.set(lx, floorY + 0.08, lz);
+    ornateGroup.add(ring);
+  }
+
+  // 7b. Traditional Wooden Hanji Stand Lantern (한옥 사방등 + 은은한 조명)
+  const lanternPos = new THREE.Vector3(-3.65, floorY + 0.03, -3.25);
+  const lanternGroup = new THREE.Group();
+  lanternGroup.position.copy(lanternPos);
+
+  const lBase = new THREE.Mesh(new THREE.BoxGeometry(0.56, 0.08, 0.56), frameWoodMat);
+  lBase.position.y = 0.04;
+  lBase.castShadow = true;
+  lanternGroup.add(lBase);
+
+  const lCore = new THREE.Mesh(
+    new THREE.BoxGeometry(0.42, 0.92, 0.42),
+    new THREE.MeshStandardMaterial({
+      color: 0xfef0d4,
+      emissive: new THREE.Color(0xffb662),
+      emissiveIntensity: 1.45,
+      roughness: 0.9,
+    })
+  );
+  lCore.position.y = 0.54;
+  lanternGroup.add(lCore);
+
+  for (const px of [-0.23, 0.23]) {
+    for (const pz of [-0.23, 0.23]) {
+      const post = new THREE.Mesh(new THREE.BoxGeometry(0.045, 1.06, 0.045), frameWoodMat);
+      post.position.set(px, 0.56, pz);
+      post.castShadow = true;
+      lanternGroup.add(post);
+    }
+  }
+  const lCap = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.07, 0.62), frameWoodMat);
+  lCap.position.y = 1.08;
+  lCap.castShadow = true;
+  lanternGroup.add(lCap);
+  ornateGroup.add(lanternGroup);
+
+  const lanternLight = new THREE.PointLight(0xffba6b, 1.25, 10.5, 1.75);
+  lanternLight.position.set(lanternPos.x + 0.15, lanternPos.y + 0.72, lanternPos.z + 0.15);
+  ornateGroup.add(lanternLight);
+
+  // 7c. Floating Golden Sunlit Dust Motes (햇살 속 미세 먼지 입자)
+  const moteCount = 85;
+  const motePositions = new Float32Array(moteCount * 3);
+  const moteBase = new Float32Array(moteCount * 3);
+  for (let i = 0; i < moteCount; i++) {
+    const bx = (Math.random() - 0.5) * 7.8;
+    const by = -0.8 + Math.random() * 4.2;
+    const bz = (Math.random() - 0.5) * 7.2;
+    moteBase[i * 3] = bx;
+    moteBase[i * 3 + 1] = by;
+    moteBase[i * 3 + 2] = bz;
+    motePositions[i * 3] = bx;
+    motePositions[i * 3 + 1] = by;
+    motePositions[i * 3 + 2] = bz;
+  }
+  const moteGeo = new THREE.BufferGeometry();
+  moteGeo.setAttribute('position', new THREE.BufferAttribute(motePositions, 3));
+  const dustMotes = new THREE.Points(
+    moteGeo,
+    new THREE.PointsMaterial({
+      map: puffTex,
+      color: 0xffe4aa,
+      size: 0.075,
+      transparent: true,
+      opacity: 0.42,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    })
+  );
+  ornateGroup.add(dustMotes);
+
+  let ornateEnabled = true;
+  const setOrnateFinish = (enabled: boolean) => {
+    ornateEnabled = enabled;
+    ornateGroup.visible = enabled;
+    lanternLight.intensity = enabled ? 1.25 : 0;
+  };
+
+  const setTextureAnisotropy = (aniso: number) => {
+    const safeAniso = Math.max(1, Math.min(16, aniso));
+    topTexBundle.map.anisotropy = safeAniso;
+    topTexBundle.bumpMap.anisotropy = Math.max(1, Math.floor(safeAniso / 2));
+    topTexBundle.roughnessMap.anisotropy = Math.max(1, Math.floor(safeAniso / 2));
+    tatamiTex.anisotropy = Math.max(1, Math.floor(safeAniso / 2));
+    sideGrainTex.anisotropy = Math.max(1, Math.floor(safeAniso / 2));
+    endGrainTex.anisotropy = Math.max(1, Math.floor(safeAniso / 2));
+    motherOfPearlTex.anisotropy = Math.max(1, Math.floor(safeAniso / 2));
+    topTexBundle.map.needsUpdate = true;
+  };
+
   const updateBoardTop = (metrics: BoardGridMetrics, coordsVisible: boolean) => {
+    const prevAniso = topTexBundle.map.anisotropy;
     topTexBundle.map.dispose();
     topTexBundle.bumpMap.dispose();
     topTexBundle.roughnessMap.dispose();
     topTexBundle = createGobanTopTextures(metrics, coordsVisible);
+    topTexBundle.map.anisotropy = prevAniso;
     topMat.map = topTexBundle.map;
     topMat.bumpMap = topTexBundle.bumpMap;
     topMat.roughnessMap = topTexBundle.roughnessMap;
@@ -439,6 +599,23 @@ export function buildTraditionalBadukRoom(
       );
     }
     posAttr.needsUpdate = true;
+
+    if (ornateEnabled) {
+      const mAttr = moteGeo.getAttribute('position') as THREE.BufferAttribute;
+      for (let i = 0; i < moteCount; i++) {
+        const bx = moteBase[i * 3];
+        const by = moteBase[i * 3 + 1];
+        const bz = moteBase[i * 3 + 2];
+        mAttr.setXYZ(
+          i,
+          bx + Math.sin(elapsed * 0.35 + i * 1.3) * 0.16,
+          by + Math.cos(elapsed * 0.28 + i * 0.9) * 0.12,
+          bz + Math.sin(elapsed * 0.31 + i * 2.1) * 0.16
+        );
+      }
+      mAttr.needsUpdate = true;
+      lanternLight.intensity = 1.2 + Math.sin(elapsed * 4.2) * 0.07;
+    }
   };
 
   return {
@@ -447,6 +624,10 @@ export function buildTraditionalBadukRoom(
     blackBowl,
     whiteBowl,
     steamParticles,
+    ornateGroup,
+    lanternLight,
+    setOrnateFinish,
+    setTextureAnisotropy,
     updateBoardTop,
     updateAtmosphere,
   };

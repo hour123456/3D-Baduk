@@ -266,8 +266,9 @@ describe('Nickname & Online Multiplayer Engine', () => {
 
     expect(hostRole?.myColor).toBe(BLACK);
     expect(guestRole?.myColor).toBe(WHITE);
-    // Open room listing is automatically cleared once match starts
-    expect(guestRooms.length).toBe(0);
+    // In v3, active rooms stay listed as live in_game for spectating until host leaves
+    expect(guestRooms.length).toBe(1);
+    expect(guestRooms[0].status).toBe('in_game');
 
     // Host plays Black move at (3, 3)
     host.sendMove(3, 3, BLACK, 1);

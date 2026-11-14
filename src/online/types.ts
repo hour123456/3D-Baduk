@@ -1,4 +1,4 @@
-import { BoardSize, Coord, GameType, OmokRulesetType, PlayerColor, RulesetType } from '../rules/types';
+import { BoardSize, Coord, GameResult, GameType, OmokRulesetType, PlayerColor, RulesetType } from '../rules/types';
 import { ClockSnapshot } from '../rules/clock';
 
 export type OnlineTransportStatus = 'disconnected' | 'connecting' | 'connected' | 'reconnecting' | 'error';
@@ -8,13 +8,27 @@ export type OnlineSessionPhase =
   | 'quick_matching'
   | 'waiting_room'
   | 'joining_room'
-  | 'in_game';
+  | 'in_game'
+  | 'spectating';
+
+export type OnlineSessionRole = 'none' | 'player' | 'spectator';
+
+export type RoomLifecycleStatus = 'waiting' | 'in_game';
+
+export type PresenceActivity = 'lobby' | 'playing' | 'spectating';
+
+export interface PresenceStats {
+  onlineUsers: number;
+  inGameUsers: number;
+  spectatingUsers: number;
+}
 
 export type QuickMatchSizePref = BoardSize | 'any';
 
 export interface CreateRoomOptions {
   title?: string;
   isPublic: boolean;
+  password?: string;
   gameType?: GameType;
   omokRuleset?: OmokRulesetType;
   boardSize: BoardSize;
@@ -32,6 +46,13 @@ export interface RoomSummary {
   title: string;
   hostId: string;
   hostName: string;
+  isPublic: boolean;
+  hasPassword: boolean;
+  status: RoomLifecycleStatus;
+  blackName?: string;
+  whiteName?: string;
+  moveCount?: number;
+  spectatorCount?: number;
   gameType?: GameType;
   omokRuleset?: OmokRulesetType;
   boardSize: BoardSize;
@@ -54,6 +75,7 @@ export interface OnlineMatchInitPayload {
   whiteId: string;
   blackName: string;
   whiteName: string;
+  playerChatToken?: string;
   gameType?: GameType;
   omokRuleset?: OmokRulesetType;
   boardSize: BoardSize;
@@ -72,6 +94,8 @@ export interface OnlineRoleInfo {
   myColor: PlayerColor;
   opponentName: string;
   opponentId: string;
+  sessionRole?: OnlineSessionRole;
+  spectatorCount?: number;
 }
 
 export interface OnlineScoreAgreementState {
@@ -123,6 +147,7 @@ export interface SyncSnapshotPayload {
   deadIndices: number[];
   scoreAgreement: OnlineScoreAgreementState;
   clock: ClockSnapshot;
+  result?: GameResult | null;
 }
 
 export interface OnlineTransport {

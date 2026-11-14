@@ -104,7 +104,7 @@ class BadukApp {
         this.audio.playByoyomiTick(secLeft);
       },
       onTimeout: (timedOutColor) => {
-        if (this.engine.phase !== 'playing') return;
+        if (this.engine.phase !== 'playing' || this.isSpectating()) return;
         this.ai.cancelPending();
         this.aiThinking = false;
 
@@ -156,12 +156,35 @@ class BadukApp {
       onMatchStart: (cfg, role, isRematch) => {
         this.audio.ensureReady();
         this.ui.markGameStartedAndCloseModals();
+        this.ui.setOnlineInGameHUD(true, role.roomCode, role.myColor, 'player', role.spectatorCount ?? 0);
         this.startNewGame(cfg, true);
-        this.ui.setOnlineInGameHUD(true, role.roomCode, role.myColor);
+        this.online.updateHostMoveCount(0);
         const stoneLabel = role.myColor === BLACK ? '흑번(선공)' : '백번(덤 수령)';
         this.ui.showToast(
           `${isRematch ? '재대국 시작!' : '온라인 매칭 성사!'} ${role.opponentName}님과 대국합니다 (${stoneLabel})`
         );
+      },
+      onSpectateStart: (cfg, _init, snapshot, spectatorCount) => {
+        this.audio.ensureReady();
+        this.ui.markGameStartedAndCloseModals();
+        this.ui.setOnlineInGameHUD(true, cfg.roomCode, undefined, 'spectator', spectatorCount);
+        this.startNewGame(cfg, true);
+        if (snapshot) {
+          this.applySyncSnapshot(snapshot, true);
+        }
+        this.ui.showToast(`실시간 관전 입장! ${cfg.blackName || '흑'} vs ${cfg.whiteName || '백'}`);
+      },
+      onSpectatorCountUpdated: (count) => {
+        this.ui?.updateSpectatorCount(count);
+      },
+      onPresenceUpdated: (stats) => {
+        this.ui?.updateLivePresence(stats);
+      },
+      onRoomPasswordRequired: (action, roomCode, title) => {
+        this.ui?.promptRoomPassword(action, roomCode, title);
+      },
+      onRoomPasswordRejected: (action, roomCode, reason) => {
+        this.ui?.promptRoomPassword(action, roomCode, undefined, reason);
       },
       onRemoteMove: (payload) => {
         if (this.engine.config.mode !== 'online' || this.engine.phase !== 'playing') return;
@@ -181,6 +204,7 @@ class BadukApp {
           moveRes.capturedCoords ?? [],
           moveRes.adjacentTotalCount ?? 0
         );
+        this.online.updateHostMoveCount(this.engine.history.length);
 
         if (this.engine.result && (this.engine.phase as string) === 'finished') {
           this.handleGameResultIfFinished(this.engine.result);
@@ -292,12 +316,41 @@ class BadukApp {
         this.ui.resetRematchButton();
         this.ui.showToast('상대방이 재대국 신청을 정중히 거절했습니다.', true);
       },
-      onRemoteChat: (senderName, senderColor, text) => {
+      onRemoteChat: () => {
+        // Routed strictly through isolated onRemotePlayerChat / onRemoteSpectatorChat channels
+      },
+      onRemotePlayerChat: (senderName, senderColor, text) => {
+        if (this.isSpectating()) return;
         this.audio.playStonePickup(senderColor === BLACK ? 'right' : 'left', true);
         this.ui.showChatBubble(senderColor, senderName, text);
+        this.ui.appendChatMessage({
+          channel: 'player',
+          senderName,
+          text,
+          isSelf: false,
+          colorLabel: senderColor === BLACK ? '흑' : '백',
+        });
+      },
+      onRemoteSpectatorChat: (senderName, _senderId, text) => {
+        if (!this.isSpectating()) return;
+        this.ui.appendChatMessage({
+          channel: 'spectator',
+          senderName,
+          text,
+          isSelf: false,
+          colorLabel: '관전',
+        });
       },
       onOpponentLeft: (opponentName) => {
         this.ui.hideOnlinePrompt();
+        if (this.isSpectating()) {
+          this.clock.stop();
+          this.online.leaveCurrentSession(false);
+          this.ui.setOnlineInGameHUD(false);
+          this.ui.openSetupModal(true);
+          this.ui.showToast(`대국자(${opponentName})가 퇴장하여 관전을 종료합니다.`);
+          return;
+        }
         if (this.engine.phase === 'playing' || this.engine.phase === 'scoring') {
           this.clock.stop();
           const oppColor = opponentColor(this.engine.config.humanColor);
@@ -311,6 +364,7 @@ class BadukApp {
         }
       },
       onLatencyUpdated: (pingMs) => {
+        if (this.isSpectating()) return;
         const role = this.online.getRoleInfo();
         if (role && this.engine.config.mode === 'online') {
           this.ui.updateOnlinePing(role.roomCode, role.myColor, pingMs);
@@ -412,27 +466,54 @@ class BadukApp {
           this.ui.showToast(err.message, true);
         });
       },
-      onJoinOnlineRoom: (code) => {
+      onJoinOnlineRoom: (code, password) => {
         this.audio.ensureReady();
-        void this.online.joinRoom(code).catch((err: Error) => {
+        void this.online.joinRoom(code, password).catch((err: Error) => {
+          this.ui.showToast(err.message, true);
+        });
+      },
+      onSpectateOnlineRoom: (code, password) => {
+        this.audio.ensureReady();
+        void this.online.spectateRoom(code, password).catch((err: Error) => {
           this.ui.showToast(err.message, true);
         });
       },
       onGetInviteUrl: () => this.online.getInviteUrl(),
       onLeaveOnlineMatch: () => {
+        const wasSpectator = this.isSpectating();
         this.online.leaveCurrentSession(false);
         this.clock.stop();
         this.ui.setOnlineInGameHUD(false);
         this.ui.openSetupModal(true);
-        this.ui.showToast('온라인 대국방에서 퇴장했습니다.');
+        this.ui.showToast(wasSpectator ? '관전을 종료했습니다.' : '온라인 대국방에서 퇴장했습니다.');
       },
       onSendOnlineChat: (text) => {
         if (this.engine.config.mode !== 'online') return;
-        this.online.sendChat(text);
-        this.ui.showChatBubble(this.engine.config.humanColor, this.profile.getNickname(), text);
+        if (this.isSpectating()) {
+          if (this.online.sendSpectatorChat(text)) {
+            this.ui.appendChatMessage({
+              channel: 'spectator',
+              senderName: this.profile.getNickname(),
+              text,
+              isSelf: true,
+              colorLabel: '관전',
+            });
+          }
+          return;
+        }
+        if (this.online.sendPlayerChat(text)) {
+          this.ui.showChatBubble(this.engine.config.humanColor, this.profile.getNickname(), text);
+          this.ui.appendChatMessage({
+            channel: 'player',
+            senderName: this.profile.getNickname(),
+            text,
+            isSelf: true,
+            colorLabel: this.engine.config.humanColor === BLACK ? '흑' : '백',
+          });
+        }
       },
       onRequestOnlineRematch: () => {
-        if (this.engine.config.mode !== 'online') return;
+        if (this.engine.config.mode !== 'online' || this.isSpectating()) return;
         this.online.requestRematch();
         this.ui.setRematchButtonPending();
         this.ui.showToast('상대방에게 온라인 재대국을 신청했습니다.');
@@ -445,6 +526,15 @@ class BadukApp {
     this.ui.updateGameHeader(defaultConfig);
     this.syncAllUI();
     this.checkUrlRoomInvite();
+
+    // Start live concurrent user presence ONLY on Web builds (hidden inside Electron desktop app)
+    if (typeof window !== 'undefined' && !window.electronAPI?.isElectron) {
+      void this.online.startPresenceTracking().catch(() => {});
+    }
+  }
+
+  private isSpectating(): boolean {
+    return this.online?.getPhase() === 'spectating';
   }
 
   private createEngine(cfg: GameConfig): GoEngine | GomokuEngine {
@@ -457,13 +547,17 @@ class BadukApp {
     if (s.trueVerticalView || (s.autoMobileVerticalView && isPortraitMobile)) {
       return 'true_top';
     }
-    if ((cfg.mode === 'ai' || cfg.mode === 'online') && cfg.humanColor === WHITE) {
+    if (!this.isSpectating() && (cfg.mode === 'ai' || cfg.mode === 'online') && cfg.humanColor === WHITE) {
       return 'white';
     }
     return 'default';
   }
 
   private applySettingsToScene(s: UserSettings, updateCamera: boolean): void {
+    this.scene.setVisualQuality(s.visualQuality, s.bloomEnabled, s.ornateFinishEnabled);
+    if (typeof document !== 'undefined') {
+      document.body.dataset.visualQuality = s.visualQuality;
+    }
     this.scene.stoneAnimator.setMotionStyle(s.stoneMotionStyle);
     this.scene.stoneAnimator.setPhysicsIntensity(s.physicsIntensity);
     this.scene.setLockVerticalRotation(s.lockVerticalRotation);
@@ -518,6 +612,7 @@ class BadukApp {
   }
 
   private isHumanTurn(): boolean {
+    if (this.isSpectating()) return false;
     if (this.engine.phase !== 'playing' || this.aiThinking) return false;
     if (this.engine.config.mode === 'local2p') return true;
     return this.engine.currentTurn === this.engine.config.humanColor;
@@ -564,10 +659,6 @@ class BadukApp {
     this.clock.startTurn(this.engine.currentTurn);
 
     this.audio.playCeremonialChime('start');
-    window.setTimeout(() => {
-      const startSide = this.engine.currentTurn === BLACK ? 'black' : 'white';
-      this.scene.stoneAnimator.stirBowl(startSide, 0.72, true);
-    }, 240);
 
     this.syncAllUI();
     void this.maybeTriggerAITurn();
@@ -580,6 +671,11 @@ class BadukApp {
     color: PlayerColor;
   } {
     const label = coordToLabel(x, y, this.engine.size);
+
+    if (this.isSpectating()) {
+      this.ui.setCoordStatus(`${label} (실시간 관전 중)`);
+      return { valid: false, showGhost: false, color: this.engine.currentTurn };
+    }
 
     if (this.engine.phase === 'scoring') {
       const hasStone = this.engine.getStone(x, y) !== EMPTY;
@@ -629,6 +725,7 @@ class BadukApp {
 
   private handleIntersectionClick(x: number, y: number): void {
     this.audio.ensureReady();
+    if (this.isSpectating()) return;
 
     if (this.engine.phase === 'scoring') {
       if (this.engine.getStone(x, y) === EMPTY) return;
@@ -793,6 +890,7 @@ class BadukApp {
           moveRes.record.moveNumber,
           this.clock.getSnapshot()
         );
+        this.online.updateHostMoveCount(this.engine.history.length);
       }
       this.handleGameResultIfFinished(this.engine.result);
       this.syncAllUI();
@@ -808,6 +906,7 @@ class BadukApp {
         moveRes.record.moveNumber,
         this.clock.getSnapshot()
       );
+      this.online.updateHostMoveCount(this.engine.history.length);
     }
 
     this.syncAllUI();
@@ -1013,6 +1112,9 @@ class BadukApp {
   ) {
     const rec = this.engine.pass();
     if (!rec) return null;
+    if (this.engine.config.mode === 'online') {
+      this.online.updateHostMoveCount(this.engine.history.length);
+    }
 
     const who = color === BLACK ? '흑' : '백';
     const tag = byAI ? ' (AI)' : fromRemote ? ' (상대)' : '';
@@ -1074,7 +1176,7 @@ class BadukApp {
   }
 
   private confirmScoring(): void {
-    if (this.engine.phase !== 'scoring') return;
+    if (this.engine.phase !== 'scoring' || this.isSpectating()) return;
     if (this.engine.config.mode === 'online') {
       this.online.sendScoreAgree(this.deadStoneMask);
       return;
@@ -1102,6 +1204,7 @@ class BadukApp {
 
   private resumeFromScoring(fromRemote = false): void {
     if (this.engine.phase !== 'scoring' || !(this.engine instanceof GoEngine)) return;
+    if (!fromRemote && this.isSpectating()) return;
     if (this.engine.config.mode === 'online' && !fromRemote) {
       this.online.sendScoreResume();
     }
@@ -1117,7 +1220,12 @@ class BadukApp {
   }
 
   private handleUndo(): void {
-    if (this.engine.phase !== 'playing' || this.aiThinking || this.engine.history.length === 0) {
+    if (
+      this.isSpectating() ||
+      this.engine.phase !== 'playing' ||
+      this.aiThinking ||
+      this.engine.history.length === 0
+    ) {
       return;
     }
 
@@ -1175,12 +1283,15 @@ class BadukApp {
     } else {
       this.clock.startTurn(this.engine.currentTurn);
     }
+    if (this.engine.config.mode === 'online') {
+      this.online.updateHostMoveCount(this.engine.history.length);
+    }
     this.syncAllUI();
     return true;
   }
 
   private handleResign(): void {
-    if (this.engine.phase !== 'playing' || this.aiThinking) return;
+    if (this.isSpectating() || this.engine.phase !== 'playing' || this.aiThinking) return;
     const resigningColor =
       this.engine.config.mode === 'ai' || this.engine.config.mode === 'online'
         ? this.engine.config.humanColor
@@ -1223,12 +1334,13 @@ class BadukApp {
       deadIndices,
       scoreAgreement: this.online.getScoreAgreement(),
       clock: this.clock.getSnapshot(),
+      result: this.engine.result ?? null,
     };
   }
 
-  private applySyncSnapshot(snap: SyncSnapshotPayload): void {
+  private applySyncSnapshot(snap: SyncSnapshotPayload, force = false): void {
     if (this.engine.config.mode !== 'online') return;
-    if (snap.moves.length <= this.engine.history.length) return;
+    if (!force && snap.moves.length <= this.engine.history.length) return;
 
     const cfg = { ...this.engine.config };
     this.engine = this.createEngine(cfg);
@@ -1261,6 +1373,16 @@ class BadukApp {
       }
       this.clock.applySnapshot(snap.clock, null);
       this.refreshScoringPreview();
+      this.ui.updateOnlineScoringAgreement(true, this.engine.config.humanColor, snap.scoreAgreement);
+    } else if (snap.phase === 'finished' && snap.result) {
+      this.engine.phase = 'finished';
+      this.engine.result = snap.result;
+      this.clock.applySnapshot(snap.clock, null);
+      this.clock.stop();
+      if (snap.result.winningLine && snap.result.winningLine.length >= 5) {
+        this.scene.renderOmokWinningLine(snap.result.winningLine);
+      }
+      this.ui.showResultModal(snap.result, this.engine.config);
     } else if (snap.phase === 'playing') {
       this.clock.applySnapshot(snap.clock, this.engine.currentTurn);
     }

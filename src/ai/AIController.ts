@@ -43,6 +43,7 @@ export class AIController {
 
   public cancelPending(): void {
     if (this.activeResolve) {
+      // Terminate & respawn worker if mid-heavy search so cancellation is instantaneous
       this.activeResolve(null);
       this.activeResolve = null;
       this.activeId = -1;
